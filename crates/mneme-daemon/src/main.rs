@@ -1,8 +1,38 @@
-use mneme_api::build_router;
-use mneme_kernel::InMemoryOperationLedger;
-use std::net::SocketAddr;
+use mneme_api::routes::build_router_with_state;
+use mneme_kernel::{SqliteOperationLedger, SqliteRunProjectionStore, SqliteStore};
+use std::{fs, net::SocketAddr, path::Path};
 use tokio::net::TcpListener;
 use tracing::info;
+
+const DEFAULT_DATABASE_URL: &str = "sqlite://.mneme/mneme.db?mode=rwc";
+
+fn database_url_from_env() -> String {
+    database_url_from_env_value(std::env::var("MNEME_DB_URL").ok())
+}
+
+fn database_url_from_env_value(value: Option<String>) -> String {
+    value.unwrap_or_else(|| DEFAULT_DATABASE_URL.to_string())
+}
+
+fn ensure_sqlite_parent_directory(database_url: &str) -> std::io::Result<()> {
+    if database_url == "sqlite::memory:" {
+        return Ok(());
+    }
+
+    let Some(path_with_query) = database_url.strip_prefix("sqlite://") else {
+        return Ok(());
+    };
+    let database_path = path_with_query.split('?').next().unwrap_or(path_with_query);
+    let Some(parent) = Path::new(database_path).parent() else {
+        return Ok(());
+    };
+
+    if parent.as_os_str().is_empty() {
+        return Ok(());
+    }
+
+    fs::create_dir_all(parent)
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -18,13 +48,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "127.0.0.1:3766".to_string())
         .parse()?;
 
-    // 第一阶段使用内存账本；持久化 SQLite 会在下一阶段替换这里。
-    let ledger = InMemoryOperationLedger::new();
-    let app = build_router(ledger);
+    let database_url = database_url_from_env();
+    ensure_sqlite_parent_directory(&database_url)?;
+    let store = SqliteStore::connect(&database_url).await?;
+    let ledger = SqliteOperationLedger::new(store.clone()).shared();
+    let run_store = SqliteRunProjectionStore::new(store).shared();
+    let app = build_router_with_state(ledger, run_store);
     let listener = TcpListener::bind(addr).await?;
 
-    info!(%addr, "mneme daemon listening");
+    info!(%addr, database_url = %database_url, "mneme daemon listening");
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_database_url_uses_local_mneme_directory() {
+        assert_eq!(
+            database_url_from_env_value(None),
+            "sqlite://.mneme/mneme.db?mode=rwc"
+        );
+    }
+
+    #[test]
+    fn database_url_from_env_uses_override() {
+        assert_eq!(
+            database_url_from_env_value(Some("sqlite://.mneme-test/mneme.db?mode=rwc".to_string())),
+            "sqlite://.mneme-test/mneme.db?mode=rwc"
+        );
+    }
+
+    #[test]
+    fn ensure_sqlite_parent_directory_creates_relative_parent() {
+        let base = std::env::temp_dir().join(format!("mneme-daemon-test-{}", std::process::id()));
+        let database_url = format!("sqlite://{}/.mneme-test/mneme.db?mode=rwc", base.display());
+        let expected_parent = base.join(".mneme-test");
+
+        if base.exists() {
+            fs::remove_dir_all(&base).expect("remove stale temp dir");
+        }
+        ensure_sqlite_parent_directory(&database_url).expect("create sqlite parent directory");
+
+        assert!(expected_parent.is_dir());
+
+        fs::remove_dir_all(&base).expect("remove temp dir");
+    }
+
+    #[test]
+    fn ensure_sqlite_parent_directory_skips_memory_database() {
+        ensure_sqlite_parent_directory("sqlite::memory:")
+            .expect("memory sqlite url does not need dir");
+    }
 }

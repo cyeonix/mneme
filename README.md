@@ -7,7 +7,7 @@ Mneme 是一个 Personal AI Kernel（个人 AI 内核）：面向本地优先、
 Phase 1 构建基础切片：
 
 - Rust Kernel crate
-- 内存版追加式 Operation Ledger
+- SQLite 持久化追加式 Operation Ledger
 - 本地 Axum API
 - daemon binary
 - TypeScript API client
@@ -30,6 +30,16 @@ pnpm check
 ```bash
 cargo run -p mneme-daemon
 ```
+
+### 本地 SQLite 数据库
+
+默认 daemon 使用 `sqlite://.mneme/mneme.db?mode=rwc`。如需隔离测试数据：
+
+```bash
+MNEME_DB_URL='sqlite://.mneme-dev/mneme.db?mode=rwc' cargo run -p mneme-daemon
+```
+
+Operation Ledger 的 `operation_events` 表是事实源；`runs` 表是可重建投影。
 
 健康检查：
 
