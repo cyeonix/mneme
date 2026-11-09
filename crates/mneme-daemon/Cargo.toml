@@ -1,0 +1,14 @@
+[package]
+name = "mneme-daemon"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+axum.workspace = true
+mneme-api = { path = "../mneme-api" }
+mneme-kernel = { path = "../mneme-kernel" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

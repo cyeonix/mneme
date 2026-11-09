@@ -2,6 +2,7 @@
 members = [
   "crates/mneme-kernel",
   "crates/mneme-api",
+  "crates/mneme-daemon",
 ]
 resolver = "2"
 
@@ -19,4 +20,6 @@ thiserror = "2.0"
 time = { version = "0.3", features = ["serde", "formatting", "macros"] }
 tokio = { version = "1.41", features = ["macros", "rt-multi-thread", "net"] }
 tower = "0.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.11", features = ["v4", "serde"] }
