@@ -4,6 +4,7 @@ pub mod ids;
 pub mod ledger;
 pub mod projections;
 pub mod runs;
+pub mod service;
 pub mod storage;
 
 pub use events::{OperationEvent, OperationEventKind};
@@ -13,6 +14,9 @@ pub use ledger::{InMemoryOperationLedger, LedgerError, OperationLedger, SharedOp
 pub use projections::{RunProjection, RunProjector, RunStatus};
 pub use runs::{
     InMemoryRunProjectionStore, RunProjectionError, RunProjectionStore, SharedRunProjectionStore,
+};
+pub use service::{
+    ComposedRunService, CreateRunOutcome, RunService, RunServiceError, SharedRunService,
 };
 pub use storage::sqlite::SqliteRunProjectionStore;
 pub use storage::{SqliteOperationLedger, SqliteStore, SqliteStoreError};
