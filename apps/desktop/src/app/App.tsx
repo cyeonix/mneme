@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import type { EventsResponse, KernelHealth, MnemeApiClient } from '../api/client';
+import type { EventsResponse, KernelHealth, MnemeApiClient, RunsResponse } from '../api/client';
 
 interface AppProps {
   client: MnemeApiClient;
@@ -8,6 +8,7 @@ interface AppProps {
 export function App({ client }: AppProps) {
   const [health, setHealth] = useState<KernelHealth | null>(null);
   const [events, setEvents] = useState<EventsResponse>({ events: [] });
+  const [runs, setRuns] = useState<RunsResponse>({ runs: [] });
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -15,14 +16,16 @@ export function App({ client }: AppProps) {
 
     async function loadKernelState() {
       try {
-        // 第一版页面只读取健康状态和事件列表，证明 UI 已经通过 API 边界访问 Kernel。
-        const [nextHealth, nextEvents] = await Promise.all([
+        // Workbench 通过 API 边界读取 Kernel 状态、Operation Ledger 事件和 runs 读模型。
+        const [nextHealth, nextEvents, nextRuns] = await Promise.all([
           client.getHealth(),
           client.listEvents(),
+          client.listRuns(),
         ]);
         if (!cancelled) {
           setHealth(nextHealth);
           setEvents(nextEvents);
+          setRuns(nextRuns);
         }
       } catch (unknownError) {
         if (!cancelled) {
@@ -57,6 +60,23 @@ export function App({ client }: AppProps) {
           <strong>{events.events.length} events</strong>
           <span className="meta">Append-only event stream foundation</span>
         </article>
+      </section>
+
+      <section className="panel">
+        <h2>Runs</h2>
+        {runs.runs.length === 0 ? (
+          <p className="muted">还没有持久化 run。通过 API 创建 run 后会显示在这里。</p>
+        ) : (
+          <ul className="run-list">
+            {runs.runs.map((run) => (
+              <li key={run.run_id} className="run-card">
+                <span className="run-status">{run.status}</span>
+                <strong>{run.instruction}</strong>
+                <small>{run.updated_at}</small>
+              </li>
+            ))}
+          </ul>
+        )}
       </section>
 
       {error ? <p className="error-banner">{error}</p> : null}

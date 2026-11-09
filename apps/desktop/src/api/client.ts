@@ -15,6 +15,24 @@ export interface EventsResponse {
   events: OperationEvent[];
 }
 
+export type RunStatus = 'running' | 'completed' | 'failed';
+
+export interface RunProjection {
+  run_id: string;
+  status: RunStatus;
+  instruction: string;
+  started_at: string;
+  completed_at: string | null;
+  failed_at: string | null;
+  summary: string | null;
+  error: string | null;
+  updated_at: string;
+}
+
+export interface RunsResponse {
+  runs: RunProjection[];
+}
+
 export interface CreateRunResponse {
   run_id: string;
 }
@@ -22,6 +40,7 @@ export interface CreateRunResponse {
 export interface MnemeApiClient {
   getHealth(): Promise<KernelHealth>;
   listEvents(): Promise<EventsResponse>;
+  listRuns(): Promise<RunsResponse>;
   createRun(instruction: string): Promise<CreateRunResponse>;
 }
 
@@ -51,6 +70,13 @@ export function createMnemeApiClient(baseUrl: string, fetchImpl: FetchLike = fet
         headers: { accept: 'application/json' },
       });
       return parseJsonResponse<EventsResponse>(response);
+    },
+
+    async listRuns() {
+      const response = await fetchImpl(`${normalizedBaseUrl}/api/v1/runs`, {
+        headers: { accept: 'application/json' },
+      });
+      return parseJsonResponse<RunsResponse>(response);
     },
 
     async createRun(instruction: string) {

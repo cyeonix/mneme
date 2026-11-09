@@ -12,6 +12,23 @@ function createClient(): MnemeApiClient {
     async listEvents() {
       return { events: [] };
     },
+    async listRuns() {
+      return {
+        runs: [
+          {
+            run_id: 'run-1',
+            status: 'running',
+            instruction: '展示 runs 投影',
+            started_at: '2026-11-09T00:00:00Z',
+            completed_at: null,
+            failed_at: null,
+            summary: null,
+            error: null,
+            updated_at: '2026-11-09T00:00:00Z',
+          },
+        ],
+      };
+    },
     async createRun() {
       return { run_id: 'run-123' };
     },
@@ -27,5 +44,7 @@ describe('App', () => {
     await waitFor(() => {
       expect(screen.getByText('Kernel ready')).toBeInTheDocument();
     });
+    expect(await screen.findByText('展示 runs 投影')).toBeInTheDocument();
+    expect(screen.getByText('running')).toBeInTheDocument();
   });
 });
