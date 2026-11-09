@@ -1,4 +1,4 @@
-use mneme_kernel::{KernelHealth, OperationEvent};
+use mneme_kernel::{KernelHealth, OperationEvent, RunProjection};
 use serde::{Deserialize, Serialize};
 
 /// HTTP health 返回体。API DTO 与 Kernel 领域类型分开，便于以后做版本兼容。
@@ -32,4 +32,9 @@ pub struct CreateRunResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventsResponse {
     pub events: Vec<OperationEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunsResponse {
+    pub runs: Vec<RunProjection>,
 }
