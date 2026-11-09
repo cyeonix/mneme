@@ -19,10 +19,11 @@ Phase 1 构建基础切片：
 - Node.js 24+
 - pnpm 11+
 
-## 验证
+## 常用验证
 
 ```bash
 pnpm check
+git diff --check
 ```
 
 ## 启动本地 daemon
@@ -45,6 +46,16 @@ Operation Ledger 的 `operation_events` 表是事实源；`runs` 表是可重建
 
 ```bash
 curl http://127.0.0.1:3766/api/v1/health
+```
+
+## 创建一条 run
+
+```bash
+curl -s -X POST http://127.0.0.1:3766/api/v1/runs \
+  -H 'content-type: application/json' \
+  -d '{"instruction":"整理今天的工作"}'
+
+curl -s http://127.0.0.1:3766/api/v1/runs
 ```
 
 ## 启动基础阶段 Web shell
