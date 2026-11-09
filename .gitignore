@@ -1,0 +1,16 @@
+# 本地隔离开发工作区，避免 worktree 内容被误提交
+.worktrees/
+worktrees/
+
+# Rust 构建产物
+target/
+
+# Node / 前端依赖与构建产物
+node_modules/
+dist/
+.vite/
+
+# 系统与编辑器临时文件
+.DS_Store
+.idea/
+.vscode/
