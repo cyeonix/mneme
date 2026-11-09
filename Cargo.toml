@@ -1,0 +1,17 @@
+[workspace]
+members = [
+  "crates/mneme-kernel",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/cyeonix/mneme"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+time = { version = "0.3", features = ["serde", "formatting", "macros"] }
+uuid = { version = "1.11", features = ["v4", "serde"] }
