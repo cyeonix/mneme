@@ -6,17 +6,21 @@ use axum::{
     Json, Router,
 };
 use mneme_kernel::{
-    kernel_health, InMemoryOperationLedger, OperationEvent, OperationLedger, RunId,
+    kernel_health, InMemoryOperationLedger, OperationEvent, RunId, SharedOperationLedger,
 };
 
 #[derive(Clone)]
 pub struct ApiState {
-    pub ledger: InMemoryOperationLedger,
+    pub ledger: SharedOperationLedger,
 }
 
 /// 创建第一版本地 API 路由。
 /// 这里显式传入 ledger，便于测试中复用同一个内存账本检查副作用。
 pub fn build_router(ledger: InMemoryOperationLedger) -> Router {
+    build_router_with_ledger(ledger.shared())
+}
+
+pub fn build_router_with_ledger(ledger: SharedOperationLedger) -> Router {
     Router::new()
         .route("/api/v1/health", get(get_health))
         .route("/api/v1/events", get(list_events))
@@ -32,6 +36,7 @@ async fn list_events(State(state): State<ApiState>) -> Result<Json<EventsRespons
     let events = state
         .ledger
         .list()
+        .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(EventsResponse { events }))
 }
@@ -49,6 +54,7 @@ async fn create_run(
     state
         .ledger
         .append(event)
+        .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(CreateRunResponse {
@@ -61,6 +67,7 @@ mod tests {
     use super::*;
     use axum::{body::Body, http::Request};
     use http_body_util::BodyExt;
+    use mneme_kernel::OperationLedger;
     use serde_json::json;
     use tower::ServiceExt;
 
@@ -111,7 +118,7 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(ledger.list().expect("events").len(), 1);
+        assert_eq!(ledger.list().await.expect("events").len(), 1);
     }
 
     #[tokio::test]

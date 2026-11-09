@@ -336,9 +336,11 @@ dependencies = [
 name = "mneme-kernel"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "serde",
  "thiserror",
  "time",
+ "tokio",
  "uuid",
 ]
 
