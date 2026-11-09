@@ -1,6 +1,7 @@
 use crate::{
     EventId, LedgerError, OperationEvent, OperationEventKind, OperationLedger, RunId,
-    SharedOperationLedger,
+    RunProjection, RunProjectionError, RunProjectionStore, RunProjector, RunStatus,
+    SharedOperationLedger, SharedRunProjectionStore,
 };
 use async_trait::async_trait;
 use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
@@ -106,6 +107,116 @@ impl OperationLedger for SqliteOperationLedger {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct SqliteRunProjectionStore {
+    store: SqliteStore,
+}
+
+impl SqliteRunProjectionStore {
+    pub fn new(store: SqliteStore) -> Self {
+        Self { store }
+    }
+
+    pub fn shared(self) -> SharedRunProjectionStore {
+        Arc::new(self)
+    }
+}
+
+#[async_trait]
+impl RunProjectionStore for SqliteRunProjectionStore {
+    async fn apply(&self, event: &OperationEvent) -> Result<(), RunProjectionError> {
+        let occurred_at = format_datetime(event.occurred_at)?;
+
+        match &event.kind {
+            OperationEventKind::RunStarted { instruction } => {
+                sqlx::query(
+                    "insert into runs (run_id, status, instruction, started_at, completed_at, failed_at, summary, error, updated_at) values (?1, 'running', ?2, ?3, null, null, null, null, ?3) on conflict(run_id) do update set status = excluded.status, instruction = excluded.instruction, started_at = excluded.started_at, completed_at = excluded.completed_at, failed_at = excluded.failed_at, summary = excluded.summary, error = excluded.error, updated_at = excluded.updated_at",
+                )
+                .bind(event.run_id.to_string())
+                .bind(instruction)
+                .bind(occurred_at)
+                .execute(self.store.pool())
+                .await
+                .map_err(|error| RunProjectionError::Storage(error.to_string()))?;
+            }
+            OperationEventKind::RunCompleted { summary } => {
+                sqlx::query(
+                    "update runs set status = 'completed', completed_at = ?2, summary = ?3, updated_at = ?2 where run_id = ?1",
+                )
+                .bind(event.run_id.to_string())
+                .bind(occurred_at)
+                .bind(summary)
+                .execute(self.store.pool())
+                .await
+                .map_err(|error| RunProjectionError::Storage(error.to_string()))?;
+            }
+            OperationEventKind::RunFailed { reason } => {
+                sqlx::query(
+                    "update runs set status = 'failed', failed_at = ?2, error = ?3, updated_at = ?2 where run_id = ?1",
+                )
+                .bind(event.run_id.to_string())
+                .bind(occurred_at)
+                .bind(reason)
+                .execute(self.store.pool())
+                .await
+                .map_err(|error| RunProjectionError::Storage(error.to_string()))?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn rebuild(&self, events: &[OperationEvent]) -> Result<(), RunProjectionError> {
+        let projections = RunProjector::replay(events);
+        let mut tx = self
+            .store
+            .pool()
+            .begin()
+            .await
+            .map_err(|error| RunProjectionError::Storage(error.to_string()))?;
+
+        sqlx::query("delete from runs")
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| RunProjectionError::Storage(error.to_string()))?;
+
+        for run in projections {
+            sqlx::query(
+                "insert into runs (run_id, status, instruction, started_at, completed_at, failed_at, summary, error, updated_at) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )
+            .bind(run.run_id.to_string())
+            .bind(status_to_storage(&run.status))
+            .bind(run.instruction)
+            .bind(format_datetime(run.started_at)?)
+            .bind(format_optional_datetime(run.completed_at)?)
+            .bind(format_optional_datetime(run.failed_at)?)
+            .bind(run.summary)
+            .bind(run.error)
+            .bind(format_datetime(run.updated_at)?)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| RunProjectionError::Storage(error.to_string()))?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|error| RunProjectionError::Storage(error.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn list_runs(&self) -> Result<Vec<RunProjection>, RunProjectionError> {
+        let rows = sqlx::query_as::<_, StoredRunProjection>(
+            "select run_id, status, instruction, started_at, completed_at, failed_at, summary, error, updated_at from runs order by updated_at desc",
+        )
+        .fetch_all(self.store.pool())
+        .await
+        .map_err(|error| RunProjectionError::Storage(error.to_string()))?;
+
+        rows.into_iter().map(RunProjection::try_from).collect()
+    }
+}
+
 #[derive(sqlx::FromRow)]
 struct StoredOperationEvent {
     event_id: String,
@@ -131,6 +242,80 @@ impl TryFrom<StoredOperationEvent> for OperationEvent {
     }
 }
 
+#[derive(sqlx::FromRow)]
+struct StoredRunProjection {
+    run_id: String,
+    status: String,
+    instruction: String,
+    started_at: String,
+    completed_at: Option<String>,
+    failed_at: Option<String>,
+    summary: Option<String>,
+    error: Option<String>,
+    updated_at: String,
+}
+
+impl TryFrom<StoredRunProjection> for RunProjection {
+    type Error = RunProjectionError;
+
+    fn try_from(row: StoredRunProjection) -> Result<Self, Self::Error> {
+        Ok(Self {
+            run_id: RunId::from_str(&row.run_id)
+                .map_err(|error| RunProjectionError::InvalidPayload(error.to_string()))?,
+            status: status_from_storage(&row.status)?,
+            instruction: row.instruction,
+            started_at: parse_datetime(&row.started_at)?,
+            completed_at: parse_optional_datetime(row.completed_at)?,
+            failed_at: parse_optional_datetime(row.failed_at)?,
+            summary: row.summary,
+            error: row.error,
+            updated_at: parse_datetime(&row.updated_at)?,
+        })
+    }
+}
+
+fn status_to_storage(status: &RunStatus) -> &'static str {
+    match status {
+        RunStatus::Running => "running",
+        RunStatus::Completed => "completed",
+        RunStatus::Failed => "failed",
+    }
+}
+
+fn status_from_storage(status: &str) -> Result<RunStatus, RunProjectionError> {
+    match status {
+        "running" => Ok(RunStatus::Running),
+        "completed" => Ok(RunStatus::Completed),
+        "failed" => Ok(RunStatus::Failed),
+        other => Err(RunProjectionError::InvalidPayload(format!(
+            "unknown run status: {other}"
+        ))),
+    }
+}
+
+fn format_datetime(value: OffsetDateTime) -> Result<String, RunProjectionError> {
+    value
+        .format(&Rfc3339)
+        .map_err(|error| RunProjectionError::InvalidPayload(error.to_string()))
+}
+
+fn format_optional_datetime(
+    value: Option<OffsetDateTime>,
+) -> Result<Option<String>, RunProjectionError> {
+    value.map(format_datetime).transpose()
+}
+
+fn parse_datetime(value: &str) -> Result<OffsetDateTime, RunProjectionError> {
+    OffsetDateTime::parse(value, &Rfc3339)
+        .map_err(|error| RunProjectionError::InvalidPayload(error.to_string()))
+}
+
+fn parse_optional_datetime(
+    value: Option<String>,
+) -> Result<Option<OffsetDateTime>, RunProjectionError> {
+    value.as_deref().map(parse_datetime).transpose()
+}
+
 #[derive(Debug, Error)]
 pub enum SqliteStoreError {
     #[error("sqlite connection failed: {0}")]
@@ -142,7 +327,7 @@ pub enum SqliteStoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{OperationEvent, OperationLedger, RunId};
+    use crate::{OperationEvent, OperationLedger, RunId, RunProjectionStore, RunProjector};
 
     #[tokio::test]
     async fn sqlite_store_runs_migrations() {
@@ -186,5 +371,67 @@ mod tests {
             ledger.list_for_run(selected_run).await.unwrap(),
             vec![selected]
         );
+    }
+
+    #[tokio::test]
+    async fn sqlite_run_store_persists_projection() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let runs = SqliteRunProjectionStore::new(store);
+        let run_id = RunId::new();
+        let event = OperationEvent::new_run_started(run_id, "SQLite run 投影");
+
+        runs.apply(&event).await.unwrap();
+
+        let listed = runs.list_runs().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].run_id, run_id);
+        assert_eq!(listed[0].instruction, "SQLite run 投影");
+    }
+
+    #[tokio::test]
+    async fn sqlite_run_store_rebuild_matches_projector_replay() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let runs = SqliteRunProjectionStore::new(store);
+        let run_id = RunId::new();
+        let events = vec![
+            OperationEvent::new_run_started(run_id, "重建投影"),
+            OperationEvent::new_run_completed(run_id, "完成"),
+        ];
+
+        runs.rebuild(&events).await.unwrap();
+
+        assert_eq!(
+            runs.list_runs().await.unwrap(),
+            RunProjector::replay(&events)
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_run_store_rebuild_handles_duplicate_started_events() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let runs = SqliteRunProjectionStore::new(store);
+        let run_id = RunId::new();
+        let events = vec![
+            OperationEvent::new_run_started(run_id, "第一次启动"),
+            OperationEvent::new_run_started(run_id, "第二次启动"),
+        ];
+
+        runs.rebuild(&events).await.unwrap();
+
+        assert_eq!(
+            runs.list_runs().await.unwrap(),
+            RunProjector::replay(&events)
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_run_store_ignores_unknown_terminal_events() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let runs = SqliteRunProjectionStore::new(store);
+        let event = OperationEvent::new_run_failed(RunId::new(), "未知 run 失败");
+
+        runs.apply(&event).await.unwrap();
+
+        assert!(runs.list_runs().await.unwrap().is_empty());
     }
 }

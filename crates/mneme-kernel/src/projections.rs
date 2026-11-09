@@ -33,17 +33,28 @@ impl RunProjector {
         for event in events {
             match &event.kind {
                 OperationEventKind::RunStarted { instruction } => {
-                    runs.push(RunProjection {
-                        run_id: event.run_id,
-                        status: RunStatus::Running,
-                        instruction: instruction.clone(),
-                        started_at: event.occurred_at,
-                        completed_at: None,
-                        failed_at: None,
-                        summary: None,
-                        error: None,
-                        updated_at: event.occurred_at,
-                    });
+                    if let Some(run) = runs.iter_mut().find(|run| run.run_id == event.run_id) {
+                        run.status = RunStatus::Running;
+                        run.instruction = instruction.clone();
+                        run.started_at = event.occurred_at;
+                        run.completed_at = None;
+                        run.failed_at = None;
+                        run.summary = None;
+                        run.error = None;
+                        run.updated_at = event.occurred_at;
+                    } else {
+                        runs.push(RunProjection {
+                            run_id: event.run_id,
+                            status: RunStatus::Running,
+                            instruction: instruction.clone(),
+                            started_at: event.occurred_at,
+                            completed_at: None,
+                            failed_at: None,
+                            summary: None,
+                            error: None,
+                            updated_at: event.occurred_at,
+                        });
+                    }
                 }
                 OperationEventKind::RunCompleted { summary } => {
                     if let Some(run) = runs.iter_mut().find(|run| run.run_id == event.run_id) {
@@ -97,5 +108,21 @@ mod tests {
         let events = vec![OperationEvent::new_run_started(run_id, "稳定 replay")];
 
         assert_eq!(RunProjector::replay(&events), RunProjector::replay(&events));
+    }
+
+    #[test]
+    fn replay_treats_duplicate_started_events_as_one_run_projection() {
+        let run_id = RunId::new();
+        let events = vec![
+            OperationEvent::new_run_started(run_id, "第一次启动"),
+            OperationEvent::new_run_started(run_id, "第二次启动"),
+        ];
+
+        let runs = RunProjector::replay(&events);
+
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].run_id, run_id);
+        assert_eq!(runs[0].instruction, "第二次启动");
+        assert_eq!(runs[0].status, RunStatus::Running);
     }
 }
