@@ -4,7 +4,11 @@
   "version": "0.1.0",
   "packageManager": "pnpm@11.9.0",
   "scripts": {
-    "check": "pnpm --recursive check",
-    "test": "pnpm --recursive test"
+    "check": "pnpm check:rust && pnpm check:ui",
+    "check:rust": "cargo fmt --all --check && cargo test --workspace",
+    "check:ui": "pnpm --recursive check && pnpm --recursive test",
+    "test": "pnpm test:rust && pnpm test:ui",
+    "test:rust": "cargo test --workspace",
+    "test:ui": "pnpm --recursive test"
   }
 }

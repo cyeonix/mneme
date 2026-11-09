@@ -6,14 +6,24 @@ worktrees/
 .superpowers/
 
 # Rust 构建产物
+/target/
 target/
 
 # Node / 前端依赖与构建产物
+/node_modules/
 node_modules/
+/apps/*/dist/
 dist/
 .vite/
 
 # 系统与编辑器临时文件
+/.DS_Store
 .DS_Store
 .idea/
 .vscode/
+
+# 日志与本地环境
+*.log
+.env
+.env.*
+!.env.example
