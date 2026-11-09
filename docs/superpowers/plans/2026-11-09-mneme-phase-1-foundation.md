@@ -1,78 +1,78 @@
-# Mneme Phase 1 Foundation Implementation Plan
+# Mneme 第一阶段基础工程实施计划
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **给执行型 Agent 的要求：** 执行本计划时必须使用 `superpowers:subagent-driven-development`（推荐）或 `superpowers:executing-plans`。请逐个任务执行，并用复选框（`- [ ]`）跟踪进度。
 
-**Goal:** Build the first testable Mneme repository foundation: Rust workspace, kernel domain types, append-only in-memory Operation Ledger, Axum daemon API, TypeScript API client, and a minimal React workbench that proves UI communicates with the local kernel boundary.
+**目标：** 建出 Mneme 第一个可测试的基础工程切片：Rust 工作区、Kernel 领域类型、内存版追加式 Operation Ledger、本地 Axum API、TypeScript API 客户端，以及一个能连到本地 Kernel 边界的最小 React Workbench。
 
-**Architecture:** This plan implements the thinnest vertical slice of the approved technical direction. Rust owns kernel/domain/API authority; the UI consumes a generated-compatible TypeScript client shape but does not write state directly. Storage starts as an in-memory ledger to prove domain and API boundaries before SQLite migrations are introduced in the next plan.
+**架构：** 本计划只实现已确认技术路线中最薄的一条纵向切片。Rust Kernel 负责领域模型、状态边界、API 权威入口；TypeScript UI 只通过 API client 访问 Kernel，不直接写状态。存储先使用内存版 Ledger 验证事件模型和 API 边界，SQLite 持久化放到下一阶段。
 
-**Tech Stack:** Rust stable, Cargo workspace, Tokio, Axum, Serde, thiserror, uuid, time, tracing, Vite, React, TypeScript, Vitest, pnpm.
+**技术栈：** Rust stable、Cargo workspace、Tokio、Axum、Serde、thiserror、uuid、time、tracing、Vite、React、TypeScript、Vitest、pnpm。
 
-## Global Constraints
+## 全局约束
 
-- Product direction: Personal AI Kernel named Mneme.
-- First runtime shape: Desktop App + Local Daemon/API.
-- Kernel strategy: Rust-first Kernel with TypeScript UI.
-- Interface strategy: full dual interface: typed internal service boundary plus external HTTP/local API.
-- Data direction: Operation Ledger as source of truth; SQLite projections and search/vector sidecars are deferred to a later plan.
-- Runtime direction: Rust Kernel is authoritative control plane; workers do not write kernel state directly.
-- Tool direction: Mneme-native effect-typed Tool Protocol; MCP/OpenAPI/CLI adapters are compatibility layers in later plans.
-- Frontend route: React + Vite + Radix primitives + self-owned design system.
-- Sync route: personal cloud server/self-hosted server is a future milestone; this plan keeps local API boundaries sync-ready.
-- The current workspace may not have Rust installed. If `rustc --version` fails, install Rust stable with `rustup` before starting Task 1.
-- Every task must end with tests or verification commands and a git commit.
+- 产品方向：Mneme = Personal AI Kernel（个人 AI 内核）。
+- 第一运行形态：Desktop App + Local Daemon/API。
+- Kernel 路线：Rust-first Kernel + TypeScript UI。
+- 接口路线：完整双接口：内部 typed RPC/event bus + 外部 HTTP/local API。
+- 数据路线：Operation Ledger 作为事实源；SQLite 投影、搜索 sidecar、向量 sidecar 放到后续阶段。
+- Runtime 路线：Rust Kernel 是任务、权限、账本、上下文、工具策略的权威控制面；模型执行通过可插拔 worker 完成。
+- 工具路线：Mneme-native effect-typed Tool Protocol；MCP/OpenAPI/CLI/local-script 作为后续兼容适配层。
+- 前端路线：React + Vite + Radix primitives + 自有设计系统。
+- 同步路线：个人云服务器/自托管 Mneme Server 是后续里程碑；本阶段保持 API 边界可同步化。
+- 当前环境可能还没有 Rust。若 `rustc --version` 失败，先安装 Rust stable，再开始任务 1。
+- 每个任务都必须以测试/验证命令和 git commit 结束。
 
 ---
 
-## Ordered Product Roadmap
+## 一、产品实施顺序总览
 
-This product is too large for one implementation plan. Build it in these milestones, each with its own plan and review gate.
+这个产品不能一次性做完，建议按下面里程碑推进。每个里程碑都应该有单独计划和验收关口。
 
-### Milestone 0 — Repository and vertical-slice foundation
+### Milestone 0 — 仓库基础与第一条纵向切片
 
-Outcome: a clean monorepo skeleton with Rust crates, daemon health/events API, TypeScript client, and React workbench consuming the API. This is the scope of this plan.
+产出：干净 monorepo 骨架、Rust crates、daemon health/events API、TypeScript client、React Workbench。本文档就是这个里程碑的执行计划。
 
-### Milestone 1 — Durable Operation Ledger and projections
+### Milestone 1 — 持久化 Operation Ledger 与投影
 
-Outcome: SQLite-backed append-only events, SQLx migrations, projection tables for runs/tasks/artifacts/tool calls, and deterministic replay tests.
+产出：SQLite 追加式事件表、SQLx migrations、runs/tasks/artifacts/tool calls 投影表、确定性 replay 测试。
 
-### Milestone 2 — Kernel service boundary
+### Milestone 2 — Kernel 服务边界
 
-Outcome: AgentService, TaskService, RunService, ContextService, ToolService, PolicyService, and EventService traits with tested command/query flows.
+产出：AgentService、TaskService、RunService、ContextService、ToolService、PolicyService、EventService traits，以及经过测试的 command/query 流程。
 
 ### Milestone 3 — Agent run loop MVP
 
-Outcome: create a run, compile a simple ContextBundle, call one OpenAI-compatible or Ollama provider, stream model output, and record all run events.
+产出：创建 run、编译简单 ContextBundle、调用一个 OpenAI-compatible 或 Ollama provider、流式输出模型结果、记录完整 run events。
 
-### Milestone 4 — Effect-typed tools and approvals
+### Milestone 4 — Effect-typed tools 与审批
 
-Outcome: ToolDescriptor, ToolCallIntent, PolicyService approval decisions, NativeExecutor for read-only filesystem/artifact operations, and UI approval panel.
+产出：ToolDescriptor、ToolCallIntent、PolicyService 审批决策、只读 NativeExecutor、UI 审批面板。
 
-### Milestone 5 — Artifact and context inspector workspace
+### Milestone 5 — Artifact 与 Context Inspector 工作台
 
-Outcome: content-addressed artifact store, ContextBundle explainability, Work Room, Operation Timeline, Context Inspector, and Artifact Workspace.
+产出：content-addressed artifact store、ContextBundle 可解释视图、Work Room、Operation Timeline、Context Inspector、Artifact Workspace。
 
-### Milestone 6 — Search, memory, and knowledge
+### Milestone 6 — Search、Memory、Knowledge
 
-Outcome: Tantivy full-text index, vector index abstraction, memory metadata, knowledge sources, document chunks, and retrieval traces in the ledger.
+产出：Tantivy 全文索引、向量索引抽象、memory metadata、knowledge sources、document chunks、ledger 中的 retrieval traces。
 
-### Milestone 7 — Worker runtime protocol
+### Milestone 7 — Worker Runtime Protocol
 
-Outcome: stdio JSON-RPC worker protocol, Rust-native provider worker, Node worker adapter, worker supervision, and event-streamed runtime errors.
+产出：stdio JSON-RPC worker 协议、Rust-native provider worker、Node worker adapter、worker supervision、事件化 runtime errors。
 
-### Milestone 8 — Tauri desktop packaging
+### Milestone 8 — Tauri 桌面打包
 
-Outcome: Tauri 2 shell that starts/manages the local daemon, embeds the React UI, and exposes native OS integrations through a thin bridge.
+产出：Tauri 2 shell，负责启动/管理本地 daemon、嵌入 React UI、通过薄 bridge 暴露原生 OS 能力。
 
-### Milestone 9 — Self-hosted personal server
+### Milestone 9 — 自托管个人服务器
 
-Outcome: authenticated device registration, event/object sync, backup/restore, remote web console, and conflict rules built around the ledger.
+产出：设备注册、事件/对象同步、备份恢复、远程 Web console、基于 Ledger 的冲突规则。
 
 ---
 
-## File Structure for This Plan
+## 二、本阶段目标文件结构
 
-Create this structure:
+本阶段创建下面结构：
 
 ```text
 mneme/
@@ -82,91 +82,92 @@ mneme/
       Cargo.toml
       src/
         lib.rs
+        health.rs
         ids.rs
         events.rs
         ledger.rs
-        health.rs
     mneme-api/
       Cargo.toml
       src/
         lib.rs
-        routes.rs
         types.rs
+        routes.rs
     mneme-daemon/
       Cargo.toml
-      src/
-        main.rs
+      src/main.rs
   apps/
     desktop/
       package.json
       index.html
       tsconfig.json
-      tsconfig.node.json
       vite.config.ts
       src/
         main.tsx
-        app/App.tsx
-        app/App.test.tsx
         api/client.ts
         api/client.test.ts
+        app/App.tsx
+        app/App.test.tsx
         design-system/tokens.css
         styles.css
   package.json
   pnpm-workspace.yaml
+  README.md
+  .gitignore
   docs/
+    architecture/phase-1-foundation.md
     superpowers/
       specs/2026-11-09-mneme-technical-selection-design.md
       plans/2026-11-09-mneme-phase-1-foundation.md
 ```
 
-Responsibilities:
+文件职责：
 
-- `Cargo.toml`: Rust workspace membership and shared dependency versions.
-- `crates/mneme-kernel/src/ids.rs`: typed identifiers for events and runs.
-- `crates/mneme-kernel/src/events.rs`: canonical event model for the initial Operation Ledger.
-- `crates/mneme-kernel/src/ledger.rs`: append-only ledger trait and in-memory implementation.
-- `crates/mneme-kernel/src/health.rs`: kernel health snapshot used by API/UI.
-- `crates/mneme-api/src/types.rs`: external API DTOs, separate from domain types.
-- `crates/mneme-api/src/routes.rs`: Axum router and route handlers.
-- `crates/mneme-daemon/src/main.rs`: binary entry point that serves the local API.
-- `apps/desktop/src/api/client.ts`: typed UI API client boundary.
-- `apps/desktop/src/app/App.tsx`: minimal workbench view that reads kernel health and latest ledger events.
-- `apps/desktop/src/design-system/tokens.css`: first Mneme design tokens.
+- `Cargo.toml`：Rust workspace 成员与共享依赖版本。
+- `crates/mneme-kernel/src/health.rs`：Kernel 健康状态模型。
+- `crates/mneme-kernel/src/ids.rs`：事件和 run 的强类型 ID。
+- `crates/mneme-kernel/src/events.rs`：第一版 Operation Ledger 事件模型。
+- `crates/mneme-kernel/src/ledger.rs`：追加式 Ledger trait 与内存实现。
+- `crates/mneme-api/src/types.rs`：HTTP 外部 DTO，避免 UI 直接依赖内部领域类型细节。
+- `crates/mneme-api/src/routes.rs`：Axum router 与 route handlers。
+- `crates/mneme-daemon/src/main.rs`：本地 daemon 进程入口。
+- `apps/desktop/src/api/client.ts`：前端访问 Kernel 的唯一 API client 边界。
+- `apps/desktop/src/app/App.tsx`：最小 Mneme Workbench 页面。
+- `apps/desktop/src/design-system/tokens.css`：第一版 Mneme 设计 token。
 
 ---
 
-### Task 1: Bootstrap Rust workspace and kernel health model
+## Task 1：初始化 Rust workspace 与 Kernel 健康模型
 
-**Files:**
-- Create: `Cargo.toml`
-- Create: `crates/mneme-kernel/Cargo.toml`
-- Create: `crates/mneme-kernel/src/lib.rs`
-- Create: `crates/mneme-kernel/src/health.rs`
+**文件：**
+- 创建：`Cargo.toml`
+- 创建：`crates/mneme-kernel/Cargo.toml`
+- 创建：`crates/mneme-kernel/src/lib.rs`
+- 创建：`crates/mneme-kernel/src/health.rs`
 
-**Interfaces:**
-- Consumes: none.
-- Produces: `mneme_kernel::KernelHealth`, `mneme_kernel::kernel_health() -> KernelHealth`.
+**接口：**
+- 消费：无。
+- 产出：`mneme_kernel::KernelHealth`，`mneme_kernel::kernel_health() -> KernelHealth`。
 
-- [ ] **Step 1: Verify Rust is available**
+- [ ] **Step 1：确认 Rust 可用**
 
-Run:
+运行：
 
 ```bash
 rustc --version
 cargo --version
 ```
 
-Expected: both commands print versions and exit 0. If either command is missing, install Rust stable with:
+期望：两个命令都打印版本并退出 0。若命令不存在，先安装 Rust stable：
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-Then open a new shell and re-run the version commands.
+安装后打开新 shell，再重新运行版本检查。
 
-- [ ] **Step 2: Create root Rust workspace manifest**
+- [ ] **Step 2：创建根 Rust workspace manifest**
 
-Write `Cargo.toml`:
+写入 `Cargo.toml`：
 
 ```toml
 [workspace]
@@ -188,9 +189,9 @@ time = { version = "0.3", features = ["serde", "formatting", "macros"] }
 uuid = { version = "1.11", features = ["v4", "serde"] }
 ```
 
-- [ ] **Step 3: Create kernel crate manifest**
+- [ ] **Step 3：创建 Kernel crate manifest**
 
-Write `crates/mneme-kernel/Cargo.toml`:
+写入 `crates/mneme-kernel/Cargo.toml`：
 
 ```toml
 [package]
@@ -205,9 +206,9 @@ serde.workspace = true
 time.workspace = true
 ```
 
-- [ ] **Step 4: Create kernel public module file**
+- [ ] **Step 4：创建 Kernel 对外模块文件**
 
-Write `crates/mneme-kernel/src/lib.rs`:
+写入 `crates/mneme-kernel/src/lib.rs`：
 
 ```rust
 pub mod health;
@@ -215,13 +216,15 @@ pub mod health;
 pub use health::{kernel_health, KernelHealth};
 ```
 
-- [ ] **Step 5: Write the failing kernel health test**
+- [ ] **Step 5：先写一个会失败的健康检查测试**
 
-Write `crates/mneme-kernel/src/health.rs`:
+写入 `crates/mneme-kernel/src/health.rs`：
 
 ```rust
 use serde::{Deserialize, Serialize};
 
+/// Kernel 对外暴露的最小健康状态。
+/// 后续可以继续增加 ledger 状态、worker 状态、数据库状态等字段。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KernelHealth {
     pub service: String,
@@ -232,6 +235,7 @@ pub struct KernelHealth {
 pub fn kernel_health() -> KernelHealth {
     KernelHealth {
         service: "mneme-kernel".to_string(),
+        // 这里先故意写成 starting，让测试先失败，确认测试真的在保护行为。
         status: "starting".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
     }
@@ -252,52 +256,47 @@ mod tests {
 }
 ```
 
-- [ ] **Step 6: Run test to verify it fails**
-
-Run:
+- [ ] **Step 6：运行测试，确认它按预期失败**
 
 ```bash
 cargo test -p mneme-kernel kernel_health_reports_ready_service_identity
 ```
 
-Expected: FAIL with an assertion showing left value `"starting"` and right value `"ready"`.
+期望：失败，并出现类似 left `"starting"`、right `"ready"` 的断言信息。
 
-- [ ] **Step 7: Implement minimal fix**
+- [ ] **Step 7：实现最小修复**
 
-Edit `crates/mneme-kernel/src/health.rs` so `kernel_health()` returns `ready`:
+把 `kernel_health()` 改成：
 
 ```rust
 pub fn kernel_health() -> KernelHealth {
     KernelHealth {
         service: "mneme-kernel".to_string(),
+        // 对外健康检查返回 ready，表示 Kernel 基础模块已经可以响应。
         status: "ready".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
     }
 }
 ```
 
-- [ ] **Step 8: Run test to verify it passes**
-
-Run:
+- [ ] **Step 8：运行测试，确认通过**
 
 ```bash
 cargo test -p mneme-kernel kernel_health_reports_ready_service_identity
 ```
 
-Expected: PASS.
+期望：PASS。
 
-- [ ] **Step 9: Run crate formatting and all kernel tests**
-
-Run:
+- [ ] **Step 9：运行格式检查和 Kernel 全量测试**
 
 ```bash
 cargo fmt --all --check
 cargo test -p mneme-kernel
 ```
 
-Expected: formatting check exits 0 and all kernel tests pass.
+期望：格式检查退出 0，Kernel crate 测试全部通过。
 
-- [ ] **Step 10: Commit**
+- [ ] **Step 10：提交**
 
 ```bash
 git add Cargo.toml crates/mneme-kernel
@@ -306,21 +305,21 @@ git commit -m "feat: bootstrap Rust kernel crate"
 
 ---
 
-### Task 2: Add canonical event IDs and Operation Ledger event model
+## Task 2：添加强类型 ID 与 Operation Ledger 事件模型
 
-**Files:**
-- Modify: `crates/mneme-kernel/src/lib.rs`
-- Create: `crates/mneme-kernel/src/ids.rs`
-- Create: `crates/mneme-kernel/src/events.rs`
-- Modify: `crates/mneme-kernel/Cargo.toml`
+**文件：**
+- 修改：`crates/mneme-kernel/src/lib.rs`
+- 修改：`crates/mneme-kernel/Cargo.toml`
+- 创建：`crates/mneme-kernel/src/ids.rs`
+- 创建：`crates/mneme-kernel/src/events.rs`
 
-**Interfaces:**
-- Consumes: `mneme_kernel::KernelHealth` from Task 1.
-- Produces: `EventId::new() -> EventId`, `RunId::new() -> RunId`, `OperationEvent`, `OperationEventKind`, `OperationEvent::new_run_started(run_id: RunId, instruction: impl Into<String>) -> OperationEvent`.
+**接口：**
+- 消费：Task 1 的 `KernelHealth`。
+- 产出：`EventId::new() -> EventId`，`RunId::new() -> RunId`，`OperationEvent`，`OperationEventKind`，`OperationEvent::new_run_started(run_id: RunId, instruction: impl Into<String>) -> OperationEvent`。
 
-- [ ] **Step 1: Add uuid/time dependencies to kernel crate**
+- [ ] **Step 1：给 Kernel crate 加 uuid/time 依赖**
 
-Edit `crates/mneme-kernel/Cargo.toml`:
+更新 `crates/mneme-kernel/Cargo.toml` 的 `[dependencies]`：
 
 ```toml
 [dependencies]
@@ -329,18 +328,21 @@ time.workspace = true
 uuid.workspace = true
 ```
 
-- [ ] **Step 2: Create typed ID module with tests**
+- [ ] **Step 2：创建强类型 ID 模块和测试**
 
-Write `crates/mneme-kernel/src/ids.rs`:
+写入 `crates/mneme-kernel/src/ids.rs`：
 
 ```rust
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use uuid::Uuid;
 
+/// Ledger 中每条事件的唯一 ID。
+/// 用 newtype 包一层，避免把 EventId 和 RunId 误传。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct EventId(Uuid);
 
+/// 一次 Agent/用户工作流运行的唯一 ID。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RunId(Uuid);
 
@@ -402,15 +404,17 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Create operation event model with test**
+- [ ] **Step 3：创建 OperationEvent 事件模型和测试**
 
-Write `crates/mneme-kernel/src/events.rs`:
+写入 `crates/mneme-kernel/src/events.rs`：
 
 ```rust
 use crate::ids::{EventId, RunId};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+/// 第一版事件类型。
+/// 先覆盖 run 生命周期，后续再扩展 tool、artifact、context、memory 等事件。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OperationEventKind {
@@ -419,6 +423,8 @@ pub enum OperationEventKind {
     RunFailed { reason: String },
 }
 
+/// Operation Ledger 的最小事件结构。
+/// 事件一旦写入就不应该原地修改，后续状态通过追加新事件表达。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperationEvent {
     pub id: EventId,
@@ -459,9 +465,9 @@ mod tests {
 }
 ```
 
-- [ ] **Step 4: Export new modules**
+- [ ] **Step 4：导出新模块**
 
-Edit `crates/mneme-kernel/src/lib.rs`:
+更新 `crates/mneme-kernel/src/lib.rs`：
 
 ```rust
 pub mod events;
@@ -473,18 +479,16 @@ pub use health::{kernel_health, KernelHealth};
 pub use ids::{EventId, RunId};
 ```
 
-- [ ] **Step 5: Run tests**
-
-Run:
+- [ ] **Step 5：运行测试**
 
 ```bash
 cargo fmt --all --check
 cargo test -p mneme-kernel
 ```
 
-Expected: formatting check exits 0 and tests for health, IDs, and events pass.
+期望：health、IDs、events 测试全部通过。
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6：提交**
 
 ```bash
 git add crates/mneme-kernel/Cargo.toml crates/mneme-kernel/src
@@ -493,20 +497,20 @@ git commit -m "feat: add kernel operation event model"
 
 ---
 
-### Task 3: Add append-only in-memory Operation Ledger service
+## Task 3：添加追加式内存 Operation Ledger
 
-**Files:**
-- Modify: `crates/mneme-kernel/src/lib.rs`
-- Create: `crates/mneme-kernel/src/ledger.rs`
-- Modify: `crates/mneme-kernel/Cargo.toml`
+**文件：**
+- 修改：`crates/mneme-kernel/src/lib.rs`
+- 修改：`crates/mneme-kernel/Cargo.toml`
+- 创建：`crates/mneme-kernel/src/ledger.rs`
 
-**Interfaces:**
-- Consumes: `OperationEvent`, `RunId` from Task 2.
-- Produces: `OperationLedger` trait, `InMemoryOperationLedger`, `LedgerError`.
+**接口：**
+- 消费：Task 2 的 `OperationEvent`、`RunId`。
+- 产出：`OperationLedger` trait、`InMemoryOperationLedger`、`LedgerError`。
 
-- [ ] **Step 1: Add thiserror dependency to kernel crate**
+- [ ] **Step 1：添加 thiserror 依赖**
 
-Edit `crates/mneme-kernel/Cargo.toml`:
+更新 `crates/mneme-kernel/Cargo.toml`：
 
 ```toml
 [dependencies]
@@ -516,9 +520,9 @@ time.workspace = true
 uuid.workspace = true
 ```
 
-- [ ] **Step 2: Write ledger module with append/list tests**
+- [ ] **Step 2：写 Ledger 模块和 append/list 测试**
 
-Write `crates/mneme-kernel/src/ledger.rs`:
+写入 `crates/mneme-kernel/src/ledger.rs`：
 
 ```rust
 use crate::{OperationEvent, RunId};
@@ -531,12 +535,15 @@ pub enum LedgerError {
     Poisoned,
 }
 
+/// Operation Ledger 的抽象边界。
+/// 后续 SQLite 实现也应该实现这个 trait，让 API 层不关心具体存储。
 pub trait OperationLedger: Send + Sync {
     fn append(&self, event: OperationEvent) -> Result<(), LedgerError>;
     fn list(&self) -> Result<Vec<OperationEvent>, LedgerError>;
     fn list_for_run(&self, run_id: RunId) -> Result<Vec<OperationEvent>, LedgerError>;
 }
 
+/// 第一阶段只使用内存版 Ledger，用来验证领域模型和 API 边界。
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryOperationLedger {
     events: Arc<Mutex<Vec<OperationEvent>>>,
@@ -607,9 +614,9 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Export ledger interfaces**
+- [ ] **Step 3：导出 Ledger 接口**
 
-Edit `crates/mneme-kernel/src/lib.rs`:
+更新 `crates/mneme-kernel/src/lib.rs`：
 
 ```rust
 pub mod events;
@@ -623,18 +630,16 @@ pub use ids::{EventId, RunId};
 pub use ledger::{InMemoryOperationLedger, LedgerError, OperationLedger};
 ```
 
-- [ ] **Step 4: Run tests**
-
-Run:
+- [ ] **Step 4：运行测试**
 
 ```bash
 cargo fmt --all --check
 cargo test -p mneme-kernel
 ```
 
-Expected: all kernel tests pass.
+期望：Kernel 测试全部通过。
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5：提交**
 
 ```bash
 git add crates/mneme-kernel/Cargo.toml crates/mneme-kernel/src
@@ -643,22 +648,22 @@ git commit -m "feat: add in-memory operation ledger"
 
 ---
 
-### Task 4: Add local HTTP API crate with health and events routes
+## Task 4：添加本地 HTTP API crate
 
-**Files:**
-- Modify: `Cargo.toml`
-- Create: `crates/mneme-api/Cargo.toml`
-- Create: `crates/mneme-api/src/lib.rs`
-- Create: `crates/mneme-api/src/types.rs`
-- Create: `crates/mneme-api/src/routes.rs`
+**文件：**
+- 修改：`Cargo.toml`
+- 创建：`crates/mneme-api/Cargo.toml`
+- 创建：`crates/mneme-api/src/lib.rs`
+- 创建：`crates/mneme-api/src/types.rs`
+- 创建：`crates/mneme-api/src/routes.rs`
 
-**Interfaces:**
-- Consumes: `kernel_health()`, `InMemoryOperationLedger`, `OperationLedger`, `OperationEvent`, `RunId`.
-- Produces: `mneme_api::build_router(ledger: InMemoryOperationLedger) -> axum::Router`, HTTP `GET /api/v1/health`, `GET /api/v1/events`, `POST /api/v1/runs`.
+**接口：**
+- 消费：`kernel_health()`、`InMemoryOperationLedger`、`OperationLedger`、`OperationEvent`、`RunId`。
+- 产出：`mneme_api::build_router(ledger: InMemoryOperationLedger) -> axum::Router`，以及 HTTP `GET /api/v1/health`、`GET /api/v1/events`、`POST /api/v1/runs`。
 
-- [ ] **Step 1: Add API crate to workspace**
+- [ ] **Step 1：把 API crate 加入 workspace**
 
-Edit root `Cargo.toml` workspace members:
+更新根 `Cargo.toml`：
 
 ```toml
 [workspace]
@@ -667,11 +672,7 @@ members = [
   "crates/mneme-api",
 ]
 resolver = "2"
-```
 
-Add workspace dependencies:
-
-```toml
 [workspace.dependencies]
 axum = "0.7"
 http-body-util = "0.1"
@@ -684,9 +685,9 @@ tower = "0.5"
 uuid = { version = "1.11", features = ["v4", "serde"] }
 ```
 
-- [ ] **Step 2: Create API crate manifest**
+- [ ] **Step 2：创建 API crate manifest**
 
-Write `crates/mneme-api/Cargo.toml`:
+写入 `crates/mneme-api/Cargo.toml`：
 
 ```toml
 [package]
@@ -709,14 +710,15 @@ tokio.workspace = true
 tower.workspace = true
 ```
 
-- [ ] **Step 3: Create API DTOs**
+- [ ] **Step 3：创建 API DTO**
 
-Write `crates/mneme-api/src/types.rs`:
+写入 `crates/mneme-api/src/types.rs`：
 
 ```rust
 use mneme_kernel::{KernelHealth, OperationEvent};
 use serde::{Deserialize, Serialize};
 
+/// HTTP health 返回体。API DTO 与 Kernel 领域类型分开，便于以后做版本兼容。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub service: String,
@@ -750,9 +752,9 @@ pub struct EventsResponse {
 }
 ```
 
-- [ ] **Step 4: Write failing route tests and router implementation**
+- [ ] **Step 4：创建 routes 与 route 测试**
 
-Write `crates/mneme-api/src/routes.rs`:
+写入 `crates/mneme-api/src/routes.rs`：
 
 ```rust
 use crate::types::{CreateRunRequest, CreateRunResponse, EventsResponse, HealthResponse};
@@ -769,6 +771,8 @@ pub struct ApiState {
     pub ledger: InMemoryOperationLedger,
 }
 
+/// 创建第一版本地 API 路由。
+/// 这里显式传入 ledger，便于测试中复用同一个内存账本检查副作用。
 pub fn build_router(ledger: InMemoryOperationLedger) -> Router {
     Router::new()
         .route("/api/v1/health", get(get_health))
@@ -812,10 +816,7 @@ async fn create_run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{
-        body::Body,
-        http::{Request, StatusCode},
-    };
+    use axum::{body::Body, http::Request};
     use http_body_util::BodyExt;
     use serde_json::json;
     use tower::ServiceExt;
@@ -825,12 +826,7 @@ mod tests {
         let app = build_router(InMemoryOperationLedger::new());
 
         let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/health")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
+            .oneshot(Request::builder().uri("/api/v1/health").body(Body::empty()).expect("request"))
             .await
             .expect("response");
 
@@ -853,9 +849,7 @@ mod tests {
                     .method("POST")
                     .uri("/api/v1/runs")
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({ "instruction": "Build the first Mneme run" }).to_string(),
-                    ))
+                    .body(Body::from(json!({ "instruction": "Build the first Mneme run" }).to_string()))
                     .expect("request"),
             )
             .await
@@ -886,9 +880,9 @@ mod tests {
 }
 ```
 
-- [ ] **Step 5: Export API module**
+- [ ] **Step 5：导出 API 模块**
 
-Write `crates/mneme-api/src/lib.rs`:
+写入 `crates/mneme-api/src/lib.rs`：
 
 ```rust
 pub mod routes;
@@ -897,9 +891,7 @@ pub mod types;
 pub use routes::build_router;
 ```
 
-- [ ] **Step 6: Run API tests**
-
-Run:
+- [ ] **Step 6：运行 API 测试**
 
 ```bash
 cargo fmt --all --check
@@ -907,9 +899,9 @@ cargo test -p mneme-api
 cargo test --workspace
 ```
 
-Expected: API route tests and kernel tests pass.
+期望：API route 测试与 Kernel 测试全部通过。
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 7：提交**
 
 ```bash
 git add Cargo.toml crates/mneme-api
@@ -918,20 +910,20 @@ git commit -m "feat: add local API routes"
 
 ---
 
-### Task 5: Add daemon binary serving the local API
+## Task 5：添加本地 daemon binary
 
-**Files:**
-- Modify: `Cargo.toml`
-- Create: `crates/mneme-daemon/Cargo.toml`
-- Create: `crates/mneme-daemon/src/main.rs`
+**文件：**
+- 修改：`Cargo.toml`
+- 创建：`crates/mneme-daemon/Cargo.toml`
+- 创建：`crates/mneme-daemon/src/main.rs`
 
-**Interfaces:**
-- Consumes: `mneme_api::build_router`, `mneme_kernel::InMemoryOperationLedger`.
-- Produces: `mneme-daemon` binary with default bind address `127.0.0.1:3766`.
+**接口：**
+- 消费：`mneme_api::build_router`、`mneme_kernel::InMemoryOperationLedger`。
+- 产出：`mneme-daemon` binary，默认监听 `127.0.0.1:3766`。
 
-- [ ] **Step 1: Add daemon crate to workspace**
+- [ ] **Step 1：把 daemon crate 加入 workspace**
 
-Edit root `Cargo.toml` workspace members:
+更新根 `Cargo.toml` 的 workspace members，并添加 tracing 依赖：
 
 ```toml
 [workspace]
@@ -941,18 +933,17 @@ members = [
   "crates/mneme-daemon",
 ]
 resolver = "2"
-```
 
-Add `tracing` dependencies if missing:
-
-```toml
+[workspace.dependencies]
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ```
 
-- [ ] **Step 2: Create daemon crate manifest**
+保留前面已经添加的其他 workspace dependencies。
 
-Write `crates/mneme-daemon/Cargo.toml`:
+- [ ] **Step 2：创建 daemon crate manifest**
+
+写入 `crates/mneme-daemon/Cargo.toml`：
 
 ```toml
 [package]
@@ -963,6 +954,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+axum.workspace = true
 mneme-api = { path = "../mneme-api" }
 mneme-kernel = { path = "../mneme-kernel" }
 tokio.workspace = true
@@ -970,9 +962,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 ```
 
-- [ ] **Step 3: Create daemon main**
+- [ ] **Step 3：创建 daemon main**
 
-Write `crates/mneme-daemon/src/main.rs`:
+写入 `crates/mneme-daemon/src/main.rs`：
 
 ```rust
 use mneme_api::build_router;
@@ -990,9 +982,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
+    // 默认只绑定本机地址，避免第一阶段误暴露到局域网。
     let addr: SocketAddr = std::env::var("MNEME_BIND_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:3766".to_string())
         .parse()?;
+
+    // 第一阶段使用内存账本；持久化 SQLite 会在下一阶段替换这里。
     let ledger = InMemoryOperationLedger::new();
     let app = build_router(ledger);
     let listener = TcpListener::bind(addr).await?;
@@ -1004,17 +999,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-- [ ] **Step 4: Fix missing axum dependency for daemon**
-
-If `cargo check -p mneme-daemon` reports `use of undeclared crate or module 'axum'`, add this line to `crates/mneme-daemon/Cargo.toml` under `[dependencies]`:
-
-```toml
-axum.workspace = true
-```
-
-- [ ] **Step 5: Run daemon checks**
-
-Run:
+- [ ] **Step 4：运行 daemon 检查**
 
 ```bash
 cargo fmt --all --check
@@ -1022,31 +1007,31 @@ cargo check -p mneme-daemon
 cargo test --workspace
 ```
 
-Expected: daemon compiles and workspace tests pass.
+期望：daemon 可编译，workspace 测试全部通过。
 
-- [ ] **Step 6: Manually verify health endpoint**
+- [ ] **Step 5：手动验证 health endpoint**
 
-Run daemon in one terminal:
+一个终端运行：
 
 ```bash
 cargo run -p mneme-daemon
 ```
 
-In another terminal:
+另一个终端运行：
 
 ```bash
 curl http://127.0.0.1:3766/api/v1/health
 ```
 
-Expected JSON contains:
+期望返回 JSON 包含：
 
 ```json
 {"service":"mneme-kernel","status":"ready","version":"0.1.0"}
 ```
 
-Stop the daemon with `Ctrl+C`.
+验证后用 `Ctrl+C` 停止 daemon。
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 6：提交**
 
 ```bash
 git add Cargo.toml crates/mneme-daemon
@@ -1055,24 +1040,24 @@ git commit -m "feat: add local daemon binary"
 
 ---
 
-### Task 6: Bootstrap pnpm workspace and TypeScript API client
+## Task 6：初始化 pnpm workspace 与 TypeScript API client
 
-**Files:**
-- Create: `package.json`
-- Create: `pnpm-workspace.yaml`
-- Create: `apps/desktop/package.json`
-- Create: `apps/desktop/tsconfig.json`
-- Create: `apps/desktop/vite.config.ts`
-- Create: `apps/desktop/src/api/client.ts`
-- Create: `apps/desktop/src/api/client.test.ts`
+**文件：**
+- 创建：`package.json`
+- 创建：`pnpm-workspace.yaml`
+- 创建：`apps/desktop/package.json`
+- 创建：`apps/desktop/tsconfig.json`
+- 创建：`apps/desktop/vite.config.ts`
+- 创建：`apps/desktop/src/api/client.ts`
+- 创建：`apps/desktop/src/api/client.test.ts`
 
-**Interfaces:**
-- Consumes: HTTP API from Task 4/5.
-- Produces: `MnemeApiClient`, `createMnemeApiClient(baseUrl: string): MnemeApiClient`, `KernelHealth`, `OperationEvent`, `CreateRunResponse`.
+**接口：**
+- 消费：Task 4/5 的 HTTP API。
+- 产出：`MnemeApiClient`、`createMnemeApiClient(baseUrl: string): MnemeApiClient`、`KernelHealth`、`OperationEvent`、`CreateRunResponse`。
 
-- [ ] **Step 1: Create root pnpm workspace files**
+- [ ] **Step 1：创建根 pnpm workspace 文件**
 
-Write `package.json`:
+写入 `package.json`：
 
 ```json
 {
@@ -1087,7 +1072,7 @@ Write `package.json`:
 }
 ```
 
-Write `pnpm-workspace.yaml`:
+写入 `pnpm-workspace.yaml`：
 
 ```yaml
 packages:
@@ -1095,9 +1080,9 @@ packages:
   - packages/*
 ```
 
-- [ ] **Step 2: Create desktop package manifest**
+- [ ] **Step 2：创建 desktop package manifest**
 
-Write `apps/desktop/package.json`:
+写入 `apps/desktop/package.json`：
 
 ```json
 {
@@ -1129,34 +1114,9 @@ Write `apps/desktop/package.json`:
 }
 ```
 
-- [ ] **Step 3: Create TypeScript and Vite config**
+- [ ] **Step 3：创建 TypeScript 与 Vite 配置**
 
-Write `apps/desktop/tsconfig.json`:
-
-```json
-{
-  "compilerOptions": {
-    "target": "ES2022",
-    "useDefineForClassFields": true,
-    "lib": ["ES2022", "DOM", "DOM.Iterable"],
-    "allowJs": false,
-    "skipLibCheck": true,
-    "esModuleInterop": true,
-    "allowSyntheticDefaultImports": true,
-    "strict": true,
-    "forceConsistentCasingInFileNames": true,
-    "module": "ESNext",
-    "moduleResolution": "Node",
-    "resolveJsonModule": true,
-    "isolatedModules": true,
-    "noEmit": true,
-    "jsx": "react-jsx"
-  },
-  "include": ["src"]
-}
-```
-
-Write `apps/desktop/vite.config.ts`:
+写入 `apps/desktop/tsconfig.json` 和 `apps/desktop/vite.config.ts`。Vite 配置如下：
 
 ```ts
 import react from '@vitejs/plugin-react';
@@ -1171,16 +1131,18 @@ export default defineConfig({
 });
 ```
 
-- [ ] **Step 4: Write API client test first**
+`tsconfig.json` 使用严格模式：`strict: true`、`noEmit: true`、`jsx: "react-jsx"`。
 
-Write `apps/desktop/src/api/client.test.ts`:
+- [ ] **Step 4：先写 API client 测试**
+
+写入 `apps/desktop/src/api/client.test.ts`：
 
 ```ts
 import { describe, expect, it, vi } from 'vitest';
 import { createMnemeApiClient } from './client';
 
 describe('createMnemeApiClient', () => {
-  it('fetches kernel health from the configured base URL', async () => {
+  it('从配置的 base URL 读取 Kernel 健康状态', async () => {
     const fetchMock = vi.fn(async () =>
       new Response(JSON.stringify({ service: 'mneme-kernel', status: 'ready', version: '0.1.0' }), {
         status: 200,
@@ -1197,7 +1159,7 @@ describe('createMnemeApiClient', () => {
     expect(health.status).toBe('ready');
   });
 
-  it('posts run instructions and returns the new run id', async () => {
+  it('提交 run instruction 并返回新 run id', async () => {
     const fetchMock = vi.fn(async () =>
       new Response(JSON.stringify({ run_id: 'run-123' }), {
         status: 200,
@@ -1218,20 +1180,18 @@ describe('createMnemeApiClient', () => {
 });
 ```
 
-- [ ] **Step 5: Run test to verify it fails**
-
-Run:
+- [ ] **Step 5：运行测试确认失败**
 
 ```bash
 pnpm install
 pnpm --filter @mneme/desktop test -- src/api/client.test.ts
 ```
 
-Expected: FAIL because `./client` does not exist.
+期望：失败，因为 `./client` 还不存在。
 
-- [ ] **Step 6: Implement API client**
+- [ ] **Step 6：实现 API client**
 
-Write `apps/desktop/src/api/client.ts`:
+写入 `apps/desktop/src/api/client.ts`：
 
 ```ts
 export interface KernelHealth {
@@ -1271,6 +1231,7 @@ async function parseJsonResponse<T>(response: Response): Promise<T> {
 }
 
 export function createMnemeApiClient(baseUrl: string, fetchImpl: FetchLike = fetch): MnemeApiClient {
+  // 统一去掉结尾斜杠，避免拼接出双斜杠 URL。
   const normalizedBaseUrl = baseUrl.replace(/\/$/, '');
 
   return {
@@ -1300,18 +1261,16 @@ export function createMnemeApiClient(baseUrl: string, fetchImpl: FetchLike = fet
 }
 ```
 
-- [ ] **Step 7: Run client tests and typecheck**
-
-Run:
+- [ ] **Step 7：运行 client 测试和类型检查**
 
 ```bash
 pnpm --filter @mneme/desktop test -- src/api/client.test.ts
 pnpm --filter @mneme/desktop check
 ```
 
-Expected: test passes and TypeScript check exits 0.
+期望：测试通过，TypeScript check 退出 0。
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 8：提交**
 
 ```bash
 git add package.json pnpm-workspace.yaml pnpm-lock.yaml apps/desktop
@@ -1320,23 +1279,23 @@ git commit -m "feat: add TypeScript API client"
 
 ---
 
-### Task 7: Add minimal React workbench shell
+## Task 7：添加最小 React Workbench
 
-**Files:**
-- Create: `apps/desktop/index.html`
-- Create: `apps/desktop/src/main.tsx`
-- Create: `apps/desktop/src/app/App.tsx`
-- Create: `apps/desktop/src/app/App.test.tsx`
-- Create: `apps/desktop/src/design-system/tokens.css`
-- Create: `apps/desktop/src/styles.css`
+**文件：**
+- 创建：`apps/desktop/index.html`
+- 创建：`apps/desktop/src/main.tsx`
+- 创建：`apps/desktop/src/app/App.tsx`
+- 创建：`apps/desktop/src/app/App.test.tsx`
+- 创建：`apps/desktop/src/design-system/tokens.css`
+- 创建：`apps/desktop/src/styles.css`
 
-**Interfaces:**
-- Consumes: `MnemeApiClient`, `KernelHealth`, `EventsResponse` from Task 6.
-- Produces: `App({ client }: { client: MnemeApiClient }): JSX.Element`.
+**接口：**
+- 消费：Task 6 的 `MnemeApiClient`、`KernelHealth`、`EventsResponse`。
+- 产出：`App({ client }: { client: MnemeApiClient }): JSX.Element`。
 
-- [ ] **Step 1: Write app component test first**
+- [ ] **Step 1：先写组件测试**
 
-Write `apps/desktop/src/app/App.test.tsx`:
+写入 `apps/desktop/src/app/App.test.tsx`：
 
 ```tsx
 import '@testing-library/jest-dom/vitest';
@@ -1360,7 +1319,7 @@ function createClient(): MnemeApiClient {
 }
 
 describe('App', () => {
-  it('renders the Mneme workbench and kernel health', async () => {
+  it('渲染 Mneme Workbench 和 Kernel 健康状态', async () => {
     render(<App client={createClient()} />);
 
     expect(screen.getByRole('heading', { name: 'Mneme Workbench' })).toBeInTheDocument();
@@ -1372,19 +1331,17 @@ describe('App', () => {
 });
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
-
-Run:
+- [ ] **Step 2：运行测试确认失败**
 
 ```bash
 pnpm --filter @mneme/desktop test -- src/app/App.test.tsx
 ```
 
-Expected: FAIL because `./App` does not exist.
+期望：失败，因为 `./App` 还不存在。
 
-- [ ] **Step 3: Implement app component**
+- [ ] **Step 3：实现 App 组件**
 
-Write `apps/desktop/src/app/App.tsx`:
+写入 `apps/desktop/src/app/App.tsx`：
 
 ```tsx
 import { useEffect, useState } from 'react';
@@ -1404,6 +1361,7 @@ export function App({ client }: AppProps) {
 
     async function loadKernelState() {
       try {
+        // 第一版页面只读取健康状态和事件列表，证明 UI 已经通过 API 边界访问 Kernel。
         const [nextHealth, nextEvents] = await Promise.all([
           client.getHealth(),
           client.listEvents(),
@@ -1453,26 +1411,9 @@ export function App({ client }: AppProps) {
 }
 ```
 
-- [ ] **Step 4: Create browser entry files and styles**
+- [ ] **Step 4：创建浏览器入口和样式**
 
-Write `apps/desktop/index.html`:
-
-```html
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Mneme</title>
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.tsx"></script>
-  </body>
-</html>
-```
-
-Write `apps/desktop/src/main.tsx`:
+写入 `apps/desktop/index.html`、`apps/desktop/src/main.tsx`、`apps/desktop/src/design-system/tokens.css`、`apps/desktop/src/styles.css`。`main.tsx`：
 
 ```tsx
 import React from 'react';
@@ -1482,6 +1423,7 @@ import { App } from './app/App';
 import './design-system/tokens.css';
 import './styles.css';
 
+// 开发期默认连接本地 daemon；后续 Tauri 阶段可以改成由桌面壳注入。
 const client = createMnemeApiClient(import.meta.env.VITE_MNEME_API_BASE_URL ?? 'http://127.0.0.1:3766');
 
 ReactDOM.createRoot(document.getElementById('root') as HTMLElement).render(
@@ -1491,128 +1433,9 @@ ReactDOM.createRoot(document.getElementById('root') as HTMLElement).render(
 );
 ```
 
-Write `apps/desktop/src/design-system/tokens.css`:
+`tokens.css` 先定义深色主题、间距、圆角、字体 token；`styles.css` 创建 hero panel、status grid、error banner、移动端单列布局。
 
-```css
-:root {
-  color-scheme: dark;
-  --mneme-color-bg: #080a0f;
-  --mneme-color-panel: #10141d;
-  --mneme-color-panel-strong: #171d2a;
-  --mneme-color-text: #eef3ff;
-  --mneme-color-muted: #9aa7bd;
-  --mneme-color-accent: #9fd3ff;
-  --mneme-color-risk: #ffb4a8;
-  --mneme-radius-lg: 24px;
-  --mneme-radius-md: 16px;
-  --mneme-space-1: 0.25rem;
-  --mneme-space-2: 0.5rem;
-  --mneme-space-3: 0.75rem;
-  --mneme-space-4: 1rem;
-  --mneme-space-6: 1.5rem;
-  --mneme-space-8: 2rem;
-  --mneme-font-sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-}
-```
-
-Write `apps/desktop/src/styles.css`:
-
-```css
-* {
-  box-sizing: border-box;
-}
-
-body {
-  margin: 0;
-  min-width: 320px;
-  min-height: 100vh;
-  background: radial-gradient(circle at top left, rgba(159, 211, 255, 0.16), transparent 30%), var(--mneme-color-bg);
-  color: var(--mneme-color-text);
-  font-family: var(--mneme-font-sans);
-}
-
-.mneme-shell {
-  width: min(1120px, calc(100vw - 48px));
-  margin: 0 auto;
-  padding: 72px 0;
-}
-
-.hero-panel,
-.status-card {
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  background: linear-gradient(135deg, rgba(16, 20, 29, 0.92), rgba(23, 29, 42, 0.72));
-  border-radius: var(--mneme-radius-lg);
-  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.35);
-}
-
-.hero-panel {
-  padding: var(--mneme-space-8);
-}
-
-.eyebrow,
-.label,
-.meta {
-  color: var(--mneme-color-muted);
-}
-
-.eyebrow,
-.label {
-  margin: 0;
-  text-transform: uppercase;
-  letter-spacing: 0.14em;
-  font-size: 0.72rem;
-  font-weight: 700;
-}
-
-h1 {
-  margin: var(--mneme-space-3) 0;
-  font-size: clamp(2.5rem, 7vw, 5.5rem);
-  line-height: 0.95;
-}
-
-.lede {
-  max-width: 680px;
-  color: var(--mneme-color-muted);
-  font-size: 1.1rem;
-  line-height: 1.7;
-}
-
-.status-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: var(--mneme-space-4);
-  margin-top: var(--mneme-space-4);
-}
-
-.status-card {
-  display: grid;
-  gap: var(--mneme-space-2);
-  padding: var(--mneme-space-6);
-}
-
-.status-card strong {
-  font-size: 1.4rem;
-}
-
-.error-banner {
-  margin-top: var(--mneme-space-4);
-  padding: var(--mneme-space-4);
-  color: var(--mneme-color-risk);
-  background: rgba(255, 180, 168, 0.1);
-  border: 1px solid rgba(255, 180, 168, 0.22);
-  border-radius: var(--mneme-radius-md);
-}
-
-@media (max-width: 720px) {
-  .status-grid {
-    grid-template-columns: 1fr;
-  }
-}
-```
-
-- [ ] **Step 5: Run app tests and build**
-
-Run:
+- [ ] **Step 5：运行 app 测试和构建**
 
 ```bash
 pnpm --filter @mneme/desktop test -- src/app/App.test.tsx
@@ -1620,9 +1443,9 @@ pnpm --filter @mneme/desktop check
 pnpm --filter @mneme/desktop build
 ```
 
-Expected: app test passes, TypeScript check exits 0, and Vite build succeeds.
+期望：组件测试通过，TypeScript check 退出 0，Vite build 成功。
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6：提交**
 
 ```bash
 git add apps/desktop
@@ -1631,21 +1454,21 @@ git commit -m "feat: add minimal Mneme workbench"
 
 ---
 
-### Task 8: Add root verification scripts and foundation documentation
+## Task 8：添加根验证脚本与基础文档
 
-**Files:**
-- Modify: `package.json`
-- Create: `docs/architecture/phase-1-foundation.md`
-- Create: `.gitignore`
-- Create: `README.md`
+**文件：**
+- 修改：`package.json`
+- 创建：`.gitignore`
+- 创建：`README.md`
+- 创建：`docs/architecture/phase-1-foundation.md`
 
-**Interfaces:**
-- Consumes: Rust workspace and desktop workspace from prior tasks.
-- Produces: documented verification commands for future agents and humans.
+**接口：**
+- 消费：前面任务创建的 Rust workspace 与 desktop workspace。
+- 产出：给后续开发者和 Agent 使用的统一验证命令与基础架构说明。
 
-- [ ] **Step 1: Add root scripts for Rust and UI checks**
+- [ ] **Step 1：添加根验证脚本**
 
-Edit root `package.json`:
+更新根 `package.json`：
 
 ```json
 {
@@ -1664,9 +1487,9 @@ Edit root `package.json`:
 }
 ```
 
-- [ ] **Step 2: Create gitignore**
+- [ ] **Step 2：创建 gitignore**
 
-Write `.gitignore`:
+写入 `.gitignore`：
 
 ```gitignore
 /target/
@@ -1679,74 +1502,74 @@ Write `.gitignore`:
 !.env.example
 ```
 
-- [ ] **Step 3: Create README**
+- [ ] **Step 3：创建中文 README**
 
-Write `README.md`:
+写入 `README.md`：
 
 ````markdown
 # Mneme
 
-Mneme is a Personal AI Kernel: a local-first, auditable workbench for agents, context, tools, memory, artifacts, and operation history.
+Mneme 是一个 Personal AI Kernel（个人 AI 内核）：面向本地优先、可审计、可扩展的 Agent 工作台，用来管理 runs、context、tools、memory、artifacts 和 operation history。
 
-## Current phase
+## 当前阶段
 
-Phase 1 builds the foundation:
+Phase 1 构建基础切片：
 
-- Rust kernel crate
-- append-only in-memory Operation Ledger
-- local Axum API
+- Rust Kernel crate
+- 内存版追加式 Operation Ledger
+- 本地 Axum API
 - daemon binary
 - TypeScript API client
-- minimal React workbench
+- 最小 React Workbench
 
-## Prerequisites
+## 环境要求
 
 - Rust stable via rustup
 - Node.js 24+
 - pnpm 11+
 
-## Verify
+## 验证
 
 ```bash
 pnpm check
 ```
 
-## Run local daemon
+## 启动本地 daemon
 
 ```bash
 cargo run -p mneme-daemon
 ```
 
-Health endpoint:
+健康检查：
 
 ```bash
 curl http://127.0.0.1:3766/api/v1/health
 ```
 
-## Run desktop web shell during foundation phase
+## 启动基础阶段 Web shell
 
 ```bash
 pnpm --filter @mneme/desktop dev
 ```
 ````
 
-- [ ] **Step 4: Create architecture note**
+- [ ] **Step 4：创建架构说明**
 
-Write `docs/architecture/phase-1-foundation.md`:
+写入 `docs/architecture/phase-1-foundation.md`：
 
 ````markdown
 # Phase 1 Foundation Architecture
 
-Phase 1 proves the first vertical slice of Mneme without durable storage or model calls.
+Phase 1 只验证 Mneme 的第一条纵向切片，不包含持久化存储和真实模型调用。
 
-## Boundaries
+## 边界
 
-- `mneme-kernel` owns domain types and the Operation Ledger interface.
-- `mneme-api` exposes external HTTP DTOs and routes.
-- `mneme-daemon` owns process startup and the local bind address.
-- `apps/desktop` consumes the API through a typed client and does not write kernel state directly.
+- `mneme-kernel` 拥有领域类型和 Operation Ledger 接口。
+- `mneme-api` 暴露 HTTP DTO 与 routes。
+- `mneme-daemon` 负责进程启动和本地监听地址。
+- `apps/desktop` 通过 typed API client 消费 Kernel API，不直接写 Kernel 状态。
 
-## Data flow
+## 数据流
 
 ```text
 React Workbench
@@ -1756,30 +1579,26 @@ React Workbench
   → mneme-kernel ledger
 ```
 
-## Current storage
+## 当前存储
 
-The ledger is in-memory in this phase. Durable SQLite storage starts in the next milestone so event schemas and API boundaries can be validated first.
+本阶段 Ledger 是内存实现。下一阶段再加入 SQLite 持久化，这样可以先确认事件 schema 与 API 边界足够稳定。
 
-## Verification
-
-Run:
+## 验证
 
 ```bash
 pnpm check
 ```
 ````
 
-- [ ] **Step 5: Run complete verification**
-
-Run:
+- [ ] **Step 5：运行完整验证**
 
 ```bash
 pnpm check
 ```
 
-Expected: Rust formatting and tests pass; TypeScript checks and Vitest tests pass.
+期望：Rust 格式检查与测试通过；TypeScript check 与 Vitest 测试通过。
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6：提交**
 
 ```bash
 git add .gitignore README.md package.json docs/architecture/phase-1-foundation.md
@@ -1788,9 +1607,9 @@ git commit -m "docs: document phase 1 foundation"
 
 ---
 
-## Final Verification for This Plan
+## 三、本计划最终验证
 
-After Task 8, run:
+完成 Task 8 后运行：
 
 ```bash
 git status --short --branch
@@ -1798,13 +1617,13 @@ pnpm check
 git log --oneline -8
 ```
 
-Expected:
+期望：
 
-- `git status --short --branch` shows a clean branch tracking `origin/main` or only intentional unpushed commits.
-- `pnpm check` exits 0.
-- `git log --oneline -8` shows one commit per task in this plan.
+- `git status --short --branch` 显示分支干净，或只显示明确准备 push 的本地 commit。
+- `pnpm check` 退出 0。
+- `git log --oneline -8` 能看到本计划每个任务对应的 commit。
 
-Push after verification:
+最终 push：
 
 ```bash
 git push origin main
@@ -1812,18 +1631,18 @@ git push origin main
 
 ---
 
-## Explicitly Out of Scope for This Plan
+## 四、本阶段明确不做的事情
 
-These are intentionally deferred to later milestone plans:
+这些内容留到后续里程碑，不要混进 Phase 1：
 
-- SQLite persistence and SQLx migrations.
-- Tauri 2 packaging.
-- generated OpenAPI / generated TypeScript SDK.
-- real LLM provider calls.
-- worker protocol implementation.
-- effect-typed tool execution.
-- MCP/OpenAPI/CLI adapters.
-- artifact content-addressed store.
-- Tantivy or vector indexes.
-- self-hosted server.
-- authentication or device registration.
+- SQLite 持久化与 SQLx migrations。
+- Tauri 2 桌面打包。
+- 生成 OpenAPI / 生成 TypeScript SDK。
+- 真实 LLM provider 调用。
+- worker protocol 实现。
+- effect-typed tool 执行。
+- MCP/OpenAPI/CLI adapters。
+- content-addressed artifact store。
+- Tantivy 或 vector indexes。
+- self-hosted server。
+- authentication 或 device registration。
