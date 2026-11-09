@@ -9,6 +9,10 @@ pub type SharedOperationLedger = Arc<dyn OperationLedger>;
 pub enum LedgerError {
     #[error("operation ledger lock is poisoned")]
     Poisoned,
+    #[error("operation ledger storage failed: {0}")]
+    Storage(String),
+    #[error("operation event payload is invalid: {0}")]
+    InvalidPayload(String),
 }
 
 /// Operation Ledger 的抽象边界。

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use std::{fmt, str::FromStr};
 use uuid::Uuid;
 
 /// Ledger 中每条事件的唯一 ID。
@@ -29,6 +29,14 @@ impl fmt::Display for EventId {
     }
 }
 
+impl FromStr for EventId {
+    type Err = uuid::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self(Uuid::parse_str(value)?))
+    }
+}
+
 impl RunId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
@@ -44,6 +52,14 @@ impl Default for RunId {
 impl fmt::Display for RunId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+impl FromStr for RunId {
+    type Err = uuid::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self(Uuid::parse_str(value)?))
     }
 }
 

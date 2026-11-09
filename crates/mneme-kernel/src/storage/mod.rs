@@ -1,3 +1,3 @@
 pub mod sqlite;
 
-pub use sqlite::{SqliteStore, SqliteStoreError};
+pub use sqlite::{SqliteOperationLedger, SqliteStore, SqliteStoreError};

@@ -8,4 +8,4 @@ pub use events::{OperationEvent, OperationEventKind};
 pub use health::{kernel_health, KernelHealth};
 pub use ids::{EventId, RunId};
 pub use ledger::{InMemoryOperationLedger, LedgerError, OperationLedger, SharedOperationLedger};
-pub use storage::{SqliteStore, SqliteStoreError};
+pub use storage::{SqliteOperationLedger, SqliteStore, SqliteStoreError};
