@@ -3,14 +3,13 @@ use crate::types::{
 };
 use axum::{extract::State, http::StatusCode, routing::get, Json, Router};
 use mneme_kernel::{
-    kernel_health, InMemoryOperationLedger, InMemoryRunProjectionStore, OperationEvent, RunId,
-    SharedOperationLedger, SharedRunProjectionStore,
+    kernel_health, ComposedRunService, InMemoryOperationLedger, InMemoryRunProjectionStore,
+    RunServiceError, SharedOperationLedger, SharedRunProjectionStore, SharedRunService,
 };
 
 #[derive(Clone)]
 pub struct ApiState {
-    pub ledger: SharedOperationLedger,
-    pub run_store: SharedRunProjectionStore,
+    pub run_service: SharedRunService,
 }
 
 /// 创建第一版本地 API 路由。
@@ -27,11 +26,15 @@ pub fn build_router_with_state(
     ledger: SharedOperationLedger,
     run_store: SharedRunProjectionStore,
 ) -> Router {
+    build_router_with_service(ComposedRunService::new(ledger, run_store).shared())
+}
+
+pub fn build_router_with_service(run_service: SharedRunService) -> Router {
     Router::new()
         .route("/api/v1/health", get(get_health))
         .route("/api/v1/events", get(list_events))
         .route("/api/v1/runs", get(list_runs).post(create_run))
-        .with_state(ApiState { ledger, run_store })
+        .with_state(ApiState { run_service })
 }
 
 async fn get_health() -> Json<HealthResponse> {
@@ -40,19 +43,19 @@ async fn get_health() -> Json<HealthResponse> {
 
 async fn list_events(State(state): State<ApiState>) -> Result<Json<EventsResponse>, StatusCode> {
     let events = state
-        .ledger
-        .list()
+        .run_service
+        .list_events()
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(service_error_to_status)?;
     Ok(Json(EventsResponse { events }))
 }
 
 async fn list_runs(State(state): State<ApiState>) -> Result<Json<RunsResponse>, StatusCode> {
     let runs = state
-        .run_store
+        .run_service
         .list_runs()
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(service_error_to_status)?;
 
     Ok(Json(RunsResponse { runs }))
 }
@@ -61,26 +64,24 @@ async fn create_run(
     State(state): State<ApiState>,
     Json(request): Json<CreateRunRequest>,
 ) -> Result<Json<CreateRunResponse>, StatusCode> {
-    if request.instruction.trim().is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
-    let run_id = RunId::new();
-    let event = OperationEvent::new_run_started(run_id, request.instruction);
-    state
-        .ledger
-        .append(event.clone())
+    let outcome = state
+        .run_service
+        .create_run(request.instruction)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    state
-        .run_store
-        .apply(&event)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(service_error_to_status)?;
 
     Ok(Json(CreateRunResponse {
-        run_id: run_id.to_string(),
+        run_id: outcome.run_id.to_string(),
     }))
+}
+
+fn service_error_to_status(error: RunServiceError) -> StatusCode {
+    match error {
+        RunServiceError::InvalidInstruction => StatusCode::BAD_REQUEST,
+        RunServiceError::Ledger(_) | RunServiceError::Projection(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
 }
 
 #[cfg(test)]
@@ -91,7 +92,7 @@ mod tests {
         http::{header, Method, Request},
     };
     use http_body_util::BodyExt;
-    use mneme_kernel::OperationLedger;
+    use mneme_kernel::{ComposedRunService, OperationLedger};
     use serde_json::json;
     use tower::ServiceExt;
 
@@ -146,7 +147,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_run_rejects_blank_instruction() {
+    async fn create_run_rejects_blank_instruction_through_service() {
         let app = build_router(InMemoryOperationLedger::new());
 
         let response = app
@@ -168,7 +169,8 @@ mod tests {
     async fn list_runs_returns_created_run_projection() {
         let ledger = InMemoryOperationLedger::new();
         let run_store = InMemoryRunProjectionStore::new();
-        let app = build_router_with_state(ledger.shared(), run_store.shared());
+        let service = ComposedRunService::new(ledger.shared(), run_store.shared()).shared();
+        let app = build_router_with_service(service);
 
         let create_response = app
             .clone()
