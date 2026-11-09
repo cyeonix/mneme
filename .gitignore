@@ -2,6 +2,9 @@
 .worktrees/
 worktrees/
 
+# Superpowers / SDD 本地执行账本与交接材料
+.superpowers/
+
 # Rust 构建产物
 target/
 
