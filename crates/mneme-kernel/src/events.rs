@@ -33,6 +33,28 @@ impl OperationEvent {
             },
         }
     }
+
+    pub fn new_run_completed(run_id: RunId, summary: impl Into<String>) -> Self {
+        Self {
+            id: EventId::new(),
+            run_id,
+            occurred_at: OffsetDateTime::now_utc(),
+            kind: OperationEventKind::RunCompleted {
+                summary: summary.into(),
+            },
+        }
+    }
+
+    pub fn new_run_failed(run_id: RunId, reason: impl Into<String>) -> Self {
+        Self {
+            id: EventId::new(),
+            run_id,
+            occurred_at: OffsetDateTime::now_utc(),
+            kind: OperationEventKind::RunFailed {
+                reason: reason.into(),
+            },
+        }
+    }
 }
 
 #[cfg(test)]
