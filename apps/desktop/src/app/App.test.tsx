@@ -5,9 +5,13 @@ import type {
   ArtifactDetail,
   ArtifactsResponse,
   ContextBundlesResponse,
+  DocumentChunksResponse,
   EventsResponse,
   KernelHealth,
+  KnowledgeSourcesResponse,
+  MemoriesResponse,
   MnemeApiClient,
+  RetrievalTracesResponse,
   RunsResponse,
 } from '../api/client';
 import { App } from './App';
@@ -19,6 +23,10 @@ interface TestClientState {
   artifacts?: ArtifactsResponse;
   artifactDetail?: ArtifactDetail;
   contextBundles?: ContextBundlesResponse;
+  knowledgeSources?: KnowledgeSourcesResponse['knowledge_sources'];
+  documentChunks?: DocumentChunksResponse['document_chunks'];
+  memories?: MemoriesResponse['memories'];
+  retrievalTraces?: RetrievalTracesResponse['retrieval_traces'];
 }
 
 function createTestClient(state: TestClientState = {}): MnemeApiClient {
@@ -116,16 +124,16 @@ function createTestClient(state: TestClientState = {}): MnemeApiClient {
         created_at: '2026-11-10T00:00:00Z',
       };
     },
-    listKnowledgeSources: vi.fn(async () => ({ knowledge_sources: [] })),
+    listKnowledgeSources: vi.fn(async () => ({ knowledge_sources: state.knowledgeSources ?? [] })),
     createKnowledgeSourceFromArtifact: vi.fn(async () => ({ knowledge_source_id: 'source-1' })),
     createKnowledgeSourceFromContextBundle: vi.fn(async () => ({ knowledge_source_id: 'source-1' })),
     createManualKnowledgeSource: vi.fn(async () => ({ knowledge_source_id: 'source-1' })),
-    listDocumentChunks: vi.fn(async () => ({ document_chunks: [] })),
+    listDocumentChunks: vi.fn(async () => ({ document_chunks: state.documentChunks ?? [] })),
     chunkKnowledgeSource: vi.fn(async () => ({ document_chunks: [] })),
-    listMemories: vi.fn(async () => ({ memories: [] })),
+    listMemories: vi.fn(async () => ({ memories: state.memories ?? [] })),
     recordMemory: vi.fn(async () => ({ memory_id: 'memory-1' })),
     search: vi.fn(async () => ({ query: 'sqlite', hits: [], retrieval_trace_id: 'trace-1' })),
-    listRetrievalTraces: vi.fn(async () => ({ retrieval_traces: [] })),
+    listRetrievalTraces: vi.fn(async () => ({ retrieval_traces: state.retrievalTraces ?? [] })),
   };
 }
 
@@ -233,6 +241,72 @@ describe('App', () => {
     expect(await screen.findByText('Debug context')).toBeInTheDocument();
     expect(await screen.findByText('1 artifact')).toBeInTheDocument();
     expect(await screen.findByText('2 events')).toBeInTheDocument();
+  });
+
+  it('renders knowledge search memory and retrieval trace sections', async () => {
+    const client = createTestClient({
+      knowledgeSources: [
+        {
+          knowledge_source_id: 'source-1',
+          run_id: 'run-123',
+          source_kind: 'artifact',
+          artifact_id: 'artifact-1',
+          context_bundle_id: null,
+          title: 'Run summary source',
+          summary: 'SQLite deterministic retrieval source',
+          created_at: '2026-11-10T00:00:00Z',
+        },
+      ],
+      documentChunks: [
+        {
+          document_chunk_id: 'chunk-1',
+          knowledge_source_id: 'source-1',
+          run_id: 'run-123',
+          sequence: 0,
+          text: 'SQLite deterministic retrieval chunk',
+          char_start: 0,
+          char_end: 36,
+          created_at: '2026-11-10T00:00:00Z',
+        },
+      ],
+      memories: [
+        {
+          memory_id: 'memory-1',
+          knowledge_source_id: 'source-1',
+          run_id: 'run-123',
+          kind: 'decision',
+          title: 'Use SQLite-first search',
+          body: 'Search sidecars are rebuildable.',
+          confidence: 0.9,
+          created_at: '2026-11-10T00:00:00Z',
+        },
+      ],
+      retrievalTraces: [
+        {
+          retrieval_trace_id: 'trace-1',
+          run_id: 'run-123',
+          query: 'sqlite',
+          result_chunk_ids: ['chunk-1'],
+          result_memory_ids: ['memory-1'],
+          explanation: 'M6 deterministic keyword retrieval matched sqlite',
+          created_at: '2026-11-10T00:00:00Z',
+        },
+      ],
+    });
+
+    render(<App client={client} />);
+
+    expect(await screen.findByText('Knowledge Search')).toBeInTheDocument();
+    expect(screen.getByText('Run summary source')).toBeInTheDocument();
+    expect(screen.getByText('SQLite deterministic retrieval chunk')).toBeInTheDocument();
+    expect(screen.getByText('Memory Inspector')).toBeInTheDocument();
+    expect(screen.getByText('Use SQLite-first search')).toBeInTheDocument();
+    expect(screen.getByText('Retrieval Traces')).toBeInTheDocument();
+    expect(screen.getByText('M6 deterministic keyword retrieval matched sqlite')).toBeInTheDocument();
+    expect(
+      screen.getByText('Milestone 6 search uses deterministic keyword retrieval, not semantic embeddings.'),
+    ).toBeInTheDocument();
+    expect(client.search).not.toHaveBeenCalled();
   });
 
   it('shows tool activity from the operation ledger', async () => {

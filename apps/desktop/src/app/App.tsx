@@ -3,9 +3,13 @@ import type {
   ArtifactDetail,
   ArtifactRecord,
   ContextBundlesResponse,
+  DocumentChunksResponse,
   EventsResponse,
   KernelHealth,
+  KnowledgeSourcesResponse,
+  MemoriesResponse,
   MnemeApiClient,
+  RetrievalTracesResponse,
   RunsResponse,
 } from '../api/client';
 
@@ -104,6 +108,10 @@ export function App({ client }: AppProps) {
   const [runs, setRuns] = useState<RunsResponse>({ runs: [] });
   const [artifactPreviews, setArtifactPreviews] = useState<ArtifactPreviewItem[]>([]);
   const [contextBundles, setContextBundles] = useState<ContextBundlesResponse>({ context_bundles: [] });
+  const [knowledgeSources, setKnowledgeSources] = useState<KnowledgeSourcesResponse>({ knowledge_sources: [] });
+  const [documentChunks, setDocumentChunks] = useState<DocumentChunksResponse>({ document_chunks: [] });
+  const [memories, setMemories] = useState<MemoriesResponse>({ memories: [] });
+  const [retrievalTraces, setRetrievalTraces] = useState<RetrievalTracesResponse>({ retrieval_traces: [] });
   const [error, setError] = useState<string | null>(null);
   const toolActivity = toolActivityFromEvents(events);
 
@@ -113,12 +121,26 @@ export function App({ client }: AppProps) {
     async function loadKernelState() {
       try {
         // Workbench 通过 API 边界读取 Kernel 状态、Operation Ledger 事件和 runs 读模型。
-        const [nextHealth, nextEvents, nextRuns, nextArtifacts, nextContextBundles] = await Promise.all([
+        const [
+          nextHealth,
+          nextEvents,
+          nextRuns,
+          nextArtifacts,
+          nextContextBundles,
+          nextKnowledgeSources,
+          nextDocumentChunks,
+          nextMemories,
+          nextRetrievalTraces,
+        ] = await Promise.all([
           client.getHealth(),
           client.listEvents(),
           client.listRuns(),
           client.listArtifacts(),
           client.listContextBundles(),
+          client.listKnowledgeSources(),
+          client.listDocumentChunks(),
+          client.listMemories(),
+          client.listRetrievalTraces(),
         ]);
         const nextArtifactPreviews = await Promise.all(
           nextArtifacts.artifacts.map(async (record) => {
@@ -135,6 +157,10 @@ export function App({ client }: AppProps) {
           setRuns(nextRuns);
           setArtifactPreviews(nextArtifactPreviews);
           setContextBundles(nextContextBundles);
+          setKnowledgeSources(nextKnowledgeSources);
+          setDocumentChunks(nextDocumentChunks);
+          setMemories(nextMemories);
+          setRetrievalTraces(nextRetrievalTraces);
         }
       } catch (unknownError) {
         if (!cancelled) {
@@ -255,6 +281,94 @@ export function App({ client }: AppProps) {
                   <span>{countLabel(bundle.event_ids.length, 'event', 'events')}</span>
                 </div>
                 <small>{bundle.created_at}</small>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      <section className="panel">
+        <h2>Knowledge Search</h2>
+        <p className="muted">Milestone 6 search uses deterministic keyword retrieval, not semantic embeddings.</p>
+        <p className="muted">Read-only inspector: existing sources and chunks are displayed without running a search.</p>
+        <div className="knowledge-grid">
+          <article className="knowledge-card">
+            <h3>Sources</h3>
+            {knowledgeSources.knowledge_sources.length === 0 ? (
+              <p className="muted">No knowledge sources have been recorded yet.</p>
+            ) : (
+              <ul className="knowledge-list">
+                {knowledgeSources.knowledge_sources.map((source) => (
+                  <li key={source.knowledge_source_id} className="knowledge-card">
+                    <div className="artifact-card-header">
+                      <strong>{source.title}</strong>
+                      <span className="artifact-kind">{source.source_kind}</span>
+                    </div>
+                    <p>{source.summary}</p>
+                    <small>{source.created_at}</small>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </article>
+          <article className="knowledge-card">
+            <h3>Chunks</h3>
+            {documentChunks.document_chunks.length === 0 ? (
+              <p className="muted">No document chunks have been generated yet.</p>
+            ) : (
+              <ul className="knowledge-list">
+                {documentChunks.document_chunks.map((chunk) => (
+                  <li key={chunk.document_chunk_id} className="knowledge-card">
+                    <span className="label">Chunk {chunk.sequence}</span>
+                    <p>{chunk.text}</p>
+                    <small>
+                      chars {chunk.char_start}-{chunk.char_end}
+                    </small>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </article>
+        </div>
+      </section>
+
+      <section className="panel">
+        <h2>Memory Inspector</h2>
+        {memories.memories.length === 0 ? (
+          <p className="muted">No memories have been recorded yet. This panel is read-only.</p>
+        ) : (
+          <ul className="knowledge-list">
+            {memories.memories.map((memory) => (
+              <li key={memory.memory_id} className="memory-card">
+                <div className="artifact-card-header">
+                  <strong>{memory.title}</strong>
+                  <span className="artifact-kind">{memory.kind}</span>
+                </div>
+                <p>{memory.body}</p>
+                <small>
+                  confidence {memory.confidence} · {memory.created_at}
+                </small>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      <section className="panel">
+        <h2>Retrieval Traces</h2>
+        {retrievalTraces.retrieval_traces.length === 0 ? (
+          <p className="muted">No retrieval traces have been recorded yet. Searches are not run automatically on load.</p>
+        ) : (
+          <ul className="knowledge-list">
+            {retrievalTraces.retrieval_traces.map((trace) => (
+              <li key={trace.retrieval_trace_id} className="trace-card">
+                <strong>{trace.query}</strong>
+                <div className="context-counts">
+                  <span>{countLabel(trace.result_chunk_ids.length, 'chunk', 'chunks')}</span>
+                  <span>{countLabel(trace.result_memory_ids.length, 'memory', 'memories')}</span>
+                </div>
+                <p>{trace.explanation}</p>
+                <small>{trace.created_at}</small>
               </li>
             ))}
           </ul>
