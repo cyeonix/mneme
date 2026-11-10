@@ -1,6 +1,7 @@
 use crate::types::{
     CreateRunRequest, CreateRunResponse, EventsResponse, HealthResponse, LifecycleTextRequest,
-    RunLifecycleResponse, RunsResponse,
+    RunLifecycleResponse, RunsResponse, ToolCallRequest, ToolCallResponse, ToolLifecycleRequest,
+    ToolLifecycleResponse, ToolResultRequest,
 };
 use axum::{
     extract::{Path, State},
@@ -9,8 +10,8 @@ use axum::{
     Json, Router,
 };
 use mneme_kernel::{
-    kernel_health, ComposedRunService, InMemoryOperationLedger, InMemoryRunProjectionStore,
-    RunServiceError, SharedOperationLedger, SharedRunProjectionStore, SharedRunService,
+    kernel_health, ComposedRunService, InMemoryOperationLedger, InMemoryRunProjectionStore, RunId,
+    RunServiceError, SharedOperationLedger, SharedRunProjectionStore, SharedRunService, ToolCallId,
 };
 
 #[derive(Clone)]
@@ -40,6 +41,26 @@ pub fn build_router_with_service(run_service: SharedRunService) -> Router {
         .route("/api/v1/health", get(get_health))
         .route("/api/v1/events", get(list_events))
         .route("/api/v1/runs", get(list_runs).post(create_run))
+        .route(
+            "/api/v1/runs/:run_id/tool-calls",
+            axum::routing::post(request_tool_call),
+        )
+        .route(
+            "/api/v1/runs/:run_id/tool-calls/:tool_call_id/approve",
+            axum::routing::post(approve_tool_call),
+        )
+        .route(
+            "/api/v1/runs/:run_id/tool-calls/:tool_call_id/deny",
+            axum::routing::post(deny_tool_call),
+        )
+        .route(
+            "/api/v1/runs/:run_id/tool-calls/:tool_call_id/result",
+            axum::routing::post(record_tool_result),
+        )
+        .route(
+            "/api/v1/runs/:run_id/tool-calls/:tool_call_id/fail",
+            axum::routing::post(record_tool_failure),
+        )
         .route(
             "/api/v1/runs/:run_id/model-requests",
             axum::routing::post(request_model),
@@ -94,7 +115,11 @@ async fn create_run(
     }))
 }
 
-fn parse_run_id(value: &str) -> Result<mneme_kernel::RunId, StatusCode> {
+fn parse_run_id(value: &str) -> Result<RunId, StatusCode> {
+    value.parse().map_err(|_| StatusCode::BAD_REQUEST)
+}
+
+fn parse_tool_call_id(value: &str) -> Result<ToolCallId, StatusCode> {
     value.parse().map_err(|_| StatusCode::BAD_REQUEST)
 }
 
@@ -102,6 +127,98 @@ fn lifecycle_response(outcome: mneme_kernel::RunLifecycleOutcome) -> Json<RunLif
     Json(RunLifecycleResponse {
         run_id: outcome.run_id.to_string(),
     })
+}
+
+fn tool_lifecycle_response(
+    outcome: mneme_kernel::ToolLifecycleOutcome,
+) -> Json<ToolLifecycleResponse> {
+    Json(ToolLifecycleResponse {
+        run_id: outcome.run_id.to_string(),
+        tool_call_id: outcome.tool_call_id.to_string(),
+    })
+}
+
+async fn request_tool_call(
+    State(state): State<ApiState>,
+    Path(run_id): Path<String>,
+    Json(request): Json<ToolCallRequest>,
+) -> Result<Json<ToolCallResponse>, StatusCode> {
+    let run_id = parse_run_id(&run_id)?;
+    let outcome = state
+        .run_service
+        .request_tool_call(
+            run_id,
+            request.tool_name,
+            request.effect,
+            request.input_json,
+        )
+        .await
+        .map_err(service_error_to_status)?;
+    Ok(Json(ToolCallResponse {
+        run_id: outcome.run_id.to_string(),
+        tool_call_id: outcome.tool_call_id.to_string(),
+        approval: outcome.approval,
+    }))
+}
+
+async fn approve_tool_call(
+    State(state): State<ApiState>,
+    Path((run_id, tool_call_id)): Path<(String, String)>,
+    Json(request): Json<ToolLifecycleRequest>,
+) -> Result<Json<ToolLifecycleResponse>, StatusCode> {
+    let run_id = parse_run_id(&run_id)?;
+    let tool_call_id = parse_tool_call_id(&tool_call_id)?;
+    let outcome = state
+        .run_service
+        .approve_tool_call(run_id, tool_call_id, request.text)
+        .await
+        .map_err(service_error_to_status)?;
+    Ok(tool_lifecycle_response(outcome))
+}
+
+async fn deny_tool_call(
+    State(state): State<ApiState>,
+    Path((run_id, tool_call_id)): Path<(String, String)>,
+    Json(request): Json<ToolLifecycleRequest>,
+) -> Result<Json<ToolLifecycleResponse>, StatusCode> {
+    let run_id = parse_run_id(&run_id)?;
+    let tool_call_id = parse_tool_call_id(&tool_call_id)?;
+    let outcome = state
+        .run_service
+        .deny_tool_call(run_id, tool_call_id, request.text)
+        .await
+        .map_err(service_error_to_status)?;
+    Ok(tool_lifecycle_response(outcome))
+}
+
+async fn record_tool_result(
+    State(state): State<ApiState>,
+    Path((run_id, tool_call_id)): Path<(String, String)>,
+    Json(request): Json<ToolResultRequest>,
+) -> Result<Json<ToolLifecycleResponse>, StatusCode> {
+    let run_id = parse_run_id(&run_id)?;
+    let tool_call_id = parse_tool_call_id(&tool_call_id)?;
+    let outcome = state
+        .run_service
+        .record_tool_result(run_id, tool_call_id, request.output_json)
+        .await
+        .map_err(service_error_to_status)?;
+    Ok(tool_lifecycle_response(outcome))
+}
+
+async fn record_tool_failure(
+    State(state): State<ApiState>,
+    Path((run_id, tool_call_id)): Path<(String, String)>,
+    Json(request): Json<ToolLifecycleRequest>,
+) -> Result<Json<ToolLifecycleResponse>, StatusCode> {
+    let run_id = parse_run_id(&run_id)?;
+    let tool_call_id = parse_tool_call_id(&tool_call_id)?;
+    let outcome = state
+        .run_service
+        .record_tool_failure(run_id, tool_call_id, request.text)
+        .await
+        .map_err(service_error_to_status)?;
+    Ok(tool_lifecycle_response(outcome))
 }
 
 async fn request_model(
@@ -165,6 +282,7 @@ fn service_error_to_status(error: RunServiceError) -> StatusCode {
         RunServiceError::InvalidInstruction
         | RunServiceError::InvalidRunId
         | RunServiceError::InvalidLifecycleInput
+        | RunServiceError::InvalidToolInput
         | RunServiceError::RunAlreadyTerminal => StatusCode::BAD_REQUEST,
         RunServiceError::Ledger(_) | RunServiceError::Projection(_) => {
             StatusCode::INTERNAL_SERVER_ERROR
@@ -349,6 +467,479 @@ mod tests {
         let payload: RunsResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload.runs.len(), 1);
         assert_eq!(payload.runs[0].instruction, "SQLite service run");
+    }
+
+    #[tokio::test]
+    async fn api_records_read_only_tool_call_as_auto_approved() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let service = SqliteRunService::new(store).shared();
+        let app = build_router_with_service(service);
+
+        let create_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/runs")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"instruction":"读取文件"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let create_body = create_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let created: CreateRunResponse = serde_json::from_slice(&create_body).unwrap();
+
+        let tool_response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/v1/runs/{}/tool-calls", created.run_id))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"tool_name":"read_file","effect":"read_only","input_json":{"path":"README.md"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(tool_response.status(), StatusCode::OK);
+        let body = tool_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let tool: ToolCallResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(tool.run_id, created.run_id);
+        assert_eq!(
+            tool.approval,
+            mneme_kernel::ToolApprovalDecision::AutoApproved
+        );
+        assert_eq!(tool.tool_call_id.len(), 36);
+    }
+
+    #[tokio::test]
+    async fn api_records_tool_result_after_auto_approved_request() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let service = SqliteRunService::new(store).shared();
+        let app = build_router_with_service(service);
+
+        let create_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/runs")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"instruction":"读取后汇报"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_response.status(), StatusCode::OK);
+        let create_body = create_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let created: CreateRunResponse = serde_json::from_slice(&create_body).unwrap();
+
+        let tool_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/v1/runs/{}/tool-calls", created.run_id))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"tool_name":"read_file","effect":"read_only","input_json":{"path":"README.md"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tool_response.status(), StatusCode::OK);
+        let tool_body = tool_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let tool: ToolCallResponse = serde_json::from_slice(&tool_body).unwrap();
+
+        let result_response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/v1/runs/{}/tool-calls/{}/result",
+                        created.run_id, tool.tool_call_id
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r##"{"output_json":{"content":"# Mneme","bytes":7}}"##,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result_response.status(), StatusCode::OK);
+        let result_body = result_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let result: ToolLifecycleResponse = serde_json::from_slice(&result_body).unwrap();
+        assert_eq!(result.run_id, created.run_id);
+        assert_eq!(result.tool_call_id, tool.tool_call_id);
+    }
+
+    #[tokio::test]
+    async fn api_records_manual_tool_approval() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let service = SqliteRunService::new(store).shared();
+        let app = build_router_with_service(service);
+
+        let create_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/runs")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"instruction":"审批写入工具"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_response.status(), StatusCode::OK);
+        let create_body = create_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let created: CreateRunResponse = serde_json::from_slice(&create_body).unwrap();
+
+        let tool_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/v1/runs/{}/tool-calls", created.run_id))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"tool_name":"write_file","effect":"local_write","input_json":{"path":"README.md"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tool_response.status(), StatusCode::OK);
+        let tool_body = tool_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let tool: ToolCallResponse = serde_json::from_slice(&tool_body).unwrap();
+        assert_eq!(
+            tool.approval,
+            mneme_kernel::ToolApprovalDecision::RequiresApproval
+        );
+
+        let approval_response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/v1/runs/{}/tool-calls/{}/approve",
+                        created.run_id, tool.tool_call_id
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"text":"human-review"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(approval_response.status(), StatusCode::OK);
+        let approval_body = approval_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let approval: ToolLifecycleResponse = serde_json::from_slice(&approval_body).unwrap();
+        assert_eq!(approval.run_id, created.run_id);
+        assert_eq!(approval.tool_call_id, tool.tool_call_id);
+    }
+
+    #[tokio::test]
+    async fn api_records_tool_denial() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let service = SqliteRunService::new(store).shared();
+        let app = build_router_with_service(service);
+
+        let create_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/runs")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"instruction":"拒绝网络工具"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_response.status(), StatusCode::OK);
+        let create_body = create_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let created: CreateRunResponse = serde_json::from_slice(&create_body).unwrap();
+
+        let tool_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/v1/runs/{}/tool-calls", created.run_id))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"tool_name":"fetch_url","effect":"network","input_json":{"url":"https://example.test"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tool_response.status(), StatusCode::OK);
+        let tool_body = tool_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let tool: ToolCallResponse = serde_json::from_slice(&tool_body).unwrap();
+
+        let denial_response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/v1/runs/{}/tool-calls/{}/deny",
+                        created.run_id, tool.tool_call_id
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"text":"not needed"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(denial_response.status(), StatusCode::OK);
+        let denial_body = denial_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let denial: ToolLifecycleResponse = serde_json::from_slice(&denial_body).unwrap();
+        assert_eq!(denial.run_id, created.run_id);
+        assert_eq!(denial.tool_call_id, tool.tool_call_id);
+    }
+
+    #[tokio::test]
+    async fn api_records_tool_failure() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let service = SqliteRunService::new(store).shared();
+        let app = build_router_with_service(service);
+
+        let create_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/runs")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"instruction":"记录工具失败"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_response.status(), StatusCode::OK);
+        let create_body = create_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let created: CreateRunResponse = serde_json::from_slice(&create_body).unwrap();
+
+        let tool_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/v1/runs/{}/tool-calls", created.run_id))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"tool_name":"read_file","effect":"read_only","input_json":{"path":"missing.md"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tool_response.status(), StatusCode::OK);
+        let tool_body = tool_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let tool: ToolCallResponse = serde_json::from_slice(&tool_body).unwrap();
+
+        let failure_response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/v1/runs/{}/tool-calls/{}/fail",
+                        created.run_id, tool.tool_call_id
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"text":"file not found"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(failure_response.status(), StatusCode::OK);
+        let failure_body = failure_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let failure: ToolLifecycleResponse = serde_json::from_slice(&failure_body).unwrap();
+        assert_eq!(failure.run_id, created.run_id);
+        assert_eq!(failure.tool_call_id, tool.tool_call_id);
+    }
+
+    #[tokio::test]
+    async fn api_rejects_tool_request_after_completed_run() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let service = SqliteRunService::new(store).shared();
+        let app = build_router_with_service(service);
+
+        let create_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/runs")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"instruction":"终止后拒绝工具"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_response.status(), StatusCode::OK);
+        let create_body = create_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let created: CreateRunResponse = serde_json::from_slice(&create_body).unwrap();
+
+        let complete_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/v1/runs/{}/complete", created.run_id))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"text":"已经完成"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(complete_response.status(), StatusCode::OK);
+
+        let tool_response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/v1/runs/{}/tool-calls", created.run_id))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"tool_name":"read_file","effect":"read_only","input_json":{"path":"README.md"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(tool_response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn api_rejects_invalid_tool_call_id() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let service = SqliteRunService::new(store).shared();
+        let app = build_router_with_service(service);
+
+        let create_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/runs")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"instruction":"校验工具 ID"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_response.status(), StatusCode::OK);
+        let create_body = create_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let created: CreateRunResponse = serde_json::from_slice(&create_body).unwrap();
+
+        let result_response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/v1/runs/{}/tool-calls/not-a-uuid/result",
+                        created.run_id
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"output_json":{"ok":true}}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result_response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
