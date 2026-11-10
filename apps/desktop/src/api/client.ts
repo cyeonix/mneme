@@ -45,6 +45,35 @@ export interface RunLifecycleResponse {
   run_id: string;
 }
 
+export type ToolEffect = 'read_only' | 'local_write' | 'network' | 'shell';
+
+export type ToolApprovalDecision = 'auto_approved' | 'requires_approval';
+
+export interface ToolCallRequest {
+  tool_name: string;
+  effect: ToolEffect;
+  input_json: unknown;
+}
+
+export interface ToolCallResponse {
+  run_id: string;
+  tool_call_id: string;
+  approval: ToolApprovalDecision;
+}
+
+export interface ToolLifecycleRequest {
+  text: string;
+}
+
+export interface ToolResultRequest {
+  output_json: unknown;
+}
+
+export interface ToolLifecycleResponse {
+  run_id: string;
+  tool_call_id: string;
+}
+
 export interface MnemeApiClient {
   getHealth(): Promise<KernelHealth>;
   listEvents(): Promise<EventsResponse>;
@@ -54,6 +83,15 @@ export interface MnemeApiClient {
   recordAssistantMessage(runId: string, text: string): Promise<RunLifecycleResponse>;
   completeRun(runId: string, text: string): Promise<RunLifecycleResponse>;
   failRun(runId: string, text: string): Promise<RunLifecycleResponse>;
+  requestToolCall(runId: string, request: ToolCallRequest): Promise<ToolCallResponse>;
+  approveToolCall(runId: string, toolCallId: string, text: string): Promise<ToolLifecycleResponse>;
+  denyToolCall(runId: string, toolCallId: string, text: string): Promise<ToolLifecycleResponse>;
+  recordToolResult(
+    runId: string,
+    toolCallId: string,
+    outputJson: unknown,
+  ): Promise<ToolLifecycleResponse>;
+  recordToolFailure(runId: string, toolCallId: string, text: string): Promise<ToolLifecycleResponse>;
 }
 
 type FetchLike = typeof fetch;
@@ -78,6 +116,25 @@ async function postLifecycleText(
     body: JSON.stringify({ text }),
   });
   return parseJsonResponse<RunLifecycleResponse>(response);
+}
+
+async function postToolText(
+  normalizedBaseUrl: string,
+  fetchImpl: FetchLike,
+  runId: string,
+  toolCallId: string,
+  suffix: string,
+  text: string,
+): Promise<ToolLifecycleResponse> {
+  const response = await fetchImpl(
+    `${normalizedBaseUrl}/api/v1/runs/${runId}/tool-calls/${toolCallId}/${suffix}`,
+    {
+      method: 'POST',
+      headers: { accept: 'application/json', 'content-type': 'application/json' },
+      body: JSON.stringify({ text }),
+    },
+  );
+  return parseJsonResponse<ToolLifecycleResponse>(response);
 }
 
 export function createMnemeApiClient(baseUrl: string, fetchImpl: FetchLike = fetch): MnemeApiClient {
@@ -129,6 +186,39 @@ export function createMnemeApiClient(baseUrl: string, fetchImpl: FetchLike = fet
 
     failRun(runId: string, text: string) {
       return postLifecycleText(normalizedBaseUrl, fetchImpl, runId, 'fail', text);
+    },
+
+    async requestToolCall(runId: string, request: ToolCallRequest) {
+      const response = await fetchImpl(`${normalizedBaseUrl}/api/v1/runs/${runId}/tool-calls`, {
+        method: 'POST',
+        headers: { accept: 'application/json', 'content-type': 'application/json' },
+        body: JSON.stringify(request),
+      });
+      return parseJsonResponse<ToolCallResponse>(response);
+    },
+
+    approveToolCall(runId: string, toolCallId: string, text: string) {
+      return postToolText(normalizedBaseUrl, fetchImpl, runId, toolCallId, 'approve', text);
+    },
+
+    denyToolCall(runId: string, toolCallId: string, text: string) {
+      return postToolText(normalizedBaseUrl, fetchImpl, runId, toolCallId, 'deny', text);
+    },
+
+    async recordToolResult(runId: string, toolCallId: string, outputJson: unknown) {
+      const response = await fetchImpl(
+        `${normalizedBaseUrl}/api/v1/runs/${runId}/tool-calls/${toolCallId}/result`,
+        {
+          method: 'POST',
+          headers: { accept: 'application/json', 'content-type': 'application/json' },
+          body: JSON.stringify({ output_json: outputJson }),
+        },
+      );
+      return parseJsonResponse<ToolLifecycleResponse>(response);
+    },
+
+    recordToolFailure(runId: string, toolCallId: string, text: string) {
+      return postToolText(normalizedBaseUrl, fetchImpl, runId, toolCallId, 'fail', text);
     },
   };
 }

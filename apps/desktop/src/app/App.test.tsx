@@ -44,6 +44,21 @@ function createClient(): MnemeApiClient {
     async failRun() {
       return { run_id: 'run-123' };
     },
+    async requestToolCall() {
+      return { run_id: 'run-123', tool_call_id: 'tool-123', approval: 'auto_approved' };
+    },
+    async approveToolCall() {
+      return { run_id: 'run-123', tool_call_id: 'tool-123' };
+    },
+    async denyToolCall() {
+      return { run_id: 'run-123', tool_call_id: 'tool-123' };
+    },
+    async recordToolResult() {
+      return { run_id: 'run-123', tool_call_id: 'tool-123' };
+    },
+    async recordToolFailure() {
+      return { run_id: 'run-123', tool_call_id: 'tool-123' };
+    },
   };
 }
 
@@ -95,6 +110,15 @@ describe('App', () => {
       recordAssistantMessage: vi.fn(),
       completeRun: vi.fn(),
       failRun: vi.fn(),
+      requestToolCall: vi.fn(async () => ({
+        run_id: 'run-123',
+        tool_call_id: 'tool-123',
+        approval: 'auto_approved' as const,
+      })),
+      approveToolCall: vi.fn(async () => ({ run_id: 'run-123', tool_call_id: 'tool-123' })),
+      denyToolCall: vi.fn(async () => ({ run_id: 'run-123', tool_call_id: 'tool-123' })),
+      recordToolResult: vi.fn(async () => ({ run_id: 'run-123', tool_call_id: 'tool-123' })),
+      recordToolFailure: vi.fn(async () => ({ run_id: 'run-123', tool_call_id: 'tool-123' })),
     };
 
     render(<App client={client} />);

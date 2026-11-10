@@ -90,4 +90,92 @@ describe('createMnemeApiClient', () => {
     ]);
     expect(calls[0].body).toBe(JSON.stringify({ text: '请总结今天' }));
   });
+
+  it('requests a tool call through the local API', async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          run_id: 'run-123',
+          tool_call_id: 'tool-123',
+          approval: 'auto_approved',
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      ),
+    );
+    const client = createMnemeApiClient('http://127.0.0.1:3766/', fetchMock as typeof fetch);
+
+    const response = await client.requestToolCall('run-123', {
+      tool_name: 'read_file',
+      effect: 'read_only',
+      input_json: { path: 'README.md' },
+    });
+
+    expect(response.tool_call_id).toBe('tool-123');
+    expect(response.approval).toBe('auto_approved');
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://127.0.0.1:3766/api/v1/runs/run-123/tool-calls',
+      {
+        method: 'POST',
+        headers: { accept: 'application/json', 'content-type': 'application/json' },
+        body: JSON.stringify({
+          tool_name: 'read_file',
+          effect: 'read_only',
+          input_json: { path: 'README.md' },
+        }),
+      },
+    );
+  });
+
+  it('records a tool result through the local API', async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(JSON.stringify({ run_id: 'run-123', tool_call_id: 'tool-123' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+    const client = createMnemeApiClient('http://127.0.0.1:3766', fetchMock as typeof fetch);
+
+    const response = await client.recordToolResult('run-123', 'tool-123', { content: 'hello' });
+
+    expect(response).toEqual({ run_id: 'run-123', tool_call_id: 'tool-123' });
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://127.0.0.1:3766/api/v1/runs/run-123/tool-calls/tool-123/result',
+      {
+        method: 'POST',
+        headers: { accept: 'application/json', 'content-type': 'application/json' },
+        body: JSON.stringify({ output_json: { content: 'hello' } }),
+      },
+    );
+  });
+
+  it('posts tool approval lifecycle decisions through the local API', async () => {
+    const calls: Array<{ url: string; body?: string }> = [];
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      calls.push({ url, body: init?.body?.toString() });
+      return new Response(JSON.stringify({ run_id: 'run-123', tool_call_id: 'tool-123' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as unknown as typeof fetch;
+    const client = createMnemeApiClient('http://127.0.0.1:3766/', fetchMock);
+
+    await client.approveToolCall('run-123', 'tool-123', 'approved by operator');
+    await client.denyToolCall('run-123', 'tool-123', 'denied by operator');
+    await client.recordToolFailure('run-123', 'tool-123', 'tool failed');
+
+    expect(calls).toEqual([
+      {
+        url: 'http://127.0.0.1:3766/api/v1/runs/run-123/tool-calls/tool-123/approve',
+        body: JSON.stringify({ text: 'approved by operator' }),
+      },
+      {
+        url: 'http://127.0.0.1:3766/api/v1/runs/run-123/tool-calls/tool-123/deny',
+        body: JSON.stringify({ text: 'denied by operator' }),
+      },
+      {
+        url: 'http://127.0.0.1:3766/api/v1/runs/run-123/tool-calls/tool-123/fail',
+        body: JSON.stringify({ text: 'tool failed' }),
+      },
+    ]);
+  });
 });
