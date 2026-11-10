@@ -132,6 +132,116 @@ export interface ContextBundlesResponse {
   context_bundles: ContextBundleRecord[];
 }
 
+export type KnowledgeSourceKind = 'artifact' | 'context_bundle' | 'manual';
+
+export type MemoryKind = 'fact' | 'decision' | 'preference' | 'insight';
+
+export interface KnowledgeSourceRecord {
+  knowledge_source_id: string;
+  run_id: string;
+  source_kind: KnowledgeSourceKind;
+  artifact_id: string | null;
+  context_bundle_id: string | null;
+  title: string;
+  summary: string;
+  created_at: string;
+}
+
+export interface CreateKnowledgeSourceRequest {
+  title: string;
+  summary: string;
+}
+
+export interface CreateManualKnowledgeSourceRequest {
+  run_id: string;
+  title: string;
+  summary: string;
+}
+
+export interface CreateKnowledgeSourceResponse {
+  knowledge_source_id: string;
+}
+
+export interface KnowledgeSourcesResponse {
+  knowledge_sources: KnowledgeSourceRecord[];
+}
+
+export interface DocumentChunkRecord {
+  document_chunk_id: string;
+  knowledge_source_id: string;
+  run_id: string;
+  sequence: number;
+  text: string;
+  char_start: number;
+  char_end: number;
+  created_at: string;
+}
+
+export interface DocumentChunksResponse {
+  document_chunks: DocumentChunkRecord[];
+}
+
+export interface RecordMemoryRequest {
+  run_id: string;
+  knowledge_source_id: string | null;
+  kind: MemoryKind;
+  title: string;
+  body: string;
+  confidence: number;
+}
+
+export interface RecordMemoryResponse {
+  memory_id: string;
+}
+
+export interface MemoryRecord {
+  memory_id: string;
+  knowledge_source_id: string | null;
+  run_id: string;
+  kind: MemoryKind;
+  title: string;
+  body: string;
+  confidence: number;
+  created_at: string;
+}
+
+export interface MemoriesResponse {
+  memories: MemoryRecord[];
+}
+
+export interface SearchRequest {
+  run_id: string;
+  query: string;
+  limit?: number;
+}
+
+export interface SearchResult {
+  chunk: DocumentChunkRecord;
+  source: KnowledgeSourceRecord;
+  score: number;
+  reason: string;
+}
+
+export interface SearchResponseDto {
+  query: string;
+  hits: SearchResult[];
+  retrieval_trace_id: string;
+}
+
+export interface RetrievalTraceRecord {
+  retrieval_trace_id: string;
+  run_id: string;
+  query: string;
+  result_chunk_ids: string[];
+  result_memory_ids: string[];
+  explanation: string;
+  created_at: string;
+}
+
+export interface RetrievalTracesResponse {
+  retrieval_traces: RetrievalTraceRecord[];
+}
+
 export interface MnemeApiClient {
   getHealth(): Promise<KernelHealth>;
   listEvents(): Promise<EventsResponse>;
@@ -159,6 +269,24 @@ export interface MnemeApiClient {
     request: CreateContextBundleRequest,
   ): Promise<CreateContextBundleResponse>;
   getContextBundle(contextBundleId: string): Promise<ContextBundleRecord>;
+  listKnowledgeSources(): Promise<KnowledgeSourcesResponse>;
+  createKnowledgeSourceFromArtifact(
+    artifactId: string,
+    request: CreateKnowledgeSourceRequest,
+  ): Promise<CreateKnowledgeSourceResponse>;
+  createKnowledgeSourceFromContextBundle(
+    contextBundleId: string,
+    request: CreateKnowledgeSourceRequest,
+  ): Promise<CreateKnowledgeSourceResponse>;
+  createManualKnowledgeSource(
+    request: CreateManualKnowledgeSourceRequest,
+  ): Promise<CreateKnowledgeSourceResponse>;
+  listDocumentChunks(): Promise<DocumentChunksResponse>;
+  chunkKnowledgeSource(knowledgeSourceId: string): Promise<DocumentChunksResponse>;
+  listMemories(): Promise<MemoriesResponse>;
+  recordMemory(request: RecordMemoryRequest): Promise<RecordMemoryResponse>;
+  search(request: SearchRequest): Promise<SearchResponseDto>;
+  listRetrievalTraces(): Promise<RetrievalTracesResponse>;
 }
 
 type FetchLike = typeof fetch;
@@ -338,6 +466,99 @@ export function createMnemeApiClient(baseUrl: string, fetchImpl: FetchLike = fet
         },
       );
       return parseJsonResponse<ContextBundleRecord>(response);
+    },
+
+    async listKnowledgeSources() {
+      const response = await fetchImpl(`${normalizedBaseUrl}/api/v1/knowledge-sources`, {
+        headers: { accept: 'application/json' },
+      });
+      return parseJsonResponse<KnowledgeSourcesResponse>(response);
+    },
+
+    async createKnowledgeSourceFromArtifact(artifactId: string, request: CreateKnowledgeSourceRequest) {
+      const response = await fetchImpl(
+        `${normalizedBaseUrl}/api/v1/artifacts/${artifactId}/knowledge-source`,
+        {
+          method: 'POST',
+          headers: { accept: 'application/json', 'content-type': 'application/json' },
+          body: JSON.stringify(request),
+        },
+      );
+      return parseJsonResponse<CreateKnowledgeSourceResponse>(response);
+    },
+
+    async createKnowledgeSourceFromContextBundle(
+      contextBundleId: string,
+      request: CreateKnowledgeSourceRequest,
+    ) {
+      const response = await fetchImpl(
+        `${normalizedBaseUrl}/api/v1/context-bundles/${contextBundleId}/knowledge-source`,
+        {
+          method: 'POST',
+          headers: { accept: 'application/json', 'content-type': 'application/json' },
+          body: JSON.stringify(request),
+        },
+      );
+      return parseJsonResponse<CreateKnowledgeSourceResponse>(response);
+    },
+
+    async createManualKnowledgeSource(request: CreateManualKnowledgeSourceRequest) {
+      const response = await fetchImpl(`${normalizedBaseUrl}/api/v1/knowledge-sources/manual`, {
+        method: 'POST',
+        headers: { accept: 'application/json', 'content-type': 'application/json' },
+        body: JSON.stringify(request),
+      });
+      return parseJsonResponse<CreateKnowledgeSourceResponse>(response);
+    },
+
+    async listDocumentChunks() {
+      const response = await fetchImpl(`${normalizedBaseUrl}/api/v1/document-chunks`, {
+        headers: { accept: 'application/json' },
+      });
+      return parseJsonResponse<DocumentChunksResponse>(response);
+    },
+
+    async chunkKnowledgeSource(knowledgeSourceId: string) {
+      const response = await fetchImpl(
+        `${normalizedBaseUrl}/api/v1/knowledge-sources/${knowledgeSourceId}/chunks`,
+        {
+          method: 'POST',
+          headers: { accept: 'application/json' },
+        },
+      );
+      return parseJsonResponse<DocumentChunksResponse>(response);
+    },
+
+    async listMemories() {
+      const response = await fetchImpl(`${normalizedBaseUrl}/api/v1/memories`, {
+        headers: { accept: 'application/json' },
+      });
+      return parseJsonResponse<MemoriesResponse>(response);
+    },
+
+    async recordMemory(request: RecordMemoryRequest) {
+      const response = await fetchImpl(`${normalizedBaseUrl}/api/v1/memories`, {
+        method: 'POST',
+        headers: { accept: 'application/json', 'content-type': 'application/json' },
+        body: JSON.stringify(request),
+      });
+      return parseJsonResponse<RecordMemoryResponse>(response);
+    },
+
+    async search(request: SearchRequest) {
+      const response = await fetchImpl(`${normalizedBaseUrl}/api/v1/search`, {
+        method: 'POST',
+        headers: { accept: 'application/json', 'content-type': 'application/json' },
+        body: JSON.stringify(request),
+      });
+      return parseJsonResponse<SearchResponseDto>(response);
+    },
+
+    async listRetrievalTraces() {
+      const response = await fetchImpl(`${normalizedBaseUrl}/api/v1/retrieval-traces`, {
+        headers: { accept: 'application/json' },
+      });
+      return parseJsonResponse<RetrievalTracesResponse>(response);
     },
   };
 }

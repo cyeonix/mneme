@@ -1,6 +1,13 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createMnemeApiClient } from './client';
 
+function jsonResponse(body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+  });
+}
+
 describe('createMnemeApiClient', () => {
   it('从配置的 base URL 读取 Kernel 健康状态', async () => {
     const fetchMock = vi.fn(async () =>
@@ -238,5 +245,122 @@ describe('createMnemeApiClient', () => {
         }),
       },
     );
+  });
+
+  it('calls knowledge source and chunk endpoints', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ knowledge_sources: [] }))
+      .mockResolvedValueOnce(jsonResponse({ knowledge_source_id: 'source-1' }))
+      .mockResolvedValueOnce(jsonResponse({ knowledge_source_id: 'source-2' }))
+      .mockResolvedValueOnce(jsonResponse({ knowledge_source_id: 'source-3' }))
+      .mockResolvedValueOnce(jsonResponse({ document_chunks: [] }))
+      .mockResolvedValueOnce(jsonResponse({ document_chunks: [] }));
+    const client = createMnemeApiClient('http://localhost:3000/', fetchMock as unknown as typeof fetch);
+
+    await client.listKnowledgeSources();
+    await client.createKnowledgeSourceFromArtifact('artifact-1', {
+      title: 'Run summary',
+      summary: 'SQLite deterministic retrieval',
+    });
+    await client.createKnowledgeSourceFromContextBundle('context-bundle-1', {
+      title: 'Debug context',
+      summary: 'Useful context for retrieval',
+    });
+    await client.createManualKnowledgeSource({
+      run_id: 'run-1',
+      title: 'Manual note',
+      summary: 'Operator supplied memory source',
+    });
+    await client.listDocumentChunks();
+    await client.chunkKnowledgeSource('source-1');
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, 'http://localhost:3000/api/v1/knowledge-sources', {
+      headers: { accept: 'application/json' },
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(2, 'http://localhost:3000/api/v1/artifacts/artifact-1/knowledge-source', {
+      method: 'POST',
+      headers: { accept: 'application/json', 'content-type': 'application/json' },
+      body: JSON.stringify({ title: 'Run summary', summary: 'SQLite deterministic retrieval' }),
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      'http://localhost:3000/api/v1/context-bundles/context-bundle-1/knowledge-source',
+      {
+        method: 'POST',
+        headers: { accept: 'application/json', 'content-type': 'application/json' },
+        body: JSON.stringify({ title: 'Debug context', summary: 'Useful context for retrieval' }),
+      },
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(4, 'http://localhost:3000/api/v1/knowledge-sources/manual', {
+      method: 'POST',
+      headers: { accept: 'application/json', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        run_id: 'run-1',
+        title: 'Manual note',
+        summary: 'Operator supplied memory source',
+      }),
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(5, 'http://localhost:3000/api/v1/document-chunks', {
+      headers: { accept: 'application/json' },
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(6, 'http://localhost:3000/api/v1/knowledge-sources/source-1/chunks', {
+      method: 'POST',
+      headers: { accept: 'application/json' },
+    });
+  });
+
+  it('calls memory endpoints', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ memories: [] }))
+      .mockResolvedValueOnce(jsonResponse({ memory_id: 'memory-1' }));
+    const client = createMnemeApiClient('http://localhost:3000', fetchMock as unknown as typeof fetch);
+
+    await client.listMemories();
+    await client.recordMemory({
+      run_id: 'run-1',
+      knowledge_source_id: 'source-1',
+      kind: 'fact',
+      title: 'SQLite-first',
+      body: 'Retrieval uses deterministic SQLite queries.',
+      confidence: 0.9,
+    });
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, 'http://localhost:3000/api/v1/memories', {
+      headers: { accept: 'application/json' },
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(2, 'http://localhost:3000/api/v1/memories', {
+      method: 'POST',
+      headers: { accept: 'application/json', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        run_id: 'run-1',
+        knowledge_source_id: 'source-1',
+        kind: 'fact',
+        title: 'SQLite-first',
+        body: 'Retrieval uses deterministic SQLite queries.',
+        confidence: 0.9,
+      }),
+    });
+  });
+
+  it('calls search and retrieval trace endpoints', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ query: 'sqlite', hits: [], retrieval_trace_id: 'trace-1' }))
+      .mockResolvedValueOnce(jsonResponse({ retrieval_traces: [] }));
+    const client = createMnemeApiClient('http://localhost:3000', fetchMock as unknown as typeof fetch);
+
+    await client.search({ run_id: 'run-1', query: 'sqlite', limit: 5 });
+    await client.listRetrievalTraces();
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, 'http://localhost:3000/api/v1/search', {
+      method: 'POST',
+      headers: { accept: 'application/json', 'content-type': 'application/json' },
+      body: JSON.stringify({ run_id: 'run-1', query: 'sqlite', limit: 5 }),
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(2, 'http://localhost:3000/api/v1/retrieval-traces', {
+      headers: { accept: 'application/json' },
+    });
   });
 });

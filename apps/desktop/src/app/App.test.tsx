@@ -1,6 +1,6 @@
 import '@testing-library/jest-dom/vitest';
 import { render, screen, waitFor } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type {
   ArtifactDetail,
   ArtifactsResponse,
@@ -116,6 +116,16 @@ function createTestClient(state: TestClientState = {}): MnemeApiClient {
         created_at: '2026-11-10T00:00:00Z',
       };
     },
+    listKnowledgeSources: vi.fn(async () => ({ knowledge_sources: [] })),
+    createKnowledgeSourceFromArtifact: vi.fn(async () => ({ knowledge_source_id: 'source-1' })),
+    createKnowledgeSourceFromContextBundle: vi.fn(async () => ({ knowledge_source_id: 'source-1' })),
+    createManualKnowledgeSource: vi.fn(async () => ({ knowledge_source_id: 'source-1' })),
+    listDocumentChunks: vi.fn(async () => ({ document_chunks: [] })),
+    chunkKnowledgeSource: vi.fn(async () => ({ document_chunks: [] })),
+    listMemories: vi.fn(async () => ({ memories: [] })),
+    recordMemory: vi.fn(async () => ({ memory_id: 'memory-1' })),
+    search: vi.fn(async () => ({ query: 'sqlite', hits: [], retrieval_trace_id: 'trace-1' })),
+    listRetrievalTraces: vi.fn(async () => ({ retrieval_traces: [] })),
   };
 }
 
