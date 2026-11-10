@@ -1,7 +1,13 @@
 use crate::types::{
-    CreateRunRequest, CreateRunResponse, EventsResponse, HealthResponse, RunsResponse,
+    CreateRunRequest, CreateRunResponse, EventsResponse, HealthResponse, LifecycleTextRequest,
+    RunLifecycleResponse, RunsResponse,
 };
-use axum::{extract::State, http::StatusCode, routing::get, Json, Router};
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    routing::get,
+    Json, Router,
+};
 use mneme_kernel::{
     kernel_health, ComposedRunService, InMemoryOperationLedger, InMemoryRunProjectionStore,
     RunServiceError, SharedOperationLedger, SharedRunProjectionStore, SharedRunService,
@@ -34,6 +40,19 @@ pub fn build_router_with_service(run_service: SharedRunService) -> Router {
         .route("/api/v1/health", get(get_health))
         .route("/api/v1/events", get(list_events))
         .route("/api/v1/runs", get(list_runs).post(create_run))
+        .route(
+            "/api/v1/runs/:run_id/model-requests",
+            axum::routing::post(request_model),
+        )
+        .route(
+            "/api/v1/runs/:run_id/assistant-messages",
+            axum::routing::post(record_assistant_message),
+        )
+        .route(
+            "/api/v1/runs/:run_id/complete",
+            axum::routing::post(complete_run),
+        )
+        .route("/api/v1/runs/:run_id/fail", axum::routing::post(fail_run))
         .with_state(ApiState { run_service })
 }
 
@@ -75,9 +94,77 @@ async fn create_run(
     }))
 }
 
+fn parse_run_id(value: &str) -> Result<mneme_kernel::RunId, StatusCode> {
+    value.parse().map_err(|_| StatusCode::BAD_REQUEST)
+}
+
+fn lifecycle_response(outcome: mneme_kernel::RunLifecycleOutcome) -> Json<RunLifecycleResponse> {
+    Json(RunLifecycleResponse {
+        run_id: outcome.run_id.to_string(),
+    })
+}
+
+async fn request_model(
+    State(state): State<ApiState>,
+    Path(run_id): Path<String>,
+    Json(request): Json<LifecycleTextRequest>,
+) -> Result<Json<RunLifecycleResponse>, StatusCode> {
+    let run_id = parse_run_id(&run_id)?;
+    let outcome = state
+        .run_service
+        .request_model(run_id, request.text)
+        .await
+        .map_err(service_error_to_status)?;
+    Ok(lifecycle_response(outcome))
+}
+
+async fn record_assistant_message(
+    State(state): State<ApiState>,
+    Path(run_id): Path<String>,
+    Json(request): Json<LifecycleTextRequest>,
+) -> Result<Json<RunLifecycleResponse>, StatusCode> {
+    let run_id = parse_run_id(&run_id)?;
+    let outcome = state
+        .run_service
+        .record_assistant_message(run_id, request.text)
+        .await
+        .map_err(service_error_to_status)?;
+    Ok(lifecycle_response(outcome))
+}
+
+async fn complete_run(
+    State(state): State<ApiState>,
+    Path(run_id): Path<String>,
+    Json(request): Json<LifecycleTextRequest>,
+) -> Result<Json<RunLifecycleResponse>, StatusCode> {
+    let run_id = parse_run_id(&run_id)?;
+    let outcome = state
+        .run_service
+        .complete_run(run_id, request.text)
+        .await
+        .map_err(service_error_to_status)?;
+    Ok(lifecycle_response(outcome))
+}
+
+async fn fail_run(
+    State(state): State<ApiState>,
+    Path(run_id): Path<String>,
+    Json(request): Json<LifecycleTextRequest>,
+) -> Result<Json<RunLifecycleResponse>, StatusCode> {
+    let run_id = parse_run_id(&run_id)?;
+    let outcome = state
+        .run_service
+        .fail_run(run_id, request.text)
+        .await
+        .map_err(service_error_to_status)?;
+    Ok(lifecycle_response(outcome))
+}
+
 fn service_error_to_status(error: RunServiceError) -> StatusCode {
     match error {
-        RunServiceError::InvalidInstruction => StatusCode::BAD_REQUEST,
+        RunServiceError::InvalidInstruction
+        | RunServiceError::InvalidRunId
+        | RunServiceError::InvalidLifecycleInput => StatusCode::BAD_REQUEST,
         RunServiceError::Ledger(_) | RunServiceError::Projection(_) => {
             StatusCode::INTERNAL_SERVER_ERROR
         }
@@ -261,5 +348,102 @@ mod tests {
         let payload: RunsResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload.runs.len(), 1);
         assert_eq!(payload.runs[0].instruction, "SQLite service run");
+    }
+
+    #[tokio::test]
+    async fn api_rejects_blank_lifecycle_text() {
+        let app = build_router(InMemoryOperationLedger::new());
+        let run_id = mneme_kernel::RunId::new();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/v1/runs/{run_id}/model-requests"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"text":"   "}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn api_records_success_lifecycle_through_service() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let app = build_router_with_service(SqliteRunService::new(store).shared());
+
+        let create_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/runs")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"instruction":"端到端生命周期"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_response.status(), StatusCode::OK);
+        let create_body = create_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let created: CreateRunResponse = serde_json::from_slice(&create_body).unwrap();
+
+        for (path, text) in [
+            (
+                format!("/api/v1/runs/{}/model-requests", created.run_id),
+                "请总结今天",
+            ),
+            (
+                format!("/api/v1/runs/{}/assistant-messages", created.run_id),
+                "今天完成了 M2。",
+            ),
+            (
+                format!("/api/v1/runs/{}/complete", created.run_id),
+                "总结完成",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(path)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(json!({ "text": text }).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let runs_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/runs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = runs_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let runs: RunsResponse = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(runs.runs[0].run_id.to_string(), created.run_id);
+        assert_eq!(runs.runs[0].status, mneme_kernel::RunStatus::Completed);
+        assert_eq!(runs.runs[0].summary.as_deref(), Some("总结完成"));
     }
 }
