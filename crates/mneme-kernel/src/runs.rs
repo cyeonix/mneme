@@ -68,7 +68,12 @@ impl RunProjectionStore for InMemoryRunProjectionStore {
                 }
             }
             OperationEventKind::RunModelRequested { .. }
-            | OperationEventKind::RunAssistantMessage { .. } => {
+            | OperationEventKind::RunAssistantMessage { .. }
+            | OperationEventKind::ToolCallRequested { .. }
+            | OperationEventKind::ToolCallApproved { .. }
+            | OperationEventKind::ToolCallDenied { .. }
+            | OperationEventKind::ToolCallCompleted { .. }
+            | OperationEventKind::ToolCallFailed { .. } => {
                 if let Some(run) = runs
                     .iter_mut()
                     .find(|run| run.run_id == event.run_id && run.status == RunStatus::Running)
@@ -113,7 +118,7 @@ impl RunProjectionStore for InMemoryRunProjectionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{OperationEvent, RunId};
+    use crate::{OperationEvent, RunId, ToolCallId, ToolEffect};
 
     #[tokio::test]
     async fn in_memory_run_store_applies_started_event() {
@@ -154,13 +159,28 @@ mod tests {
     async fn in_memory_run_store_keeps_completed_run_terminal_after_late_intermediate_event() {
         let store = InMemoryRunProjectionStore::new();
         let run_id = RunId::new();
+        let tool_call_id = ToolCallId::new();
         let started = OperationEvent::new_run_started(run_id, "执行任务");
         let completed = OperationEvent::new_run_completed(run_id, "完成任务");
         let late_model_request = OperationEvent::new_run_model_requested(run_id, "不应恢复运行");
+        let late_tool_request = OperationEvent::new_tool_call_requested(
+            run_id,
+            tool_call_id,
+            "read_file",
+            ToolEffect::ReadOnly,
+            serde_json::json!({ "path": "README.md" }),
+        );
+        let late_tool_completion = OperationEvent::new_tool_call_completed(
+            run_id,
+            tool_call_id,
+            serde_json::json!({ "content": "不应覆盖终态" }),
+        );
 
         store.apply(&started).await.unwrap();
         store.apply(&completed).await.unwrap();
         store.apply(&late_model_request).await.unwrap();
+        store.apply(&late_tool_request).await.unwrap();
+        store.apply(&late_tool_completion).await.unwrap();
 
         let runs = store.list_runs().await.unwrap();
         assert_eq!(runs[0].status, RunStatus::Completed);

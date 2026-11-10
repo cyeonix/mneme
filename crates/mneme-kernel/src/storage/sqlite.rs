@@ -179,7 +179,12 @@ impl SqliteRunService {
 
         match &event.kind {
             OperationEventKind::RunModelRequested { .. }
-            | OperationEventKind::RunAssistantMessage { .. } => {
+            | OperationEventKind::RunAssistantMessage { .. }
+            | OperationEventKind::ToolCallRequested { .. }
+            | OperationEventKind::ToolCallApproved { .. }
+            | OperationEventKind::ToolCallDenied { .. }
+            | OperationEventKind::ToolCallCompleted { .. }
+            | OperationEventKind::ToolCallFailed { .. } => {
                 sqlx::query(
                     "update runs set updated_at = ?2 where run_id = ?1 and status = 'running'",
                 )
@@ -366,7 +371,12 @@ impl RunProjectionStore for SqliteRunProjectionStore {
                 .map_err(|error| RunProjectionError::Storage(error.to_string()))?;
             }
             OperationEventKind::RunModelRequested { .. }
-            | OperationEventKind::RunAssistantMessage { .. } => {
+            | OperationEventKind::RunAssistantMessage { .. }
+            | OperationEventKind::ToolCallRequested { .. }
+            | OperationEventKind::ToolCallApproved { .. }
+            | OperationEventKind::ToolCallDenied { .. }
+            | OperationEventKind::ToolCallCompleted { .. }
+            | OperationEventKind::ToolCallFailed { .. } => {
                 sqlx::query(
                     "update runs set updated_at = ?2 where run_id = ?1 and status = 'running'",
                 )
@@ -518,6 +528,11 @@ fn kind_type_for_event(kind: &OperationEventKind) -> &'static str {
         OperationEventKind::RunAssistantMessage { .. } => "run_assistant_message",
         OperationEventKind::RunCompleted { .. } => "run_completed",
         OperationEventKind::RunFailed { .. } => "run_failed",
+        OperationEventKind::ToolCallRequested { .. } => "tool_call_requested",
+        OperationEventKind::ToolCallApproved { .. } => "tool_call_approved",
+        OperationEventKind::ToolCallDenied { .. } => "tool_call_denied",
+        OperationEventKind::ToolCallCompleted { .. } => "tool_call_completed",
+        OperationEventKind::ToolCallFailed { .. } => "tool_call_failed",
     }
 }
 
@@ -574,7 +589,10 @@ pub enum SqliteStoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{OperationEvent, OperationLedger, RunId, RunProjectionStore, RunProjector};
+    use crate::{
+        OperationEvent, OperationLedger, RunId, RunProjectionStore, RunProjector, ToolCallId,
+        ToolEffect,
+    };
 
     #[tokio::test]
     async fn sqlite_store_runs_migrations() {
@@ -655,6 +673,62 @@ mod tests {
         assert!(matches!(
             events[2].kind,
             OperationEventKind::RunAssistantMessage { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn sqlite_ledger_roundtrips_tool_events() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let ledger = SqliteOperationLedger::new(store);
+        let run_id = RunId::new();
+        let tool_call_id = ToolCallId::new();
+        let requested = OperationEvent::new_tool_call_requested(
+            run_id,
+            tool_call_id,
+            "read_file",
+            ToolEffect::ReadOnly,
+            serde_json::json!({ "path": "README.md" }),
+        );
+        let approved = OperationEvent::new_tool_call_approved(run_id, tool_call_id, "mneme-policy");
+        let completed = OperationEvent::new_tool_call_completed(
+            run_id,
+            tool_call_id,
+            serde_json::json!({ "content": "hello" }),
+        );
+
+        ledger.append(requested).await.unwrap();
+        ledger.append(approved).await.unwrap();
+        ledger.append(completed).await.unwrap();
+
+        let events = ledger.list_for_run(run_id).await.unwrap();
+
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            &events[0].kind,
+            OperationEventKind::ToolCallRequested {
+                tool_call_id: actual_tool_call_id,
+                tool_name,
+                effect,
+                input_json,
+            } if actual_tool_call_id == &tool_call_id
+                && tool_name == "read_file"
+                && effect == &ToolEffect::ReadOnly
+                && input_json == &serde_json::json!({ "path": "README.md" })
+        ));
+        assert!(matches!(
+            &events[1].kind,
+            OperationEventKind::ToolCallApproved {
+                tool_call_id: actual_tool_call_id,
+                approved_by,
+            } if actual_tool_call_id == &tool_call_id && approved_by == "mneme-policy"
+        ));
+        assert!(matches!(
+            &events[2].kind,
+            OperationEventKind::ToolCallCompleted {
+                tool_call_id: actual_tool_call_id,
+                output_json,
+            } if actual_tool_call_id == &tool_call_id
+                && output_json == &serde_json::json!({ "content": "hello" })
         ));
     }
 
@@ -837,13 +911,25 @@ mod tests {
         let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
         let runs = SqliteRunProjectionStore::new(store);
         let run_id = RunId::new();
+        let tool_call_id = ToolCallId::new();
         let started = OperationEvent::new_run_started(run_id, "执行任务");
         let failed = OperationEvent::new_run_failed(run_id, "模型不可用");
         let late_message = OperationEvent::new_run_assistant_message(run_id, "不应恢复运行");
+        let late_tool_request = OperationEvent::new_tool_call_requested(
+            run_id,
+            tool_call_id,
+            "read_file",
+            ToolEffect::ReadOnly,
+            serde_json::json!({ "path": "README.md" }),
+        );
+        let late_tool_failure =
+            OperationEvent::new_tool_call_failed(run_id, tool_call_id, "不应覆盖终态");
 
         runs.apply(&started).await.unwrap();
         runs.apply(&failed).await.unwrap();
         runs.apply(&late_message).await.unwrap();
+        runs.apply(&late_tool_request).await.unwrap();
+        runs.apply(&late_tool_failure).await.unwrap();
 
         let listed = runs.list_runs().await.unwrap();
         assert_eq!(listed[0].status, RunStatus::Failed);

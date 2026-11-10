@@ -6,10 +6,11 @@ pub mod projections;
 pub mod runs;
 pub mod service;
 pub mod storage;
+pub mod tools;
 
 pub use events::{OperationEvent, OperationEventKind};
 pub use health::{kernel_health, KernelHealth};
-pub use ids::{EventId, RunId};
+pub use ids::{EventId, RunId, ToolCallId};
 pub use ledger::{InMemoryOperationLedger, LedgerError, OperationLedger, SharedOperationLedger};
 pub use projections::{RunProjection, RunProjector, RunStatus};
 pub use runs::{
@@ -22,4 +23,8 @@ pub use service::{
 pub use storage::{
     SqliteOperationLedger, SqliteRunProjectionStore, SqliteRunService, SqliteStore,
     SqliteStoreError,
+};
+pub use tools::{
+    ToolApprovalDecision, ToolApprovalPolicy, ToolCallProjection, ToolCallStatus, ToolEffect,
+    ToolProjector,
 };

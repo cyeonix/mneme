@@ -57,7 +57,12 @@ impl RunProjector {
                     }
                 }
                 OperationEventKind::RunModelRequested { .. }
-                | OperationEventKind::RunAssistantMessage { .. } => {
+                | OperationEventKind::RunAssistantMessage { .. }
+                | OperationEventKind::ToolCallRequested { .. }
+                | OperationEventKind::ToolCallApproved { .. }
+                | OperationEventKind::ToolCallDenied { .. }
+                | OperationEventKind::ToolCallCompleted { .. }
+                | OperationEventKind::ToolCallFailed { .. } => {
                     if let Some(run) = runs
                         .iter_mut()
                         .find(|run| run.run_id == event.run_id && run.status == RunStatus::Running)
@@ -92,7 +97,7 @@ impl RunProjector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{OperationEvent, RunId};
+    use crate::{OperationEvent, RunId, ToolCallId, ToolEffect};
 
     #[test]
     fn replay_builds_completed_run_projection() {
@@ -154,13 +159,55 @@ mod tests {
     }
 
     #[test]
+    fn replay_keeps_run_running_after_tool_events() {
+        let run_id = RunId::new();
+        let tool_call_id = ToolCallId::new();
+        let events = vec![
+            OperationEvent::new_run_started(run_id, "读取项目文件"),
+            OperationEvent::new_tool_call_requested(
+                run_id,
+                tool_call_id,
+                "read_file",
+                ToolEffect::ReadOnly,
+                serde_json::json!({ "path": "README.md" }),
+            ),
+            OperationEvent::new_tool_call_approved(run_id, tool_call_id, "mneme-policy"),
+            OperationEvent::new_tool_call_completed(
+                run_id,
+                tool_call_id,
+                serde_json::json!({ "content": "hello" }),
+            ),
+        ];
+
+        let runs = RunProjector::replay(&events);
+
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].run_id, run_id);
+        assert_eq!(runs[0].status, RunStatus::Running);
+        assert_eq!(runs[0].updated_at, events[3].occurred_at);
+    }
+
+    #[test]
     fn replay_keeps_completed_run_terminal_after_late_intermediate_events() {
         let run_id = RunId::new();
+        let tool_call_id = ToolCallId::new();
         let events = vec![
             OperationEvent::new_run_started(run_id, "整理今天的工作"),
             OperationEvent::new_run_completed(run_id, "总结完成"),
             OperationEvent::new_run_model_requested(run_id, "不应恢复运行"),
             OperationEvent::new_run_assistant_message(run_id, "不应覆盖终态"),
+            OperationEvent::new_tool_call_requested(
+                run_id,
+                tool_call_id,
+                "read_file",
+                ToolEffect::ReadOnly,
+                serde_json::json!({ "path": "README.md" }),
+            ),
+            OperationEvent::new_tool_call_completed(
+                run_id,
+                tool_call_id,
+                serde_json::json!({ "content": "不应覆盖终态" }),
+            ),
         ];
 
         let runs = RunProjector::replay(&events);
@@ -176,11 +223,20 @@ mod tests {
     #[test]
     fn replay_keeps_failed_run_terminal_after_late_intermediate_events() {
         let run_id = RunId::new();
+        let tool_call_id = ToolCallId::new();
         let events = vec![
             OperationEvent::new_run_started(run_id, "整理今天的工作"),
             OperationEvent::new_run_failed(run_id, "模型不可用"),
             OperationEvent::new_run_model_requested(run_id, "不应恢复运行"),
             OperationEvent::new_run_assistant_message(run_id, "不应覆盖终态"),
+            OperationEvent::new_tool_call_requested(
+                run_id,
+                tool_call_id,
+                "read_file",
+                ToolEffect::ReadOnly,
+                serde_json::json!({ "path": "README.md" }),
+            ),
+            OperationEvent::new_tool_call_failed(run_id, tool_call_id, "不应覆盖终态"),
         ];
 
         let runs = RunProjector::replay(&events);
