@@ -1,5 +1,10 @@
-use mneme_api::routes::build_router_with_service;
-use mneme_kernel::{RunService, SqliteRunService, SqliteStore};
+use mneme_api::routes::{
+    build_router_with_all_services, SharedArtifactService, SharedContextService,
+};
+use mneme_kernel::{
+    InMemoryArtifactContentStore, RunService, SqliteArtifactService, SqliteContextService,
+    SqliteRunService, SqliteStore,
+};
 use std::{fs, net::SocketAddr, path::Path};
 use tokio::net::TcpListener;
 use tracing::info;
@@ -59,7 +64,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database_url = database_url_from_env();
     ensure_sqlite_parent_directory(&database_url)?;
     let store = SqliteStore::connect(&database_url).await?;
-    let service = SqliteRunService::new(store);
+    let service = SqliteRunService::new(store.clone());
+    let artifact_service =
+        SqliteArtifactService::new(store.clone(), InMemoryArtifactContentStore::new().shared());
+    let context_service = SqliteContextService::new(store);
     if rebuild_runs_on_start() {
         let rebuilt = service.rebuild_run_projections().await?;
         info!(
@@ -67,7 +75,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "rebuilt run projections from operation ledger"
         );
     }
-    let app = build_router_with_service(service.shared());
+    let app = build_router_with_all_services(
+        service.shared(),
+        SharedArtifactService::Sqlite(artifact_service),
+        SharedContextService::Sqlite(context_service),
+    );
     let listener = TcpListener::bind(addr).await?;
 
     info!(%addr, database_url = %database_url, "mneme daemon listening");

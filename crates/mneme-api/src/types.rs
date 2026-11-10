@@ -1,4 +1,7 @@
-use mneme_kernel::{KernelHealth, OperationEvent, RunProjection, ToolApprovalDecision, ToolEffect};
+use mneme_kernel::{
+    ArtifactDetail, ArtifactKind, ArtifactRecord, ContextBundleRecord, KernelHealth,
+    OperationEvent, RunProjection, ToolApprovalDecision, ToolEffect,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -68,6 +71,57 @@ pub struct ToolResultRequest {
 pub struct ToolLifecycleResponse {
     pub run_id: String,
     pub tool_call_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateArtifactRequest {
+    pub title: String,
+    pub kind: ArtifactKind,
+    pub mime_type: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateArtifactResponse {
+    pub artifact_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactsResponse {
+    pub artifacts: Vec<ArtifactRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactDetailResponse {
+    pub artifact: ArtifactRecord,
+    pub content: Option<String>,
+}
+
+impl From<ArtifactDetail> for ArtifactDetailResponse {
+    fn from(value: ArtifactDetail) -> Self {
+        Self {
+            artifact: value.artifact,
+            content: value.content,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateContextBundleRequest {
+    pub title: String,
+    pub summary: String,
+    pub artifact_ids: Vec<String>,
+    pub event_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateContextBundleResponse {
+    pub context_bundle_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextBundlesResponse {
+    pub context_bundles: Vec<ContextBundleRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

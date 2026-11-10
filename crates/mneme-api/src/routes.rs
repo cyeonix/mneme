@@ -1,4 +1,6 @@
 use crate::types::{
+    ArtifactDetailResponse, ArtifactsResponse, ContextBundlesResponse, CreateArtifactRequest,
+    CreateArtifactResponse, CreateContextBundleRequest, CreateContextBundleResponse,
     CreateRunRequest, CreateRunResponse, EventsResponse, HealthResponse, LifecycleTextRequest,
     RunLifecycleResponse, RunsResponse, ToolCallRequest, ToolCallResponse, ToolLifecycleRequest,
     ToolLifecycleResponse, ToolResultRequest,
@@ -10,13 +12,31 @@ use axum::{
     Json, Router,
 };
 use mneme_kernel::{
-    kernel_health, ComposedRunService, InMemoryOperationLedger, InMemoryRunProjectionStore, RunId,
-    RunServiceError, SharedOperationLedger, SharedRunProjectionStore, SharedRunService, ToolCallId,
+    kernel_health, ArtifactId, ArtifactServiceError, ComposedArtifactService,
+    ComposedContextService, ComposedRunService, ContextBundleId, ContextServiceError, EventId,
+    InMemoryArtifactContentStore, InMemoryArtifactProjectionStore,
+    InMemoryContextBundleProjectionStore, InMemoryOperationLedger, InMemoryRunProjectionStore,
+    RunId, RunServiceError, SharedOperationLedger, SharedRunProjectionStore, SharedRunService,
+    SqliteArtifactService, SqliteContextService, ToolCallId,
 };
+
+#[derive(Clone)]
+pub enum SharedArtifactService {
+    Composed(ComposedArtifactService),
+    Sqlite(SqliteArtifactService),
+}
+
+#[derive(Clone)]
+pub enum SharedContextService {
+    Composed(ComposedContextService),
+    Sqlite(SqliteContextService),
+}
 
 #[derive(Clone)]
 pub struct ApiState {
     pub run_service: SharedRunService,
+    pub artifact_service: SharedArtifactService,
+    pub context_service: SharedContextService,
 }
 
 /// 创建第一版本地 API 路由。
@@ -33,14 +53,73 @@ pub fn build_router_with_state(
     ledger: SharedOperationLedger,
     run_store: SharedRunProjectionStore,
 ) -> Router {
-    build_router_with_service(ComposedRunService::new(ledger, run_store).shared())
+    let artifact_projection = InMemoryArtifactProjectionStore::new().shared();
+    let artifact_service = ComposedArtifactService::new(
+        ledger.clone(),
+        run_store.clone(),
+        artifact_projection.clone(),
+        InMemoryArtifactContentStore::new().shared(),
+    );
+    let context_service = ComposedContextService::new(
+        ledger.clone(),
+        run_store.clone(),
+        artifact_projection,
+        InMemoryContextBundleProjectionStore::new().shared(),
+    );
+    build_router_with_all_services(
+        ComposedRunService::new(ledger, run_store).shared(),
+        SharedArtifactService::Composed(artifact_service),
+        SharedContextService::Composed(context_service),
+    )
 }
 
 pub fn build_router_with_service(run_service: SharedRunService) -> Router {
+    let ledger = InMemoryOperationLedger::new().shared();
+    let run_store = InMemoryRunProjectionStore::new().shared();
+    let artifact_projection = InMemoryArtifactProjectionStore::new().shared();
+    let artifact_service = ComposedArtifactService::new(
+        ledger.clone(),
+        run_store.clone(),
+        artifact_projection.clone(),
+        InMemoryArtifactContentStore::new().shared(),
+    );
+    let context_service = ComposedContextService::new(
+        ledger,
+        run_store,
+        artifact_projection,
+        InMemoryContextBundleProjectionStore::new().shared(),
+    );
+    build_router_with_all_services(
+        run_service,
+        SharedArtifactService::Composed(artifact_service),
+        SharedContextService::Composed(context_service),
+    )
+}
+
+pub fn build_router_with_all_services(
+    run_service: SharedRunService,
+    artifact_service: SharedArtifactService,
+    context_service: SharedContextService,
+) -> Router {
     Router::new()
         .route("/api/v1/health", get(get_health))
         .route("/api/v1/events", get(list_events))
         .route("/api/v1/runs", get(list_runs).post(create_run))
+        .route("/api/v1/artifacts", get(list_artifacts))
+        .route(
+            "/api/v1/runs/:run_id/artifacts",
+            axum::routing::post(create_artifact),
+        )
+        .route("/api/v1/artifacts/:artifact_id", get(get_artifact))
+        .route("/api/v1/context-bundles", get(list_context_bundles))
+        .route(
+            "/api/v1/runs/:run_id/context-bundles",
+            axum::routing::post(create_context_bundle),
+        )
+        .route(
+            "/api/v1/context-bundles/:context_bundle_id",
+            get(get_context_bundle),
+        )
         .route(
             "/api/v1/runs/:run_id/tool-calls",
             axum::routing::post(request_tool_call),
@@ -74,7 +153,11 @@ pub fn build_router_with_service(run_service: SharedRunService) -> Router {
             axum::routing::post(complete_run),
         )
         .route("/api/v1/runs/:run_id/fail", axum::routing::post(fail_run))
-        .with_state(ApiState { run_service })
+        .with_state(ApiState {
+            run_service,
+            artifact_service,
+            context_service,
+        })
 }
 
 async fn get_health() -> Json<HealthResponse> {
@@ -123,6 +206,18 @@ fn parse_tool_call_id(value: &str) -> Result<ToolCallId, StatusCode> {
     value.parse().map_err(|_| StatusCode::BAD_REQUEST)
 }
 
+fn parse_artifact_id(value: &str) -> Result<ArtifactId, StatusCode> {
+    value.parse().map_err(|_| StatusCode::BAD_REQUEST)
+}
+
+fn parse_context_bundle_id(value: &str) -> Result<ContextBundleId, StatusCode> {
+    value.parse().map_err(|_| StatusCode::BAD_REQUEST)
+}
+
+fn parse_event_id(value: &str) -> Result<EventId, StatusCode> {
+    value.parse().map_err(|_| StatusCode::BAD_REQUEST)
+}
+
 fn lifecycle_response(outcome: mneme_kernel::RunLifecycleOutcome) -> Json<RunLifecycleResponse> {
     Json(RunLifecycleResponse {
         run_id: outcome.run_id.to_string(),
@@ -136,6 +231,138 @@ fn tool_lifecycle_response(
         run_id: outcome.run_id.to_string(),
         tool_call_id: outcome.tool_call_id.to_string(),
     })
+}
+
+async fn list_artifacts(
+    State(state): State<ApiState>,
+) -> Result<Json<ArtifactsResponse>, StatusCode> {
+    let artifacts = match state.artifact_service {
+        SharedArtifactService::Composed(service) => service.list_artifacts().await,
+        SharedArtifactService::Sqlite(service) => service.list_artifacts().await,
+    }
+    .map_err(artifact_error_to_status)?;
+
+    Ok(Json(ArtifactsResponse { artifacts }))
+}
+
+async fn create_artifact(
+    State(state): State<ApiState>,
+    Path(run_id): Path<String>,
+    Json(request): Json<CreateArtifactRequest>,
+) -> Result<Json<CreateArtifactResponse>, StatusCode> {
+    let run_id = parse_run_id(&run_id)?;
+    let outcome = match state.artifact_service {
+        SharedArtifactService::Composed(service) => {
+            service
+                .create_text_artifact(
+                    run_id,
+                    request.title,
+                    request.kind,
+                    request.mime_type,
+                    request.content,
+                )
+                .await
+        }
+        SharedArtifactService::Sqlite(service) => {
+            service
+                .create_text_artifact(
+                    run_id,
+                    request.title,
+                    request.kind,
+                    request.mime_type,
+                    request.content,
+                )
+                .await
+        }
+    }
+    .map_err(artifact_error_to_status)?;
+
+    Ok(Json(CreateArtifactResponse {
+        artifact_id: outcome.artifact_id.to_string(),
+    }))
+}
+
+async fn get_artifact(
+    State(state): State<ApiState>,
+    Path(artifact_id): Path<String>,
+) -> Result<Json<ArtifactDetailResponse>, StatusCode> {
+    let artifact_id = parse_artifact_id(&artifact_id)?;
+    let detail = match state.artifact_service {
+        SharedArtifactService::Composed(service) => service.get_artifact(artifact_id).await,
+        SharedArtifactService::Sqlite(service) => service.get_artifact(artifact_id).await,
+    }
+    .map_err(artifact_error_to_status)?;
+
+    Ok(Json(detail.into()))
+}
+
+async fn list_context_bundles(
+    State(state): State<ApiState>,
+) -> Result<Json<ContextBundlesResponse>, StatusCode> {
+    let context_bundles = match state.context_service {
+        SharedContextService::Composed(service) => service.list_context_bundles().await,
+        SharedContextService::Sqlite(service) => service.list_context_bundles().await,
+    }
+    .map_err(context_error_to_status)?;
+
+    Ok(Json(ContextBundlesResponse { context_bundles }))
+}
+
+async fn create_context_bundle(
+    State(state): State<ApiState>,
+    Path(run_id): Path<String>,
+    Json(request): Json<CreateContextBundleRequest>,
+) -> Result<Json<CreateContextBundleResponse>, StatusCode> {
+    let run_id = parse_run_id(&run_id)?;
+    let CreateContextBundleRequest {
+        title,
+        summary,
+        artifact_ids,
+        event_ids,
+    } = request;
+    let artifact_ids = artifact_ids
+        .iter()
+        .map(|artifact_id| parse_artifact_id(artifact_id))
+        .collect::<Result<Vec<_>, _>>()?;
+    let event_ids = event_ids
+        .iter()
+        .map(|event_id| parse_event_id(event_id))
+        .collect::<Result<Vec<_>, _>>()?;
+    let outcome = match state.context_service {
+        SharedContextService::Composed(service) => {
+            service
+                .create_context_bundle(run_id, title, summary, artifact_ids, event_ids)
+                .await
+        }
+        SharedContextService::Sqlite(service) => {
+            service
+                .create_context_bundle(run_id, title, summary, artifact_ids, event_ids)
+                .await
+        }
+    }
+    .map_err(context_error_to_status)?;
+
+    Ok(Json(CreateContextBundleResponse {
+        context_bundle_id: outcome.context_bundle_id.to_string(),
+    }))
+}
+
+async fn get_context_bundle(
+    State(state): State<ApiState>,
+    Path(context_bundle_id): Path<String>,
+) -> Result<Json<mneme_kernel::ContextBundleRecord>, StatusCode> {
+    let context_bundle_id = parse_context_bundle_id(&context_bundle_id)?;
+    let context_bundle = match state.context_service {
+        SharedContextService::Composed(service) => {
+            service.get_context_bundle(context_bundle_id).await
+        }
+        SharedContextService::Sqlite(service) => {
+            service.get_context_bundle(context_bundle_id).await
+        }
+    }
+    .map_err(context_error_to_status)?;
+
+    Ok(Json(context_bundle))
 }
 
 async fn request_tool_call(
@@ -290,6 +517,31 @@ fn service_error_to_status(error: RunServiceError) -> StatusCode {
     }
 }
 
+fn artifact_error_to_status(error: ArtifactServiceError) -> StatusCode {
+    match error {
+        ArtifactServiceError::InvalidInput => StatusCode::BAD_REQUEST,
+        ArtifactServiceError::UnknownRun | ArtifactServiceError::UnknownArtifact => {
+            StatusCode::NOT_FOUND
+        }
+        ArtifactServiceError::ContentStore(_)
+        | ArtifactServiceError::Ledger(_)
+        | ArtifactServiceError::Projection(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+fn context_error_to_status(error: ContextServiceError) -> StatusCode {
+    match error {
+        ContextServiceError::InvalidInput => StatusCode::BAD_REQUEST,
+        ContextServiceError::UnknownRun
+        | ContextServiceError::UnknownContextBundle
+        | ContextServiceError::UnknownArtifact
+        | ContextServiceError::UnknownEvent => StatusCode::NOT_FOUND,
+        ContextServiceError::Ledger(_) | ContextServiceError::Projection(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,6 +553,55 @@ mod tests {
     use mneme_kernel::{ComposedRunService, OperationLedger, SqliteRunService, SqliteStore};
     use serde_json::json;
     use tower::ServiceExt;
+
+    fn build_router_with_in_memory_services() -> Router {
+        build_router_with_state(
+            InMemoryOperationLedger::new().shared(),
+            InMemoryRunProjectionStore::new().shared(),
+        )
+    }
+
+    fn empty_request(method: &str, uri: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::empty())
+            .expect("request")
+    }
+
+    fn json_request(method: &str, uri: &str, payload: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload.to_string()))
+            .expect("request")
+    }
+
+    async fn response_json(response: axum::response::Response) -> serde_json::Value {
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        serde_json::from_slice(&body).expect("json response")
+    }
+
+    async fn create_run_for_test(app: &Router, instruction: &str) -> String {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/v1/runs",
+                json!({ "instruction": instruction }),
+            ))
+            .await
+            .expect("create run response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        body["run_id"].as_str().expect("run_id").to_string()
+    }
 
     #[tokio::test]
     async fn health_endpoint_returns_ready_kernel_status() {
@@ -407,6 +708,186 @@ mod tests {
         let payload: RunsResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload.runs.len(), 1);
         assert_eq!(payload.runs[0].instruction, "展示 runs");
+    }
+
+    #[tokio::test]
+    async fn api_creates_lists_and_gets_artifact() {
+        let app = build_router_with_in_memory_services();
+        let run_id = create_run_for_test(&app, "collect artifact").await;
+
+        let create_response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/api/v1/runs/{run_id}/artifacts"),
+                serde_json::json!({
+                    "title": "Run summary",
+                    "kind": "markdown",
+                    "mime_type": "text/markdown",
+                    "content": "# Summary"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(create_response.status(), StatusCode::OK);
+
+        let body = response_json(create_response).await;
+        let artifact_id = body["artifact_id"].as_str().unwrap();
+
+        let list_response = app
+            .clone()
+            .oneshot(empty_request("GET", "/api/v1/artifacts"))
+            .await
+            .unwrap();
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list = response_json(list_response).await;
+        assert_eq!(list["artifacts"].as_array().unwrap().len(), 1);
+
+        let get_response = app
+            .oneshot(empty_request(
+                "GET",
+                &format!("/api/v1/artifacts/{artifact_id}"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(get_response.status(), StatusCode::OK);
+        let detail = response_json(get_response).await;
+        assert_eq!(detail["artifact"]["title"], "Run summary");
+        assert_eq!(detail["content"], "# Summary");
+    }
+
+    #[tokio::test]
+    async fn api_rejects_invalid_artifact_input() {
+        let app = build_router_with_in_memory_services();
+        let run_id = create_run_for_test(&app, "reject artifact").await;
+
+        let response = app
+            .oneshot(json_request(
+                "POST",
+                &format!("/api/v1/runs/{run_id}/artifacts"),
+                serde_json::json!({
+                    "title": " ",
+                    "kind": "markdown",
+                    "mime_type": "text/markdown",
+                    "content": "# Summary"
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn api_rejects_invalid_artifact_id() {
+        let app = build_router_with_in_memory_services();
+
+        let response = app
+            .oneshot(empty_request("GET", "/api/v1/artifacts/not-a-uuid"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn api_returns_not_found_for_unknown_artifact() {
+        let app = build_router_with_in_memory_services();
+        let artifact_id = mneme_kernel::ArtifactId::new();
+
+        let response = app
+            .oneshot(empty_request(
+                "GET",
+                &format!("/api/v1/artifacts/{artifact_id}"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn api_creates_lists_and_gets_context_bundle() {
+        let app = build_router_with_in_memory_services();
+        let run_id = create_run_for_test(&app, "collect context").await;
+
+        let create_response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/api/v1/runs/{run_id}/context-bundles"),
+                serde_json::json!({
+                    "title": "Debug context",
+                    "summary": "User report and selected events",
+                    "artifact_ids": [],
+                    "event_ids": []
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(create_response.status(), StatusCode::OK);
+
+        let body = response_json(create_response).await;
+        let context_bundle_id = body["context_bundle_id"].as_str().unwrap();
+
+        let list_response = app
+            .clone()
+            .oneshot(empty_request("GET", "/api/v1/context-bundles"))
+            .await
+            .unwrap();
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list = response_json(list_response).await;
+        assert_eq!(list["context_bundles"].as_array().unwrap().len(), 1);
+
+        let get_response = app
+            .oneshot(empty_request(
+                "GET",
+                &format!("/api/v1/context-bundles/{context_bundle_id}"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(get_response.status(), StatusCode::OK);
+        let detail = response_json(get_response).await;
+        assert_eq!(detail["title"], "Debug context");
+        assert_eq!(detail["artifact_ids"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn api_rejects_invalid_context_bundle_reference() {
+        let app = build_router_with_in_memory_services();
+        let run_id = create_run_for_test(&app, "reject context").await;
+
+        let response = app
+            .oneshot(json_request(
+                "POST",
+                &format!("/api/v1/runs/{run_id}/context-bundles"),
+                serde_json::json!({
+                    "title": "Debug context",
+                    "summary": "User report and selected events",
+                    "artifact_ids": ["not-a-uuid"],
+                    "event_ids": []
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn api_returns_not_found_for_unknown_context_bundle() {
+        let app = build_router_with_in_memory_services();
+        let context_bundle_id = mneme_kernel::ContextBundleId::new();
+
+        let response = app
+            .oneshot(empty_request(
+                "GET",
+                &format!("/api/v1/context-bundles/{context_bundle_id}"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
