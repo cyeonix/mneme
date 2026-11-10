@@ -1,13 +1,24 @@
 import '@testing-library/jest-dom/vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
-import type { EventsResponse, KernelHealth, MnemeApiClient, RunsResponse } from '../api/client';
+import type {
+  ArtifactDetail,
+  ArtifactsResponse,
+  ContextBundlesResponse,
+  EventsResponse,
+  KernelHealth,
+  MnemeApiClient,
+  RunsResponse,
+} from '../api/client';
 import { App } from './App';
 
 interface TestClientState {
   health?: KernelHealth;
   events?: EventsResponse;
   runs?: RunsResponse;
+  artifacts?: ArtifactsResponse;
+  artifactDetail?: ArtifactDetail;
+  contextBundles?: ContextBundlesResponse;
 }
 
 function createTestClient(state: TestClientState = {}): MnemeApiClient {
@@ -66,28 +77,30 @@ function createTestClient(state: TestClientState = {}): MnemeApiClient {
       return { run_id: 'run-123', tool_call_id: 'tool-123' };
     },
     async listArtifacts() {
-      return { artifacts: [] };
+      return state.artifacts ?? { artifacts: [] };
     },
     async createArtifact() {
       return { artifact_id: 'artifact-123' };
     },
     async getArtifact() {
-      return {
-        artifact: {
-          artifact_id: 'artifact-123',
-          run_id: 'run-123',
-          title: 'Run summary',
-          kind: 'markdown',
-          mime_type: 'text/markdown',
-          sha256: 'sha256',
-          byte_len: 9,
-          created_at: '2026-11-10T00:00:00Z',
-        },
-        content: '# Summary',
-      };
+      return (
+        state.artifactDetail ?? {
+          artifact: {
+            artifact_id: 'artifact-123',
+            run_id: 'run-123',
+            title: 'Run summary',
+            kind: 'markdown',
+            mime_type: 'text/markdown',
+            sha256: 'sha256',
+            byte_len: 9,
+            created_at: '2026-11-10T00:00:00Z',
+          },
+          content: '# Summary',
+        }
+      );
     },
     async listContextBundles() {
-      return { context_bundles: [] };
+      return state.contextBundles ?? { context_bundles: [] };
     },
     async createContextBundle() {
       return { context_bundle_id: 'context-bundle-123' };
@@ -153,6 +166,63 @@ describe('App', () => {
 
     expect(await screen.findByText('总结完成')).toBeInTheDocument();
     expect(await screen.findByText('模型不可用')).toBeInTheDocument();
+  });
+
+  it('shows artifacts and context bundles after tool activity', async () => {
+    const client = createTestClient({
+      artifacts: {
+        artifacts: [
+          {
+            artifact_id: 'artifact-123',
+            run_id: 'run-123',
+            title: 'Run summary',
+            kind: 'markdown',
+            mime_type: 'text/markdown',
+            sha256: 'abcdef1234567890',
+            byte_len: 9,
+            created_at: '2026-11-10T00:00:00Z',
+          },
+        ],
+      },
+      artifactDetail: {
+        artifact: {
+          artifact_id: 'artifact-123',
+          run_id: 'run-123',
+          title: 'Run summary',
+          kind: 'markdown',
+          mime_type: 'text/markdown',
+          sha256: 'abcdef1234567890',
+          byte_len: 9,
+          created_at: '2026-11-10T00:00:00Z',
+        },
+        content: '# Summary\n\nThis run completed successfully.',
+      },
+      contextBundles: {
+        context_bundles: [
+          {
+            context_bundle_id: 'context-bundle-123',
+            run_id: 'run-123',
+            title: 'Debug context',
+            summary: 'Useful context for debugging',
+            artifact_ids: ['artifact-123'],
+            event_ids: ['event-1', 'event-2'],
+            created_at: '2026-11-10T00:00:00Z',
+          },
+        ],
+      },
+    });
+
+    render(<App client={client} />);
+
+    expect(await screen.findByText('Artifact Workspace')).toBeInTheDocument();
+    expect(await screen.findByText('Run summary')).toBeInTheDocument();
+    expect(await screen.findByText('markdown')).toBeInTheDocument();
+    expect(await screen.findByText('abcdef12')).toBeInTheDocument();
+    expect(await screen.findByText(/# Summary/)).toBeInTheDocument();
+    expect(await screen.findByText('Context Inspector')).toBeInTheDocument();
+    expect(await screen.findByText('Debug context')).toBeInTheDocument();
+    expect(await screen.findByText('1 artifact')).toBeInTheDocument();
+    expect(await screen.findByText('2 events')).toBeInTheDocument();
   });
 
   it('shows tool activity from the operation ledger', async () => {

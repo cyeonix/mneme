@@ -1,5 +1,13 @@
 import { useEffect, useState } from 'react';
-import type { EventsResponse, KernelHealth, MnemeApiClient, RunsResponse } from '../api/client';
+import type {
+  ArtifactDetail,
+  ArtifactRecord,
+  ContextBundlesResponse,
+  EventsResponse,
+  KernelHealth,
+  MnemeApiClient,
+  RunsResponse,
+} from '../api/client';
 
 interface AppProps {
   client: MnemeApiClient;
@@ -13,6 +21,25 @@ interface ToolActivityItem {
   label: string;
   detail: string;
   effect?: string;
+}
+
+interface ArtifactPreviewItem {
+  record: ArtifactRecord;
+  preview: string;
+}
+
+const TEXT_ARTIFACT_KINDS = new Set(['text', 'markdown', 'json']);
+const BINARY_PREVIEW_MESSAGE = 'Binary artifact preview is not available in Milestone 5.';
+
+function artifactPreview(detail: ArtifactDetail): string {
+  if (!TEXT_ARTIFACT_KINDS.has(detail.artifact.kind)) {
+    return BINARY_PREVIEW_MESSAGE;
+  }
+  return (detail.content ?? '').slice(0, 240);
+}
+
+function countLabel(count: number, singular: string, plural: string): string {
+  return `${count} ${count === 1 ? singular : plural}`;
 }
 
 function toolActivityFromEvents(events: EventsResponse): ToolActivityItem[] {
@@ -75,6 +102,8 @@ export function App({ client }: AppProps) {
   const [health, setHealth] = useState<KernelHealth | null>(null);
   const [events, setEvents] = useState<EventsResponse>({ events: [] });
   const [runs, setRuns] = useState<RunsResponse>({ runs: [] });
+  const [artifactPreviews, setArtifactPreviews] = useState<ArtifactPreviewItem[]>([]);
+  const [contextBundles, setContextBundles] = useState<ContextBundlesResponse>({ context_bundles: [] });
   const [error, setError] = useState<string | null>(null);
   const toolActivity = toolActivityFromEvents(events);
 
@@ -84,15 +113,28 @@ export function App({ client }: AppProps) {
     async function loadKernelState() {
       try {
         // Workbench 通过 API 边界读取 Kernel 状态、Operation Ledger 事件和 runs 读模型。
-        const [nextHealth, nextEvents, nextRuns] = await Promise.all([
+        const [nextHealth, nextEvents, nextRuns, nextArtifacts, nextContextBundles] = await Promise.all([
           client.getHealth(),
           client.listEvents(),
           client.listRuns(),
+          client.listArtifacts(),
+          client.listContextBundles(),
         ]);
+        const nextArtifactPreviews = await Promise.all(
+          nextArtifacts.artifacts.map(async (record) => {
+            if (record.kind === 'binary') {
+              return { record, preview: BINARY_PREVIEW_MESSAGE };
+            }
+            const detail = await client.getArtifact(record.artifact_id);
+            return { record, preview: artifactPreview(detail) };
+          }),
+        );
         if (!cancelled) {
           setHealth(nextHealth);
           setEvents(nextEvents);
           setRuns(nextRuns);
+          setArtifactPreviews(nextArtifactPreviews);
+          setContextBundles(nextContextBundles);
         }
       } catch (unknownError) {
         if (!cancelled) {
@@ -168,6 +210,51 @@ export function App({ client }: AppProps) {
                 {activity.effect ? <span className="tool-effect">{activity.effect}</span> : null}
                 <strong>{activity.detail}</strong>
                 <small>{activity.occurredAt}</small>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      <section className="panel">
+        <h2>Artifact Workspace</h2>
+        {artifactPreviews.length === 0 ? (
+          <p className="muted">还没有 artifact。Artifact Workspace 会只读展示已保存的运行产物。</p>
+        ) : (
+          <ul className="artifact-list">
+            {artifactPreviews.map(({ record, preview }) => (
+              <li key={record.artifact_id} className="artifact-card">
+                <div className="artifact-card-header">
+                  <strong>{record.title}</strong>
+                  <span className="artifact-kind">{record.kind}</span>
+                </div>
+                <div className="artifact-meta">
+                  <span>{record.mime_type}</span>
+                  <span>{record.sha256.slice(0, 8)}</span>
+                  <span>{record.byte_len} bytes</span>
+                </div>
+                <pre className="artifact-preview">{preview}</pre>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      <section className="panel">
+        <h2>Context Inspector</h2>
+        {contextBundles.context_bundles.length === 0 ? (
+          <p className="muted">还没有 context bundle。Context Inspector 会只读展示上下文包组成。</p>
+        ) : (
+          <ul className="context-list">
+            {contextBundles.context_bundles.map((bundle) => (
+              <li key={bundle.context_bundle_id} className="context-card">
+                <strong>{bundle.title}</strong>
+                <p>{bundle.summary}</p>
+                <div className="context-counts">
+                  <span>{countLabel(bundle.artifact_ids.length, 'artifact', 'artifacts')}</span>
+                  <span>{countLabel(bundle.event_ids.length, 'event', 'events')}</span>
+                </div>
+                <small>{bundle.created_at}</small>
               </li>
             ))}
           </ul>
