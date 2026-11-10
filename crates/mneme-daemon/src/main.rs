@@ -1,9 +1,11 @@
 use mneme_api::routes::{
-    build_router_with_all_services, SharedArtifactService, SharedContextService,
+    build_router_with_all_services, SharedArtifactService, SharedChunkService,
+    SharedContextService, SharedKnowledgeService, SharedMemoryService, SharedRetrievalService,
 };
 use mneme_kernel::{
-    InMemoryArtifactContentStore, RunService, SqliteArtifactService, SqliteContextService,
-    SqliteRunService, SqliteStore,
+    ChunkTextSplitter, InMemoryArtifactContentStore, RunService, SqliteArtifactService,
+    SqliteChunkService, SqliteContextService, SqliteKnowledgeService, SqliteMemoryService,
+    SqliteRetrievalService, SqliteRunService, SqliteStore,
 };
 use std::{fs, net::SocketAddr, path::Path};
 use tokio::net::TcpListener;
@@ -67,7 +69,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let service = SqliteRunService::new(store.clone());
     let artifact_service =
         SqliteArtifactService::new(store.clone(), InMemoryArtifactContentStore::new().shared());
-    let context_service = SqliteContextService::new(store);
+    let context_service = SqliteContextService::new(store.clone());
+    let knowledge_service = SqliteKnowledgeService::new(store.clone());
+    let chunk_service = SqliteChunkService::new(store.clone(), ChunkTextSplitter::new(4096, 256));
+    let memory_service = SqliteMemoryService::new(store.clone());
+    let retrieval_service = SqliteRetrievalService::new(store);
     if rebuild_runs_on_start() {
         let rebuilt = service.rebuild_run_projections().await?;
         info!(
@@ -79,6 +85,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         service.shared(),
         SharedArtifactService::Sqlite(artifact_service),
         SharedContextService::Sqlite(context_service),
+        SharedKnowledgeService::Sqlite(knowledge_service),
+        SharedChunkService::Sqlite(chunk_service),
+        SharedMemoryService::Sqlite(memory_service),
+        SharedRetrievalService::Sqlite(retrieval_service),
     );
     let listener = TcpListener::bind(addr).await?;
 

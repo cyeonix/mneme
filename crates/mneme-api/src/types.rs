@@ -1,6 +1,7 @@
 use mneme_kernel::{
-    ArtifactDetail, ArtifactKind, ArtifactRecord, ContextBundleRecord, KernelHealth,
-    OperationEvent, RunProjection, ToolApprovalDecision, ToolEffect,
+    ArtifactDetail, ArtifactKind, ArtifactRecord, ContextBundleRecord, DocumentChunkRecord,
+    KernelHealth, KnowledgeSourceRecord, MemoryKind, MemoryRecord, OperationEvent,
+    RetrievalTraceRecord, RunProjection, SearchResult, ToolApprovalDecision, ToolEffect,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -124,7 +125,7 @@ pub struct ContextBundlesResponse {
     pub context_bundles: Vec<ContextBundleRecord>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EventsResponse {
     pub events: Vec<OperationEvent>,
 }
@@ -132,4 +133,113 @@ pub struct EventsResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunsResponse {
     pub runs: Vec<RunProjection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateKnowledgeSourceRequest {
+    pub title: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateManualKnowledgeSourceRequest {
+    pub run_id: String,
+    pub title: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateKnowledgeSourceResponse {
+    pub knowledge_source_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnowledgeSourcesResponse {
+    pub knowledge_sources: Vec<KnowledgeSourceRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocumentChunksResponse {
+    pub document_chunks: Vec<DocumentChunkRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecordMemoryRequest {
+    pub run_id: String,
+    pub knowledge_source_id: Option<String>,
+    pub kind: MemoryKind,
+    pub title: String,
+    pub body: String,
+    pub confidence: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordMemoryResponse {
+    pub memory_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoriesResponse {
+    pub memories: Vec<MemoryRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchRequest {
+    pub run_id: String,
+    pub query: String,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(remote = "SearchResult")]
+struct SearchResultSerde {
+    pub chunk: DocumentChunkRecord,
+    pub source: KnowledgeSourceRecord,
+    pub score: f32,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchResponseDto {
+    pub query: String,
+    #[serde(with = "search_result_vec")]
+    pub hits: Vec<SearchResult>,
+    pub retrieval_trace_id: String,
+}
+
+mod search_result_vec {
+    use super::{SearchResult, SearchResultSerde};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(hits: &[SearchResult], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        #[derive(Serialize)]
+        struct Wrapper<'a>(#[serde(with = "SearchResultSerde")] &'a SearchResult);
+
+        hits.iter()
+            .map(Wrapper)
+            .collect::<Vec<_>>()
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<SearchResult>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wrapper(#[serde(with = "SearchResultSerde")] SearchResult);
+
+        Vec::<Wrapper>::deserialize(deserializer).map(|hits| {
+            hits.into_iter()
+                .map(|Wrapper(search_result)| search_result)
+                .collect()
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrievalTracesResponse {
+    pub retrieval_traces: Vec<RetrievalTraceRecord>,
 }

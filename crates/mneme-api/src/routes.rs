@@ -1,23 +1,34 @@
 use crate::types::{
     ArtifactDetailResponse, ArtifactsResponse, ContextBundlesResponse, CreateArtifactRequest,
     CreateArtifactResponse, CreateContextBundleRequest, CreateContextBundleResponse,
-    CreateRunRequest, CreateRunResponse, EventsResponse, HealthResponse, LifecycleTextRequest,
-    RunLifecycleResponse, RunsResponse, ToolCallRequest, ToolCallResponse, ToolLifecycleRequest,
-    ToolLifecycleResponse, ToolResultRequest,
+    CreateKnowledgeSourceRequest, CreateKnowledgeSourceResponse,
+    CreateManualKnowledgeSourceRequest, CreateRunRequest, CreateRunResponse,
+    DocumentChunksResponse, EventsResponse, HealthResponse, KnowledgeSourcesResponse,
+    LifecycleTextRequest, MemoriesResponse, RecordMemoryRequest, RecordMemoryResponse,
+    RetrievalTracesResponse, RunLifecycleResponse, RunsResponse, SearchRequest, SearchResponseDto,
+    ToolCallRequest, ToolCallResponse, ToolLifecycleRequest, ToolLifecycleResponse,
+    ToolResultRequest,
 };
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     routing::get,
     Json, Router,
 };
 use mneme_kernel::{
-    kernel_health, ArtifactId, ArtifactServiceError, ComposedArtifactService,
-    ComposedContextService, ComposedRunService, ContextBundleId, ContextServiceError, EventId,
+    kernel_health, ArtifactId, ArtifactServiceError, ChunkTextSplitter, ComposedArtifactService,
+    ComposedChunkService, ComposedContextService, ComposedKnowledgeService, ComposedMemoryService,
+    ComposedRetrievalService, ComposedRunService, ContextBundleId, ContextServiceError, EventId,
     InMemoryArtifactContentStore, InMemoryArtifactProjectionStore,
-    InMemoryContextBundleProjectionStore, InMemoryOperationLedger, InMemoryRunProjectionStore,
-    RunId, RunServiceError, SharedOperationLedger, SharedRunProjectionStore, SharedRunService,
-    SqliteArtifactService, SqliteContextService, ToolCallId,
+    InMemoryContextBundleProjectionStore, InMemoryDocumentChunkProjectionStore,
+    InMemoryKnowledgeSourceProjectionStore, InMemoryMemoryProjectionStore, InMemoryOperationLedger,
+    InMemoryRetrievalTraceProjectionStore, InMemoryRunProjectionStore, InMemorySearchIndex,
+    KnowledgeServiceError, KnowledgeSourceId, MemoryServiceError, RetrievalServiceError, RunId,
+    RunServiceError, SharedDocumentChunkProjectionStore, SharedKnowledgeSourceProjectionStore,
+    SharedMemoryProjectionStore, SharedOperationLedger, SharedRetrievalTraceProjectionStore,
+    SharedRunProjectionStore, SharedRunService, SharedSearchIndex, SqliteArtifactService,
+    SqliteChunkService, SqliteContextService, SqliteKnowledgeService, SqliteMemoryService,
+    SqliteRetrievalService, ToolCallId,
 };
 
 #[derive(Clone)]
@@ -33,10 +44,38 @@ pub enum SharedContextService {
 }
 
 #[derive(Clone)]
+pub enum SharedKnowledgeService {
+    Composed(ComposedKnowledgeService),
+    Sqlite(SqliteKnowledgeService),
+}
+
+#[derive(Clone)]
+pub enum SharedChunkService {
+    Composed(ComposedChunkService),
+    Sqlite(SqliteChunkService),
+}
+
+#[derive(Clone)]
+pub enum SharedMemoryService {
+    Composed(ComposedMemoryService),
+    Sqlite(SqliteMemoryService),
+}
+
+#[derive(Clone)]
+pub enum SharedRetrievalService {
+    Composed(ComposedRetrievalService),
+    Sqlite(SqliteRetrievalService),
+}
+
+#[derive(Clone)]
 pub struct ApiState {
     pub run_service: SharedRunService,
     pub artifact_service: SharedArtifactService,
     pub context_service: SharedContextService,
+    pub knowledge_service: SharedKnowledgeService,
+    pub chunk_service: SharedChunkService,
+    pub memory_service: SharedMemoryService,
+    pub retrieval_service: SharedRetrievalService,
 }
 
 /// 创建第一版本地 API 路由。
@@ -54,6 +93,12 @@ pub fn build_router_with_state(
     run_store: SharedRunProjectionStore,
 ) -> Router {
     let artifact_projection = InMemoryArtifactProjectionStore::new().shared();
+    let context_projection = InMemoryContextBundleProjectionStore::new().shared();
+    let source_projection = InMemoryKnowledgeSourceProjectionStore::new().shared();
+    let chunk_projection = InMemoryDocumentChunkProjectionStore::new().shared();
+    let memory_projection = InMemoryMemoryProjectionStore::new().shared();
+    let trace_projection = InMemoryRetrievalTraceProjectionStore::new().shared();
+    let search_index = InMemorySearchIndex::new().shared();
     let artifact_service = ComposedArtifactService::new(
         ledger.clone(),
         run_store.clone(),
@@ -63,13 +108,29 @@ pub fn build_router_with_state(
     let context_service = ComposedContextService::new(
         ledger.clone(),
         run_store.clone(),
-        artifact_projection,
-        InMemoryContextBundleProjectionStore::new().shared(),
+        artifact_projection.clone(),
+        context_projection.clone(),
     );
+    let (knowledge_service, chunk_service, memory_service, retrieval_service) =
+        composed_m6_services(
+            ledger.clone(),
+            run_store.clone(),
+            artifact_projection,
+            context_projection,
+            source_projection,
+            chunk_projection,
+            memory_projection,
+            trace_projection,
+            search_index,
+        );
     build_router_with_all_services(
         ComposedRunService::new(ledger, run_store).shared(),
         SharedArtifactService::Composed(artifact_service),
         SharedContextService::Composed(context_service),
+        knowledge_service,
+        chunk_service,
+        memory_service,
+        retrieval_service,
     )
 }
 
@@ -77,6 +138,12 @@ pub fn build_router_with_service(run_service: SharedRunService) -> Router {
     let ledger = InMemoryOperationLedger::new().shared();
     let run_store = InMemoryRunProjectionStore::new().shared();
     let artifact_projection = InMemoryArtifactProjectionStore::new().shared();
+    let context_projection = InMemoryContextBundleProjectionStore::new().shared();
+    let source_projection = InMemoryKnowledgeSourceProjectionStore::new().shared();
+    let chunk_projection = InMemoryDocumentChunkProjectionStore::new().shared();
+    let memory_projection = InMemoryMemoryProjectionStore::new().shared();
+    let trace_projection = InMemoryRetrievalTraceProjectionStore::new().shared();
+    let search_index = InMemorySearchIndex::new().shared();
     let artifact_service = ComposedArtifactService::new(
         ledger.clone(),
         run_store.clone(),
@@ -84,15 +151,85 @@ pub fn build_router_with_service(run_service: SharedRunService) -> Router {
         InMemoryArtifactContentStore::new().shared(),
     );
     let context_service = ComposedContextService::new(
-        ledger,
-        run_store,
-        artifact_projection,
-        InMemoryContextBundleProjectionStore::new().shared(),
+        ledger.clone(),
+        run_store.clone(),
+        artifact_projection.clone(),
+        context_projection.clone(),
     );
+    let (knowledge_service, chunk_service, memory_service, retrieval_service) =
+        composed_m6_services(
+            ledger,
+            run_store,
+            artifact_projection,
+            context_projection,
+            source_projection,
+            chunk_projection,
+            memory_projection,
+            trace_projection,
+            search_index,
+        );
     build_router_with_all_services(
         run_service,
         SharedArtifactService::Composed(artifact_service),
         SharedContextService::Composed(context_service),
+        knowledge_service,
+        chunk_service,
+        memory_service,
+        retrieval_service,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn composed_m6_services(
+    ledger: SharedOperationLedger,
+    run_store: SharedRunProjectionStore,
+    artifact_projection: mneme_kernel::SharedArtifactProjectionStore,
+    context_projection: mneme_kernel::SharedContextBundleProjectionStore,
+    source_projection: SharedKnowledgeSourceProjectionStore,
+    chunk_projection: SharedDocumentChunkProjectionStore,
+    memory_projection: SharedMemoryProjectionStore,
+    trace_projection: SharedRetrievalTraceProjectionStore,
+    search_index: SharedSearchIndex,
+) -> (
+    SharedKnowledgeService,
+    SharedChunkService,
+    SharedMemoryService,
+    SharedRetrievalService,
+) {
+    let knowledge_service = ComposedKnowledgeService::new(
+        ledger.clone(),
+        run_store.clone(),
+        artifact_projection,
+        context_projection,
+        source_projection.clone(),
+    );
+    let chunk_service = ComposedChunkService::new(
+        ledger.clone(),
+        source_projection.clone(),
+        chunk_projection.clone(),
+        ChunkTextSplitter::new(4096, 256),
+    );
+    let memory_service = ComposedMemoryService::new(
+        ledger.clone(),
+        run_store.clone(),
+        source_projection.clone(),
+        memory_projection.clone(),
+    );
+    let retrieval_service = ComposedRetrievalService::new(
+        ledger,
+        run_store,
+        source_projection,
+        chunk_projection,
+        memory_projection,
+        trace_projection,
+        search_index,
+    );
+
+    (
+        SharedKnowledgeService::Composed(knowledge_service),
+        SharedChunkService::Composed(chunk_service),
+        SharedMemoryService::Composed(memory_service),
+        SharedRetrievalService::Composed(retrieval_service),
     )
 }
 
@@ -100,6 +237,10 @@ pub fn build_router_with_all_services(
     run_service: SharedRunService,
     artifact_service: SharedArtifactService,
     context_service: SharedContextService,
+    knowledge_service: SharedKnowledgeService,
+    chunk_service: SharedChunkService,
+    memory_service: SharedMemoryService,
+    retrieval_service: SharedRetrievalService,
 ) -> Router {
     Router::new()
         .route("/api/v1/health", get(get_health))
@@ -120,6 +261,27 @@ pub fn build_router_with_all_services(
             "/api/v1/context-bundles/:context_bundle_id",
             get(get_context_bundle),
         )
+        .route("/api/v1/knowledge-sources", get(list_knowledge_sources))
+        .route(
+            "/api/v1/artifacts/:artifact_id/knowledge-source",
+            axum::routing::post(create_artifact_knowledge_source),
+        )
+        .route(
+            "/api/v1/context-bundles/:context_bundle_id/knowledge-source",
+            axum::routing::post(create_context_bundle_knowledge_source),
+        )
+        .route(
+            "/api/v1/knowledge-sources/manual",
+            axum::routing::post(create_manual_knowledge_source),
+        )
+        .route("/api/v1/document-chunks", get(list_document_chunks))
+        .route(
+            "/api/v1/knowledge-sources/:knowledge_source_id/chunks",
+            axum::routing::post(chunk_knowledge_source),
+        )
+        .route("/api/v1/memories", get(list_memories).post(record_memory))
+        .route("/api/v1/search", axum::routing::post(search))
+        .route("/api/v1/retrieval-traces", get(list_retrieval_traces))
         .route(
             "/api/v1/runs/:run_id/tool-calls",
             axum::routing::post(request_tool_call),
@@ -157,6 +319,10 @@ pub fn build_router_with_all_services(
             run_service,
             artifact_service,
             context_service,
+            knowledge_service,
+            chunk_service,
+            memory_service,
+            retrieval_service,
         })
 }
 
@@ -215,6 +381,10 @@ fn parse_context_bundle_id(value: &str) -> Result<ContextBundleId, StatusCode> {
 }
 
 fn parse_event_id(value: &str) -> Result<EventId, StatusCode> {
+    value.parse().map_err(|_| StatusCode::BAD_REQUEST)
+}
+
+fn parse_knowledge_source_id(value: &str) -> Result<KnowledgeSourceId, StatusCode> {
     value.parse().map_err(|_| StatusCode::BAD_REQUEST)
 }
 
@@ -363,6 +533,233 @@ async fn get_context_bundle(
     .map_err(context_error_to_status)?;
 
     Ok(Json(context_bundle))
+}
+
+async fn list_knowledge_sources(
+    State(state): State<ApiState>,
+) -> Result<Json<KnowledgeSourcesResponse>, StatusCode> {
+    let knowledge_sources = match state.knowledge_service {
+        SharedKnowledgeService::Composed(service) => service.list_sources().await,
+        SharedKnowledgeService::Sqlite(service) => service.list_sources().await,
+    }
+    .map_err(knowledge_error_to_status)?;
+
+    Ok(Json(KnowledgeSourcesResponse { knowledge_sources }))
+}
+
+async fn create_artifact_knowledge_source(
+    State(state): State<ApiState>,
+    Path(artifact_id): Path<String>,
+    Json(request): Json<CreateKnowledgeSourceRequest>,
+) -> Result<Json<CreateKnowledgeSourceResponse>, StatusCode> {
+    let artifact_id = parse_artifact_id(&artifact_id)?;
+    let outcome = match state.knowledge_service {
+        SharedKnowledgeService::Composed(service) => {
+            service
+                .create_source_from_artifact(artifact_id, request.title, request.summary)
+                .await
+        }
+        SharedKnowledgeService::Sqlite(service) => {
+            service
+                .create_source_from_artifact(artifact_id, request.title, request.summary)
+                .await
+        }
+    }
+    .map_err(knowledge_error_to_status)?;
+
+    Ok(Json(CreateKnowledgeSourceResponse {
+        knowledge_source_id: outcome.knowledge_source_id.to_string(),
+    }))
+}
+
+async fn create_context_bundle_knowledge_source(
+    State(state): State<ApiState>,
+    Path(context_bundle_id): Path<String>,
+    Json(request): Json<CreateKnowledgeSourceRequest>,
+) -> Result<Json<CreateKnowledgeSourceResponse>, StatusCode> {
+    let context_bundle_id = parse_context_bundle_id(&context_bundle_id)?;
+    let outcome = match state.knowledge_service {
+        SharedKnowledgeService::Composed(service) => {
+            service
+                .create_source_from_context_bundle(
+                    context_bundle_id,
+                    request.title,
+                    request.summary,
+                )
+                .await
+        }
+        SharedKnowledgeService::Sqlite(service) => {
+            service
+                .create_source_from_context_bundle(
+                    context_bundle_id,
+                    request.title,
+                    request.summary,
+                )
+                .await
+        }
+    }
+    .map_err(knowledge_error_to_status)?;
+
+    Ok(Json(CreateKnowledgeSourceResponse {
+        knowledge_source_id: outcome.knowledge_source_id.to_string(),
+    }))
+}
+
+async fn create_manual_knowledge_source(
+    State(state): State<ApiState>,
+    Json(request): Json<CreateManualKnowledgeSourceRequest>,
+) -> Result<Json<CreateKnowledgeSourceResponse>, StatusCode> {
+    let run_id = parse_run_id(&request.run_id)?;
+    let outcome = match state.knowledge_service {
+        SharedKnowledgeService::Composed(service) => {
+            service
+                .create_manual_source(run_id, request.title, request.summary)
+                .await
+        }
+        SharedKnowledgeService::Sqlite(service) => {
+            service
+                .create_manual_source(run_id, request.title, request.summary)
+                .await
+        }
+    }
+    .map_err(knowledge_error_to_status)?;
+
+    Ok(Json(CreateKnowledgeSourceResponse {
+        knowledge_source_id: outcome.knowledge_source_id.to_string(),
+    }))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct KnowledgeSourceFilter {
+    knowledge_source_id: Option<String>,
+}
+
+async fn list_document_chunks(
+    State(state): State<ApiState>,
+    Query(filter): Query<KnowledgeSourceFilter>,
+) -> Result<Json<DocumentChunksResponse>, StatusCode> {
+    let knowledge_source_id = filter
+        .knowledge_source_id
+        .as_deref()
+        .map(parse_knowledge_source_id)
+        .transpose()?;
+    let document_chunks = match state.chunk_service {
+        SharedChunkService::Composed(service) => service.list_chunks(knowledge_source_id).await,
+        SharedChunkService::Sqlite(service) => service.list_chunks(knowledge_source_id).await,
+    }
+    .map_err(knowledge_error_to_status)?;
+
+    Ok(Json(DocumentChunksResponse { document_chunks }))
+}
+
+async fn chunk_knowledge_source(
+    State(state): State<ApiState>,
+    Path(knowledge_source_id): Path<String>,
+) -> Result<Json<DocumentChunksResponse>, StatusCode> {
+    let knowledge_source_id = parse_knowledge_source_id(&knowledge_source_id)?;
+    let document_chunks = match state.chunk_service {
+        SharedChunkService::Composed(service) => service.chunk_source(knowledge_source_id).await,
+        SharedChunkService::Sqlite(service) => service.chunk_source(knowledge_source_id).await,
+    }
+    .map_err(knowledge_error_to_status)?;
+
+    Ok(Json(DocumentChunksResponse { document_chunks }))
+}
+
+async fn list_memories(
+    State(state): State<ApiState>,
+    Query(filter): Query<KnowledgeSourceFilter>,
+) -> Result<Json<MemoriesResponse>, StatusCode> {
+    let knowledge_source_id = filter
+        .knowledge_source_id
+        .as_deref()
+        .map(parse_knowledge_source_id)
+        .transpose()?;
+    let memories = match state.memory_service {
+        SharedMemoryService::Composed(service) => service.list_memories(knowledge_source_id).await,
+        SharedMemoryService::Sqlite(service) => service.list_memories(knowledge_source_id).await,
+    }
+    .map_err(memory_error_to_status)?;
+
+    Ok(Json(MemoriesResponse { memories }))
+}
+
+async fn record_memory(
+    State(state): State<ApiState>,
+    Json(request): Json<RecordMemoryRequest>,
+) -> Result<Json<RecordMemoryResponse>, StatusCode> {
+    let run_id = parse_run_id(&request.run_id)?;
+    let knowledge_source_id = request
+        .knowledge_source_id
+        .as_deref()
+        .map(parse_knowledge_source_id)
+        .transpose()?;
+    let outcome = match state.memory_service {
+        SharedMemoryService::Composed(service) => {
+            service
+                .record_memory(
+                    run_id,
+                    knowledge_source_id,
+                    request.kind,
+                    request.title,
+                    request.body,
+                    request.confidence,
+                )
+                .await
+        }
+        SharedMemoryService::Sqlite(service) => {
+            service
+                .record_memory(
+                    run_id,
+                    knowledge_source_id,
+                    request.kind,
+                    request.title,
+                    request.body,
+                    request.confidence,
+                )
+                .await
+        }
+    }
+    .map_err(memory_error_to_status)?;
+
+    Ok(Json(RecordMemoryResponse {
+        memory_id: outcome.memory_id.to_string(),
+    }))
+}
+
+async fn search(
+    State(state): State<ApiState>,
+    Json(request): Json<SearchRequest>,
+) -> Result<Json<SearchResponseDto>, StatusCode> {
+    let run_id = parse_run_id(&request.run_id)?;
+    let limit = request.limit.unwrap_or(10);
+    let response = match state.retrieval_service {
+        SharedRetrievalService::Composed(service) => {
+            service.search(run_id, request.query, limit).await
+        }
+        SharedRetrievalService::Sqlite(service) => {
+            service.search(run_id, request.query, limit).await
+        }
+    }
+    .map_err(retrieval_error_to_status)?;
+
+    Ok(Json(SearchResponseDto {
+        query: response.query,
+        hits: response.hits,
+        retrieval_trace_id: response.retrieval_trace_id.to_string(),
+    }))
+}
+
+async fn list_retrieval_traces(
+    State(state): State<ApiState>,
+) -> Result<Json<RetrievalTracesResponse>, StatusCode> {
+    let retrieval_traces = match state.retrieval_service {
+        SharedRetrievalService::Composed(service) => service.list_retrieval_traces().await,
+        SharedRetrievalService::Sqlite(service) => service.list_retrieval_traces().await,
+    }
+    .map_err(retrieval_error_to_status)?;
+
+    Ok(Json(RetrievalTracesResponse { retrieval_traces }))
 }
 
 async fn request_tool_call(
@@ -542,6 +939,41 @@ fn context_error_to_status(error: ContextServiceError) -> StatusCode {
     }
 }
 
+fn knowledge_error_to_status(error: KnowledgeServiceError) -> StatusCode {
+    match error {
+        KnowledgeServiceError::InvalidInput => StatusCode::BAD_REQUEST,
+        KnowledgeServiceError::UnknownRun
+        | KnowledgeServiceError::UnknownArtifact
+        | KnowledgeServiceError::UnknownContextBundle
+        | KnowledgeServiceError::UnknownKnowledgeSource => StatusCode::NOT_FOUND,
+        KnowledgeServiceError::Ledger(_) | KnowledgeServiceError::Projection(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+fn memory_error_to_status(error: MemoryServiceError) -> StatusCode {
+    match error {
+        MemoryServiceError::InvalidInput => StatusCode::BAD_REQUEST,
+        MemoryServiceError::UnknownRun
+        | MemoryServiceError::UnknownKnowledgeSource
+        | MemoryServiceError::UnknownMemory => StatusCode::NOT_FOUND,
+        MemoryServiceError::Ledger(_) | MemoryServiceError::Projection(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+fn retrieval_error_to_status(error: RetrievalServiceError) -> StatusCode {
+    match error {
+        RetrievalServiceError::InvalidInput => StatusCode::BAD_REQUEST,
+        RetrievalServiceError::UnknownRun => StatusCode::NOT_FOUND,
+        RetrievalServiceError::Index(_)
+        | RetrievalServiceError::Ledger(_)
+        | RetrievalServiceError::Projection(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -578,7 +1010,9 @@ mod tests {
             .expect("request")
     }
 
-    async fn response_json(response: axum::response::Response) -> serde_json::Value {
+    async fn response_json<T: serde::de::DeserializeOwned>(
+        response: axum::response::Response,
+    ) -> T {
         let body = response
             .into_body()
             .collect()
@@ -599,7 +1033,7 @@ mod tests {
             .await
             .expect("create run response");
         assert_eq!(response.status(), StatusCode::OK);
-        let body = response_json(response).await;
+        let body: serde_json::Value = response_json(response).await;
         body["run_id"].as_str().expect("run_id").to_string()
     }
 
@@ -710,6 +1144,108 @@ mod tests {
         assert_eq!(payload.runs[0].instruction, "展示 runs");
     }
 
+    async fn create_artifact_for_test(
+        app: &Router,
+        run_id: &str,
+        title: &str,
+        content: &str,
+    ) -> String {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/api/v1/runs/{run_id}/artifacts"),
+                json!({
+                    "title": title,
+                    "kind": "markdown",
+                    "mime_type": "text/markdown",
+                    "content": content,
+                }),
+            ))
+            .await
+            .expect("create artifact response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: CreateArtifactResponse = response_json(response).await;
+        body.artifact_id
+    }
+
+    #[tokio::test]
+    async fn api_creates_knowledge_chunks_searches_and_lists_retrieval_traces() {
+        let app = build_router_with_in_memory_services();
+        let run_id = create_run_for_test(&app, "Search run").await;
+        let artifact_id = create_artifact_for_test(
+            &app,
+            &run_id,
+            "Searchable artifact",
+            "SQLite deterministic retrieval",
+        )
+        .await;
+
+        let source_response: CreateKnowledgeSourceResponse = response_json(
+            app.clone()
+                .oneshot(json_request(
+                    "POST",
+                    &format!("/api/v1/artifacts/{artifact_id}/knowledge-source"),
+                    serde_json::json!({"title":"Searchable artifact","summary":"SQLite deterministic retrieval"}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        let chunks_response: DocumentChunksResponse = response_json(
+            app.clone()
+                .oneshot(empty_request(
+                    "POST",
+                    &format!(
+                        "/api/v1/knowledge-sources/{}/chunks",
+                        source_response.knowledge_source_id
+                    ),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(chunks_response.document_chunks.len(), 1);
+
+        let search_response: SearchResponseDto = response_json(
+            app.clone()
+                .oneshot(json_request(
+                    "POST",
+                    "/api/v1/search",
+                    serde_json::json!({"run_id":run_id,"query":"deterministic","limit":5}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(search_response.hits.len(), 1);
+
+        let traces: RetrievalTracesResponse = response_json(
+            app.oneshot(empty_request("GET", "/api/v1/retrieval-traces"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(traces.retrieval_traces.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn api_rejects_blank_search_query() {
+        let app = build_router_with_in_memory_services();
+        let run_id = create_run_for_test(&app, "Search run").await;
+        let response = app
+            .oneshot(json_request(
+                "POST",
+                "/api/v1/search",
+                serde_json::json!({"run_id":run_id,"query":"   ","limit":5}),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
     #[tokio::test]
     async fn api_creates_lists_and_gets_artifact() {
         let app = build_router_with_in_memory_services();
@@ -731,7 +1267,7 @@ mod tests {
             .unwrap();
         assert_eq!(create_response.status(), StatusCode::OK);
 
-        let body = response_json(create_response).await;
+        let body: serde_json::Value = response_json(create_response).await;
         let artifact_id = body["artifact_id"].as_str().unwrap();
 
         let list_response = app
@@ -740,7 +1276,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(list_response.status(), StatusCode::OK);
-        let list = response_json(list_response).await;
+        let list: serde_json::Value = response_json(list_response).await;
         assert_eq!(list["artifacts"].as_array().unwrap().len(), 1);
 
         let get_response = app
@@ -751,7 +1287,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(get_response.status(), StatusCode::OK);
-        let detail = response_json(get_response).await;
+        let detail: serde_json::Value = response_json(get_response).await;
         assert_eq!(detail["artifact"]["title"], "Run summary");
         assert_eq!(detail["content"], "# Summary");
     }
@@ -827,7 +1363,7 @@ mod tests {
             .unwrap();
         assert_eq!(create_response.status(), StatusCode::OK);
 
-        let body = response_json(create_response).await;
+        let body: serde_json::Value = response_json(create_response).await;
         let context_bundle_id = body["context_bundle_id"].as_str().unwrap();
 
         let list_response = app
@@ -836,7 +1372,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(list_response.status(), StatusCode::OK);
-        let list = response_json(list_response).await;
+        let list: serde_json::Value = response_json(list_response).await;
         assert_eq!(list["context_bundles"].as_array().unwrap().len(), 1);
 
         let get_response = app
@@ -847,7 +1383,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(get_response.status(), StatusCode::OK);
-        let detail = response_json(get_response).await;
+        let detail: serde_json::Value = response_json(get_response).await;
         assert_eq!(detail["title"], "Debug context");
         assert_eq!(detail["artifact_ids"].as_array().unwrap().len(), 0);
     }
