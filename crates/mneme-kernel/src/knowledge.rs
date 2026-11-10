@@ -52,6 +52,57 @@ pub struct DocumentChunkRecord {
     pub created_at: OffsetDateTime,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkDraft {
+    pub sequence: i64,
+    pub text: String,
+    pub char_start: i64,
+    pub char_end: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkTextSplitter {
+    pub target_chars: usize,
+    pub overlap_chars: usize,
+}
+
+impl ChunkTextSplitter {
+    pub fn new(target_chars: usize, overlap_chars: usize) -> Self {
+        let target_chars = target_chars.max(1);
+        let overlap_chars = overlap_chars.min(target_chars - 1);
+        Self {
+            target_chars,
+            overlap_chars,
+        }
+    }
+
+    pub fn split(&self, text: &str) -> Vec<ChunkDraft> {
+        let chars = text.chars().collect::<Vec<_>>();
+        if chars.is_empty() {
+            return Vec::new();
+        }
+
+        let mut chunks = Vec::new();
+        let mut start = 0;
+        let step = self.target_chars - self.overlap_chars;
+        while start < chars.len() {
+            let end = (start + self.target_chars).min(chars.len());
+            if start > 0 && end - start <= self.overlap_chars {
+                break;
+            }
+            chunks.push(ChunkDraft {
+                sequence: chunks.len() as i64,
+                text: chars[start..end].iter().collect(),
+                char_start: start as i64,
+                char_end: end as i64,
+            });
+            start += step;
+        }
+
+        chunks
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryRecord {
     pub memory_id: MemoryId,
@@ -76,6 +127,7 @@ pub struct RetrievalTraceRecord {
 }
 
 pub type SharedKnowledgeSourceProjectionStore = Arc<dyn KnowledgeSourceProjectionStore>;
+pub type SharedDocumentChunkProjectionStore = Arc<dyn DocumentChunkProjectionStore>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateKnowledgeSourceOutcome {
@@ -178,6 +230,93 @@ impl KnowledgeSourceProjectionStore for InMemoryKnowledgeSourceProjectionStore {
             .find(|source| source.knowledge_source_id == knowledge_source_id)
             .cloned()
             .ok_or(KnowledgeServiceError::UnknownKnowledgeSource)
+    }
+}
+
+#[async_trait]
+pub trait DocumentChunkProjectionStore: Send + Sync {
+    async fn apply(&self, event: &OperationEvent) -> Result<(), KnowledgeServiceError>;
+    async fn list_chunks(
+        &self,
+        knowledge_source_id: Option<KnowledgeSourceId>,
+    ) -> Result<Vec<DocumentChunkRecord>, KnowledgeServiceError>;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct InMemoryDocumentChunkProjectionStore {
+    chunks: Arc<RwLock<Vec<DocumentChunkRecord>>>,
+}
+
+impl InMemoryDocumentChunkProjectionStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn shared(self) -> SharedDocumentChunkProjectionStore {
+        Arc::new(self)
+    }
+}
+
+#[async_trait]
+impl DocumentChunkProjectionStore for InMemoryDocumentChunkProjectionStore {
+    async fn apply(&self, event: &OperationEvent) -> Result<(), KnowledgeServiceError> {
+        if let OperationEventKind::DocumentChunkCreated {
+            document_chunk_id,
+            knowledge_source_id,
+            sequence,
+            text,
+            char_start,
+            char_end,
+        } = &event.kind
+        {
+            let mut chunks = self.chunks.write().await;
+            let record = DocumentChunkRecord {
+                document_chunk_id: *document_chunk_id,
+                knowledge_source_id: *knowledge_source_id,
+                run_id: event.run_id,
+                sequence: *sequence,
+                text: text.clone(),
+                char_start: *char_start,
+                char_end: *char_end,
+                created_at: event.occurred_at,
+            };
+
+            if let Some(existing) = chunks
+                .iter_mut()
+                .find(|chunk| chunk.document_chunk_id == *document_chunk_id)
+            {
+                *existing = record;
+            } else {
+                chunks.push(record);
+            }
+            chunks.sort_by(|left, right| {
+                left.knowledge_source_id
+                    .to_string()
+                    .cmp(&right.knowledge_source_id.to_string())
+                    .then(left.sequence.cmp(&right.sequence))
+                    .then(left.created_at.cmp(&right.created_at))
+            });
+        }
+
+        Ok(())
+    }
+
+    async fn list_chunks(
+        &self,
+        knowledge_source_id: Option<KnowledgeSourceId>,
+    ) -> Result<Vec<DocumentChunkRecord>, KnowledgeServiceError> {
+        Ok(self
+            .chunks
+            .read()
+            .await
+            .iter()
+            .filter(|chunk| {
+                knowledge_source_id
+                    .map(|source_id| chunk.knowledge_source_id == source_id)
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect())
     }
 }
 
@@ -335,6 +474,89 @@ impl ComposedKnowledgeService {
     }
 }
 
+#[derive(Clone)]
+pub struct ComposedChunkService {
+    ledger: SharedOperationLedger,
+    source_projection: SharedKnowledgeSourceProjectionStore,
+    chunk_projection: SharedDocumentChunkProjectionStore,
+    splitter: ChunkTextSplitter,
+}
+
+impl ComposedChunkService {
+    pub fn new(
+        ledger: SharedOperationLedger,
+        source_projection: SharedKnowledgeSourceProjectionStore,
+        chunk_projection: SharedDocumentChunkProjectionStore,
+        splitter: ChunkTextSplitter,
+    ) -> Self {
+        Self {
+            ledger,
+            source_projection,
+            chunk_projection,
+            splitter,
+        }
+    }
+
+    pub async fn chunk_source(
+        &self,
+        knowledge_source_id: KnowledgeSourceId,
+    ) -> Result<Vec<DocumentChunkRecord>, KnowledgeServiceError> {
+        let source = self
+            .source_projection
+            .get_source(knowledge_source_id)
+            .await?;
+        let drafts = self.splitter.split(&source.summary);
+        let mut chunks = Vec::with_capacity(drafts.len());
+
+        for draft in drafts {
+            let document_chunk_id = DocumentChunkId::new();
+            let event = OperationEvent::new_document_chunk_created(
+                source.run_id,
+                document_chunk_id,
+                source.knowledge_source_id,
+                draft.sequence,
+                draft.text,
+                draft.char_start,
+                draft.char_end,
+            );
+            self.ledger
+                .append(event.clone())
+                .await
+                .map_err(|error| KnowledgeServiceError::Ledger(error.to_string()))?;
+            self.chunk_projection.apply(&event).await?;
+            if let OperationEventKind::DocumentChunkCreated {
+                document_chunk_id,
+                knowledge_source_id,
+                sequence,
+                text,
+                char_start,
+                char_end,
+            } = event.kind
+            {
+                chunks.push(DocumentChunkRecord {
+                    document_chunk_id,
+                    knowledge_source_id,
+                    run_id: event.run_id,
+                    sequence,
+                    text,
+                    char_start,
+                    char_end,
+                    created_at: event.occurred_at,
+                });
+            }
+        }
+
+        Ok(chunks)
+    }
+
+    pub async fn list_chunks(
+        &self,
+        knowledge_source_id: Option<KnowledgeSourceId>,
+    ) -> Result<Vec<DocumentChunkRecord>, KnowledgeServiceError> {
+        self.chunk_projection.list_chunks(knowledge_source_id).await
+    }
+}
+
 fn non_blank_knowledge_input(value: String) -> Result<String, KnowledgeServiceError> {
     let value = value.trim().to_string();
     if value.is_empty() {
@@ -400,6 +622,68 @@ mod tests {
         assert!(json.contains("decision"));
         let decoded: MemoryRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.confidence, 0.8);
+    }
+
+    #[test]
+    fn chunk_text_splitter_creates_ordered_overlapping_chunks() {
+        let splitter = ChunkTextSplitter::new(12, 3);
+        let chunks = splitter.split("abcdefghijklmnopqrstuv");
+
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].sequence, 0);
+        assert_eq!(chunks[0].text, "abcdefghijkl");
+        assert_eq!(chunks[0].char_start, 0);
+        assert_eq!(chunks[0].char_end, 12);
+        assert_eq!(chunks[1].text, "jklmnopqrstu");
+        assert_eq!(chunks[1].char_start, 9);
+    }
+
+    #[tokio::test]
+    async fn composed_chunk_service_chunks_manual_source() {
+        let ledger = crate::InMemoryOperationLedger::new().shared();
+        let run_store = crate::InMemoryRunProjectionStore::new().shared();
+        let artifact_projection = crate::InMemoryArtifactProjectionStore::new().shared();
+        let context_projection = crate::InMemoryContextBundleProjectionStore::new().shared();
+        let source_projection = InMemoryKnowledgeSourceProjectionStore::new().shared();
+        let chunk_projection = InMemoryDocumentChunkProjectionStore::new().shared();
+
+        let run_service = crate::ComposedRunService::new(ledger.clone(), run_store.clone());
+        let run = run_service
+            .create_run("Chunk source".to_string())
+            .await
+            .unwrap();
+        let knowledge_service = ComposedKnowledgeService::new(
+            ledger.clone(),
+            run_store,
+            artifact_projection,
+            context_projection,
+            source_projection.clone(),
+        );
+        let source = knowledge_service
+            .create_manual_source(
+                run.run_id,
+                "Manual source".to_string(),
+                "abcdefghijklmnopqrstuvwxyz".to_string(),
+            )
+            .await
+            .unwrap();
+
+        let chunk_service = ComposedChunkService::new(
+            ledger.clone(),
+            source_projection,
+            chunk_projection,
+            ChunkTextSplitter::new(10, 2),
+        );
+        let chunks = chunk_service
+            .chunk_source(source.knowledge_source_id)
+            .await
+            .unwrap();
+
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].sequence, 0);
+        assert_eq!(chunks[0].knowledge_source_id, source.knowledge_source_id);
+        assert_eq!(chunks[0].run_id, run.run_id);
+        assert_eq!(chunks[0].text, "abcdefghij");
     }
 
     #[tokio::test]

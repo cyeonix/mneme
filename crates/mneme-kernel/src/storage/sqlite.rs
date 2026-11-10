@@ -1,8 +1,9 @@
 use crate::{
     ArtifactId, ArtifactKind, ArtifactProjectionStore, ArtifactRecord, ArtifactServiceError,
-    ContextBundleId, ContextBundleProjectionStore, ContextBundleRecord, ContextServiceError,
-    CreateArtifactOutcome, CreateContextBundleOutcome, CreateKnowledgeSourceOutcome,
-    CreateRunOutcome, EventId, KnowledgeServiceError, KnowledgeSourceId, KnowledgeSourceKind,
+    ChunkTextSplitter, ContextBundleId, ContextBundleProjectionStore, ContextBundleRecord,
+    ContextServiceError, CreateArtifactOutcome, CreateContextBundleOutcome,
+    CreateKnowledgeSourceOutcome, CreateRunOutcome, DocumentChunkProjectionStore,
+    DocumentChunkRecord, EventId, KnowledgeServiceError, KnowledgeSourceId, KnowledgeSourceKind,
     KnowledgeSourceProjectionStore, KnowledgeSourceRecord, LedgerError, OperationEvent,
     OperationEventKind, OperationLedger, RunId, RunLifecycleOutcome, RunProjection,
     RunProjectionError, RunProjectionStore, RunProjector, RunService, RunServiceError, RunStatus,
@@ -421,6 +422,176 @@ impl SqliteKnowledgeService {
 }
 
 #[derive(Clone, Debug)]
+pub struct SqliteChunkService {
+    store: SqliteStore,
+    splitter: ChunkTextSplitter,
+}
+
+impl SqliteChunkService {
+    pub fn new(store: SqliteStore, splitter: ChunkTextSplitter) -> Self {
+        Self { store, splitter }
+    }
+
+    pub async fn chunk_source(
+        &self,
+        knowledge_source_id: KnowledgeSourceId,
+    ) -> Result<Vec<DocumentChunkRecord>, KnowledgeServiceError> {
+        let mut tx = self
+            .store
+            .pool()
+            .begin()
+            .await
+            .map_err(|error| KnowledgeServiceError::Ledger(error.to_string()))?;
+        let source = sqlite_knowledge_source_by_id(&mut tx, knowledge_source_id).await?;
+        let drafts = self.splitter.split(&source.summary);
+        let mut chunks = Vec::with_capacity(drafts.len());
+
+        for draft in drafts {
+            let document_chunk_id = crate::DocumentChunkId::new();
+            let event = OperationEvent::new_document_chunk_created(
+                source.run_id,
+                document_chunk_id,
+                source.knowledge_source_id,
+                draft.sequence,
+                draft.text,
+                draft.char_start,
+                draft.char_end,
+            );
+            insert_operation_event(&mut tx, &event)
+                .await
+                .map_err(|error| KnowledgeServiceError::Ledger(error.to_string()))?;
+            apply_document_chunk_created_to_sqlite_projection(&mut tx, &event).await?;
+            update_running_run_for_document_chunk_created(&mut tx, &event).await?;
+            if let OperationEventKind::DocumentChunkCreated {
+                document_chunk_id,
+                knowledge_source_id,
+                sequence,
+                text,
+                char_start,
+                char_end,
+            } = event.kind
+            {
+                chunks.push(DocumentChunkRecord {
+                    document_chunk_id,
+                    knowledge_source_id,
+                    run_id: event.run_id,
+                    sequence,
+                    text,
+                    char_start,
+                    char_end,
+                    created_at: event.occurred_at,
+                });
+            }
+        }
+
+        tx.commit()
+            .await
+            .map_err(|error| KnowledgeServiceError::Ledger(error.to_string()))?;
+
+        Ok(chunks)
+    }
+
+    pub async fn list_chunks(
+        &self,
+        knowledge_source_id: Option<KnowledgeSourceId>,
+    ) -> Result<Vec<DocumentChunkRecord>, KnowledgeServiceError> {
+        SqliteDocumentChunkProjectionStore::new(self.store.clone())
+            .list_chunks(knowledge_source_id)
+            .await
+    }
+
+    pub async fn rebuild_document_chunk_projections(
+        &self,
+    ) -> Result<Vec<DocumentChunkRecord>, KnowledgeServiceError> {
+        let events = self
+            .store
+            .list_events()
+            .await
+            .map_err(|error| KnowledgeServiceError::Ledger(error.to_string()))?;
+        SqliteDocumentChunkProjectionStore::new(self.store.clone())
+            .rebuild(&events)
+            .await?;
+        self.list_chunks(None).await
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SqliteDocumentChunkProjectionStore {
+    store: SqliteStore,
+}
+
+impl SqliteDocumentChunkProjectionStore {
+    pub fn new(store: SqliteStore) -> Self {
+        Self { store }
+    }
+
+    pub async fn rebuild(&self, events: &[OperationEvent]) -> Result<(), KnowledgeServiceError> {
+        let mut tx = self
+            .store
+            .pool()
+            .begin()
+            .await
+            .map_err(|error| KnowledgeServiceError::Projection(error.to_string()))?;
+
+        sqlx::query("delete from document_chunks")
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| KnowledgeServiceError::Projection(error.to_string()))?;
+
+        for event in events {
+            apply_document_chunk_created_to_sqlite_projection(&mut tx, event).await?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|error| KnowledgeServiceError::Projection(error.to_string()))?;
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl DocumentChunkProjectionStore for SqliteDocumentChunkProjectionStore {
+    async fn apply(&self, event: &OperationEvent) -> Result<(), KnowledgeServiceError> {
+        let mut tx = self
+            .store
+            .pool()
+            .begin()
+            .await
+            .map_err(|error| KnowledgeServiceError::Projection(error.to_string()))?;
+        apply_document_chunk_created_to_sqlite_projection(&mut tx, event).await?;
+        tx.commit()
+            .await
+            .map_err(|error| KnowledgeServiceError::Projection(error.to_string()))?;
+        Ok(())
+    }
+
+    async fn list_chunks(
+        &self,
+        knowledge_source_id: Option<KnowledgeSourceId>,
+    ) -> Result<Vec<DocumentChunkRecord>, KnowledgeServiceError> {
+        let rows = match knowledge_source_id {
+            Some(source_id) => sqlx::query_as::<_, StoredDocumentChunkRecord>(
+                "select document_chunk_id, knowledge_source_id, run_id, sequence, text, char_start, char_end, created_at from document_chunks where knowledge_source_id = ?1 order by sequence asc",
+            )
+            .bind(source_id.to_string())
+            .fetch_all(self.store.pool())
+            .await,
+            None => sqlx::query_as::<_, StoredDocumentChunkRecord>(
+                "select document_chunk_id, knowledge_source_id, run_id, sequence, text, char_start, char_end, created_at from document_chunks order by knowledge_source_id asc, sequence asc",
+            )
+            .fetch_all(self.store.pool())
+            .await,
+        }
+        .map_err(|error| KnowledgeServiceError::Projection(error.to_string()))?;
+
+        rows.into_iter()
+            .map(DocumentChunkRecord::try_from)
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct SqliteKnowledgeSourceProjectionStore {
     store: SqliteStore,
 }
@@ -498,6 +669,46 @@ impl KnowledgeSourceProjectionStore for SqliteKnowledgeSourceProjectionStore {
         .ok_or(KnowledgeServiceError::UnknownKnowledgeSource)?;
         KnowledgeSourceRecord::try_from(row)
     }
+}
+
+async fn insert_operation_event(
+    tx: &mut Transaction<'_, Sqlite>,
+    event: &OperationEvent,
+) -> Result<(), LedgerError> {
+    let occurred_at = event
+        .occurred_at
+        .format(&Rfc3339)
+        .map_err(|error| LedgerError::InvalidPayload(error.to_string()))?;
+    let payload_json = serde_json::to_string(&event.kind)
+        .map_err(|error| LedgerError::InvalidPayload(error.to_string()))?;
+    sqlx::query(
+        "insert into operation_events (event_id, run_id, occurred_at, kind_type, payload_json) values (?1, ?2, ?3, ?4, ?5)",
+    )
+    .bind(event.id.to_string())
+    .bind(event.run_id.to_string())
+    .bind(occurred_at)
+    .bind(kind_type_for_event(&event.kind))
+    .bind(payload_json)
+    .execute(&mut **tx)
+    .await
+    .map_err(|error| LedgerError::Storage(error.to_string()))?;
+
+    Ok(())
+}
+
+async fn sqlite_knowledge_source_by_id(
+    tx: &mut Transaction<'_, Sqlite>,
+    knowledge_source_id: KnowledgeSourceId,
+) -> Result<KnowledgeSourceRecord, KnowledgeServiceError> {
+    let row = sqlx::query_as::<_, StoredKnowledgeSourceRecord>(
+        "select knowledge_source_id, run_id, source_kind, artifact_id, context_bundle_id, title, summary, created_at from knowledge_sources where knowledge_source_id = ?1",
+    )
+    .bind(knowledge_source_id.to_string())
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|error| KnowledgeServiceError::Projection(error.to_string()))?
+    .ok_or(KnowledgeServiceError::UnknownKnowledgeSource)?;
+    KnowledgeSourceRecord::try_from(row)
 }
 
 async fn sqlite_run_id_for_artifact(
@@ -642,18 +853,73 @@ async fn update_running_run_for_knowledge_source_created(
         event.kind,
         OperationEventKind::KnowledgeSourceCreated { .. }
     ) {
+        update_running_run_for_knowledge_event(tx, event).await?;
+    }
+
+    Ok(())
+}
+
+async fn apply_document_chunk_created_to_sqlite_projection(
+    tx: &mut Transaction<'_, Sqlite>,
+    event: &OperationEvent,
+) -> Result<(), KnowledgeServiceError> {
+    if let OperationEventKind::DocumentChunkCreated {
+        document_chunk_id,
+        knowledge_source_id,
+        sequence,
+        text,
+        char_start,
+        char_end,
+    } = &event.kind
+    {
         let occurred_at = event
             .occurred_at
             .format(&Rfc3339)
             .map_err(|error| KnowledgeServiceError::Projection(error.to_string()))?;
-        sqlx::query("update runs set updated_at = ?2 where run_id = ?1 and status = 'running'")
-            .bind(event.run_id.to_string())
-            .bind(occurred_at)
-            .execute(&mut **tx)
-            .await
-            .map_err(|error| KnowledgeServiceError::Projection(error.to_string()))?;
+        sqlx::query(
+            "insert into document_chunks (document_chunk_id, knowledge_source_id, run_id, sequence, text, char_start, char_end, created_at) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) on conflict(document_chunk_id) do update set knowledge_source_id = excluded.knowledge_source_id, run_id = excluded.run_id, sequence = excluded.sequence, text = excluded.text, char_start = excluded.char_start, char_end = excluded.char_end, created_at = excluded.created_at",
+        )
+        .bind(document_chunk_id.to_string())
+        .bind(knowledge_source_id.to_string())
+        .bind(event.run_id.to_string())
+        .bind(*sequence)
+        .bind(text)
+        .bind(*char_start)
+        .bind(*char_end)
+        .bind(occurred_at)
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| KnowledgeServiceError::Projection(error.to_string()))?;
     }
 
+    Ok(())
+}
+
+async fn update_running_run_for_document_chunk_created(
+    tx: &mut Transaction<'_, Sqlite>,
+    event: &OperationEvent,
+) -> Result<(), KnowledgeServiceError> {
+    if matches!(event.kind, OperationEventKind::DocumentChunkCreated { .. }) {
+        update_running_run_for_knowledge_event(tx, event).await?;
+    }
+
+    Ok(())
+}
+
+async fn update_running_run_for_knowledge_event(
+    tx: &mut Transaction<'_, Sqlite>,
+    event: &OperationEvent,
+) -> Result<(), KnowledgeServiceError> {
+    let occurred_at = event
+        .occurred_at
+        .format(&Rfc3339)
+        .map_err(|error| KnowledgeServiceError::Projection(error.to_string()))?;
+    sqlx::query("update runs set updated_at = ?2 where run_id = ?1 and status = 'running'")
+        .bind(event.run_id.to_string())
+        .bind(occurred_at)
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| KnowledgeServiceError::Projection(error.to_string()))?;
     Ok(())
 }
 
@@ -1725,6 +1991,39 @@ impl TryFrom<StoredKnowledgeSourceRecord> for KnowledgeSourceRecord {
 }
 
 #[derive(sqlx::FromRow)]
+struct StoredDocumentChunkRecord {
+    document_chunk_id: String,
+    knowledge_source_id: String,
+    run_id: String,
+    sequence: i64,
+    text: String,
+    char_start: i64,
+    char_end: i64,
+    created_at: String,
+}
+
+impl TryFrom<StoredDocumentChunkRecord> for DocumentChunkRecord {
+    type Error = KnowledgeServiceError;
+
+    fn try_from(row: StoredDocumentChunkRecord) -> Result<Self, Self::Error> {
+        Ok(Self {
+            document_chunk_id: crate::DocumentChunkId::from_str(&row.document_chunk_id)
+                .map_err(|error| KnowledgeServiceError::Projection(error.to_string()))?,
+            knowledge_source_id: KnowledgeSourceId::from_str(&row.knowledge_source_id)
+                .map_err(|error| KnowledgeServiceError::Projection(error.to_string()))?,
+            run_id: RunId::from_str(&row.run_id)
+                .map_err(|error| KnowledgeServiceError::Projection(error.to_string()))?,
+            sequence: row.sequence,
+            text: row.text,
+            char_start: row.char_start,
+            char_end: row.char_end,
+            created_at: OffsetDateTime::parse(&row.created_at, &Rfc3339)
+                .map_err(|error| KnowledgeServiceError::Projection(error.to_string()))?,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
 struct StoredRunProjection {
     run_id: String,
     status: String,
@@ -2307,6 +2606,62 @@ mod tests {
 
         let events = SqliteOperationLedger::new(store).list().await.unwrap();
         assert!(events.iter().any(|event| matches!(event.kind, OperationEventKind::KnowledgeSourceCreated { knowledge_source_id, .. } if knowledge_source_id == outcome.knowledge_source_id)));
+    }
+
+    #[tokio::test]
+    async fn sqlite_chunk_service_chunks_source_and_records_ledger_events() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let run_service = SqliteRunService::new(store.clone());
+        let run = run_service
+            .create_run("Chunk source".to_string())
+            .await
+            .unwrap();
+        let knowledge_service = SqliteKnowledgeService::new(store.clone());
+        let source = knowledge_service
+            .create_manual_source(
+                run.run_id,
+                "Manual source".to_string(),
+                "abcdefghijklmnopqrstuvwxyz".to_string(),
+            )
+            .await
+            .unwrap();
+
+        let service = SqliteChunkService::new(store.clone(), ChunkTextSplitter::new(10, 2));
+        let chunks = service
+            .chunk_source(source.knowledge_source_id)
+            .await
+            .unwrap();
+
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].text, "abcdefghij");
+        let events = SqliteOperationLedger::new(store).list().await.unwrap();
+        assert!(events.iter().any(|event| matches!(event.kind, OperationEventKind::DocumentChunkCreated { document_chunk_id, .. } if document_chunk_id == chunks[0].document_chunk_id)));
+    }
+
+    #[tokio::test]
+    async fn sqlite_ledger_roundtrips_document_chunk_events_can_rebuild_projection() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let ledger = SqliteOperationLedger::new(store.clone());
+        let projection = SqliteDocumentChunkProjectionStore::new(store);
+        let run_id = RunId::new();
+        let source_id = KnowledgeSourceId::new();
+        let chunk_id = DocumentChunkId::new();
+        let event = OperationEvent::new_document_chunk_created(
+            run_id,
+            chunk_id,
+            source_id,
+            0,
+            "searchable",
+            0,
+            10,
+        );
+
+        ledger.append(event.clone()).await.unwrap();
+        projection.rebuild(&[event]).await.unwrap();
+
+        let chunks = projection.list_chunks(None).await.unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].document_chunk_id, chunk_id);
     }
 
     #[tokio::test]

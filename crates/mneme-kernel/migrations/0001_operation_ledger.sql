@@ -65,3 +65,17 @@ create table if not exists knowledge_sources (
 
 create index if not exists idx_knowledge_sources_run_id_created_at
   on knowledge_sources(run_id, created_at);
+
+create table if not exists document_chunks (
+  document_chunk_id text primary key,
+  knowledge_source_id text not null,
+  run_id text not null,
+  sequence integer not null,
+  text text not null,
+  char_start integer not null,
+  char_end integer not null,
+  created_at text not null
+);
+
+create index if not exists idx_document_chunks_source_sequence
+  on document_chunks(knowledge_source_id, sequence);
