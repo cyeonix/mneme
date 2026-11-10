@@ -1,7 +1,8 @@
 use crate::{
     CreateRunOutcome, EventId, LedgerError, OperationEvent, OperationEventKind, OperationLedger,
-    RunId, RunProjection, RunProjectionError, RunProjectionStore, RunProjector, RunService,
-    RunServiceError, RunStatus, SharedOperationLedger, SharedRunProjectionStore, SharedRunService,
+    RunId, RunLifecycleOutcome, RunProjection, RunProjectionError, RunProjectionStore,
+    RunProjector, RunService, RunServiceError, RunStatus, SharedOperationLedger,
+    SharedRunProjectionStore, SharedRunService,
 };
 use async_trait::async_trait;
 use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
@@ -71,13 +72,7 @@ impl SqliteOperationLedger {
 #[async_trait]
 impl OperationLedger for SqliteOperationLedger {
     async fn append(&self, event: OperationEvent) -> Result<(), LedgerError> {
-        let kind_type = match &event.kind {
-            OperationEventKind::RunStarted { .. } => "run_started",
-            OperationEventKind::RunModelRequested { .. } => "run_model_requested",
-            OperationEventKind::RunAssistantMessage { .. } => "run_assistant_message",
-            OperationEventKind::RunCompleted { .. } => "run_completed",
-            OperationEventKind::RunFailed { .. } => "run_failed",
-        };
+        let kind_type = kind_type_for_event(&event.kind);
         let payload_json = serde_json::to_string(&event.kind)
             .map_err(|error| LedgerError::InvalidPayload(error.to_string()))?;
         let occurred_at = event
@@ -137,6 +132,96 @@ impl SqliteRunService {
     pub fn shared(self) -> SharedRunService {
         Arc::new(self)
     }
+
+    async fn append_lifecycle_event_transactionally(
+        &self,
+        event: OperationEvent,
+    ) -> Result<RunLifecycleOutcome, RunServiceError> {
+        let run_id = event.run_id;
+        let occurred_at = event
+            .occurred_at
+            .format(&Rfc3339)
+            .map_err(|error| RunServiceError::Ledger(error.to_string()))?;
+        let kind_type = kind_type_for_event(&event.kind);
+        let payload_json = serde_json::to_string(&event.kind)
+            .map_err(|error| RunServiceError::Ledger(error.to_string()))?;
+
+        let mut tx = self
+            .store
+            .pool()
+            .begin()
+            .await
+            .map_err(|error| RunServiceError::Ledger(error.to_string()))?;
+
+        let known_run_count: i64 =
+            sqlx::query_scalar("select count(*) from runs where run_id = ?1")
+                .bind(run_id.to_string())
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|error| RunServiceError::Projection(error.to_string()))?;
+        if known_run_count == 0 {
+            return Err(RunServiceError::InvalidRunId);
+        }
+
+        sqlx::query(
+            "insert into operation_events (event_id, run_id, occurred_at, kind_type, payload_json) values (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind(event.id.to_string())
+        .bind(run_id.to_string())
+        .bind(&occurred_at)
+        .bind(kind_type)
+        .bind(payload_json)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| RunServiceError::Ledger(error.to_string()))?;
+
+        match &event.kind {
+            OperationEventKind::RunModelRequested { .. }
+            | OperationEventKind::RunAssistantMessage { .. } => {
+                sqlx::query(
+                    "update runs set status = 'running', updated_at = ?2 where run_id = ?1",
+                )
+                .bind(run_id.to_string())
+                .bind(&occurred_at)
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| RunServiceError::Projection(error.to_string()))?;
+            }
+            OperationEventKind::RunCompleted { summary } => {
+                sqlx::query("update runs set status = 'completed', completed_at = ?2, summary = ?3, updated_at = ?2 where run_id = ?1")
+                    .bind(run_id.to_string())
+                    .bind(&occurred_at)
+                    .bind(summary)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|error| RunServiceError::Projection(error.to_string()))?;
+            }
+            OperationEventKind::RunFailed { reason } => {
+                sqlx::query("update runs set status = 'failed', failed_at = ?2, error = ?3, updated_at = ?2 where run_id = ?1")
+                    .bind(run_id.to_string())
+                    .bind(&occurred_at)
+                    .bind(reason)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|error| RunServiceError::Projection(error.to_string()))?;
+            }
+            OperationEventKind::RunStarted { .. } => unreachable!("create_run handles run_started"),
+        }
+
+        tx.commit()
+            .await
+            .map_err(|error| RunServiceError::Ledger(error.to_string()))?;
+
+        Ok(RunLifecycleOutcome { run_id })
+    }
+
+    fn non_blank_lifecycle_input(value: String) -> Result<String, RunServiceError> {
+        let value = value.trim().to_string();
+        if value.is_empty() {
+            return Err(RunServiceError::InvalidLifecycleInput);
+        }
+        Ok(value)
+    }
 }
 
 #[async_trait]
@@ -189,6 +274,52 @@ impl RunService for SqliteRunService {
             .map_err(|error| RunServiceError::Ledger(error.to_string()))?;
 
         Ok(CreateRunOutcome { run_id })
+    }
+
+    async fn request_model(
+        &self,
+        run_id: RunId,
+        prompt: String,
+    ) -> Result<RunLifecycleOutcome, RunServiceError> {
+        let prompt = Self::non_blank_lifecycle_input(prompt)?;
+        self.append_lifecycle_event_transactionally(OperationEvent::new_run_model_requested(
+            run_id, prompt,
+        ))
+        .await
+    }
+
+    async fn record_assistant_message(
+        &self,
+        run_id: RunId,
+        content: String,
+    ) -> Result<RunLifecycleOutcome, RunServiceError> {
+        let content = Self::non_blank_lifecycle_input(content)?;
+        self.append_lifecycle_event_transactionally(OperationEvent::new_run_assistant_message(
+            run_id, content,
+        ))
+        .await
+    }
+
+    async fn complete_run(
+        &self,
+        run_id: RunId,
+        summary: String,
+    ) -> Result<RunLifecycleOutcome, RunServiceError> {
+        let summary = Self::non_blank_lifecycle_input(summary)?;
+        self.append_lifecycle_event_transactionally(OperationEvent::new_run_completed(
+            run_id, summary,
+        ))
+        .await
+    }
+
+    async fn fail_run(
+        &self,
+        run_id: RunId,
+        reason: String,
+    ) -> Result<RunLifecycleOutcome, RunServiceError> {
+        let reason = Self::non_blank_lifecycle_input(reason)?;
+        self.append_lifecycle_event_transactionally(OperationEvent::new_run_failed(run_id, reason))
+            .await
     }
 
     async fn list_events(&self) -> Result<Vec<OperationEvent>, RunServiceError> {
@@ -375,6 +506,16 @@ impl TryFrom<StoredRunProjection> for RunProjection {
             error: row.error,
             updated_at: parse_datetime(&row.updated_at)?,
         })
+    }
+}
+
+fn kind_type_for_event(kind: &OperationEventKind) -> &'static str {
+    match kind {
+        OperationEventKind::RunStarted { .. } => "run_started",
+        OperationEventKind::RunModelRequested { .. } => "run_model_requested",
+        OperationEventKind::RunAssistantMessage { .. } => "run_assistant_message",
+        OperationEventKind::RunCompleted { .. } => "run_completed",
+        OperationEventKind::RunFailed { .. } => "run_failed",
     }
 }
 
@@ -589,6 +730,73 @@ mod tests {
 
         assert_eq!(rebuilt.len(), 1);
         assert_eq!(rebuilt[0].run_id, run_id);
+    }
+
+    #[tokio::test]
+    async fn sqlite_run_service_records_full_success_lifecycle() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let service = SqliteRunService::new(store);
+
+        let created = service.create_run("整理今天".to_string()).await.unwrap();
+        service
+            .request_model(created.run_id, "请总结今天".to_string())
+            .await
+            .unwrap();
+        service
+            .record_assistant_message(created.run_id, "今天完成了 M2。".to_string())
+            .await
+            .unwrap();
+        service
+            .complete_run(created.run_id, "总结完成".to_string())
+            .await
+            .unwrap();
+
+        let events = service.list_events().await.unwrap();
+        let runs = service.list_runs().await.unwrap();
+
+        assert_eq!(events.len(), 4);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].run_id, created.run_id);
+        assert_eq!(runs[0].status, RunStatus::Completed);
+        assert_eq!(runs[0].summary.as_deref(), Some("总结完成"));
+    }
+
+    #[tokio::test]
+    async fn sqlite_run_service_records_failed_lifecycle() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let service = SqliteRunService::new(store);
+
+        let created = service
+            .create_run("会失败的 run".to_string())
+            .await
+            .unwrap();
+        service
+            .request_model(created.run_id, "请总结今天".to_string())
+            .await
+            .unwrap();
+        service
+            .fail_run(created.run_id, "模型不可用".to_string())
+            .await
+            .unwrap();
+
+        let runs = service.list_runs().await.unwrap();
+
+        assert_eq!(runs[0].status, RunStatus::Failed);
+        assert_eq!(runs[0].error.as_deref(), Some("模型不可用"));
+    }
+
+    #[tokio::test]
+    async fn sqlite_run_service_rejects_unknown_lifecycle_run_id() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let service = SqliteRunService::new(store);
+
+        let error = service
+            .fail_run(RunId::new(), "未知 run".to_string())
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, RunServiceError::InvalidRunId);
+        assert!(service.list_events().await.unwrap().is_empty());
     }
 
     #[tokio::test]

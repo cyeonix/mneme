@@ -16,7 +16,8 @@ pub use runs::{
     InMemoryRunProjectionStore, RunProjectionError, RunProjectionStore, SharedRunProjectionStore,
 };
 pub use service::{
-    ComposedRunService, CreateRunOutcome, RunService, RunServiceError, SharedRunService,
+    ComposedRunService, CreateRunOutcome, RunLifecycleOutcome, RunService, RunServiceError,
+    SharedRunService,
 };
 pub use storage::{
     SqliteOperationLedger, SqliteRunProjectionStore, SqliteRunService, SqliteStore,
