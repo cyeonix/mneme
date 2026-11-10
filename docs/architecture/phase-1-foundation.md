@@ -19,9 +19,9 @@ React Workbench
   → mneme-kernel ledger
 ```
 
-## 当前存储
+## 存储演进
 
-本阶段 Ledger 是内存实现。下一阶段再加入 SQLite 持久化，这样可以先确认事件 schema 与 API 边界足够稳定。
+Phase 1 初始切片使用 in-memory ledger，以便先确认事件 schema 与 API 边界。Milestone 1/2 之后，daemon 默认使用 SQLite ledger、runs 投影和 Kernel service data plane；内存实现仅作为早期上下文和测试替身。
 
 ## Phase 1 之后的数据面演进
 

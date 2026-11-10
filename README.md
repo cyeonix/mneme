@@ -70,6 +70,30 @@ curl -s -X POST http://127.0.0.1:3766/api/v1/runs \
 curl -s http://127.0.0.1:3766/api/v1/runs
 ```
 
+### 手动推进 run lifecycle
+
+Milestone 3 提供本地手动验证路径，用来确认 lifecycle event append、projection 和 Workbench 展示；这不代表已接入真实模型调用。
+
+```bash
+RUN_ID=$(curl -s http://127.0.0.1:3766/api/v1/runs \
+  -H 'content-type: application/json' \
+  -d '{"instruction":"整理今天的工作"}' | jq -r '.run_id')
+
+curl -s "http://127.0.0.1:3766/api/v1/runs/$RUN_ID/model-requests" \
+  -H 'content-type: application/json' \
+  -d '{"text":"请总结今天的工作"}'
+
+curl -s "http://127.0.0.1:3766/api/v1/runs/$RUN_ID/assistant-messages" \
+  -H 'content-type: application/json' \
+  -d '{"text":"今天完成了 Kernel service boundary。"}'
+
+curl -s "http://127.0.0.1:3766/api/v1/runs/$RUN_ID/complete" \
+  -H 'content-type: application/json' \
+  -d '{"text":"总结完成"}'
+
+curl -s http://127.0.0.1:3766/api/v1/runs
+```
+
 ## 启动基础阶段 Web shell
 
 ```bash

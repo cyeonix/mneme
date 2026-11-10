@@ -6,6 +6,10 @@ Milestone 2 把 run 写入语义从 HTTP route 和 daemon wiring 中收敛到 Ke
 
 Milestone 2 不实现模型执行、工具审批、Tauri、自托管服务器或完整 agent run loop。
 
+## Milestone 3 之后
+
+`RunService` 现在不仅负责 create/query/repair，也负责 lifecycle event append。HTTP API、daemon 和后续 worker runtime 都应继续通过 service boundary 追加 run lifecycle 事件，不直接组合 ledger 与 projection 写入。
+
 ## 写入路径
 
 ```text
