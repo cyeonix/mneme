@@ -1,5 +1,5 @@
-use crate::ids::{EventId, RunId, ToolCallId};
-use crate::ToolEffect;
+use crate::ids::{ArtifactId, ContextBundleId, EventId, RunId, ToolCallId};
+use crate::{ArtifactKind, ToolEffect};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -45,6 +45,21 @@ pub enum OperationEventKind {
     ToolCallFailed {
         tool_call_id: ToolCallId,
         reason: String,
+    },
+    ArtifactCreated {
+        artifact_id: ArtifactId,
+        title: String,
+        kind: ArtifactKind,
+        mime_type: String,
+        sha256: String,
+        byte_len: u64,
+    },
+    ContextBundleCreated {
+        context_bundle_id: ContextBundleId,
+        title: String,
+        summary: String,
+        artifact_ids: Vec<ArtifactId>,
+        event_ids: Vec<EventId>,
     },
 }
 
@@ -197,12 +212,58 @@ impl OperationEvent {
             },
         }
     }
+
+    pub fn new_artifact_created(
+        run_id: RunId,
+        artifact_id: ArtifactId,
+        title: impl Into<String>,
+        kind: ArtifactKind,
+        mime_type: impl Into<String>,
+        sha256: impl Into<String>,
+        byte_len: u64,
+    ) -> Self {
+        Self {
+            id: EventId::new(),
+            run_id,
+            occurred_at: OffsetDateTime::now_utc(),
+            kind: OperationEventKind::ArtifactCreated {
+                artifact_id,
+                title: title.into(),
+                kind,
+                mime_type: mime_type.into(),
+                sha256: sha256.into(),
+                byte_len,
+            },
+        }
+    }
+
+    pub fn new_context_bundle_created(
+        run_id: RunId,
+        context_bundle_id: ContextBundleId,
+        title: impl Into<String>,
+        summary: impl Into<String>,
+        artifact_ids: Vec<ArtifactId>,
+        event_ids: Vec<EventId>,
+    ) -> Self {
+        Self {
+            id: EventId::new(),
+            run_id,
+            occurred_at: OffsetDateTime::now_utc(),
+            kind: OperationEventKind::ContextBundleCreated {
+                context_bundle_id,
+                title: title.into(),
+                summary: summary.into(),
+                artifact_ids,
+                event_ids,
+            },
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ToolCallId, ToolEffect};
+    use crate::{ArtifactId, ArtifactKind, ContextBundleId, ToolCallId, ToolEffect};
 
     #[test]
     fn run_started_event_captures_instruction_and_run_id() {
@@ -240,6 +301,56 @@ mod tests {
             event.kind,
             OperationEventKind::RunAssistantMessage { ref content }
                 if content == "今天完成了服务边界收敛。"
+        ));
+    }
+
+    #[test]
+    fn artifact_created_event_roundtrips_through_json() {
+        let run_id = RunId::new();
+        let artifact_id = ArtifactId::new();
+        let event = OperationEvent::new_artifact_created(
+            run_id,
+            artifact_id,
+            "Run summary",
+            ArtifactKind::Markdown,
+            "text/markdown",
+            "abc123",
+            42,
+        );
+
+        let json = serde_json::to_string(&event).unwrap();
+        let decoded: OperationEvent = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(decoded.run_id, run_id);
+        assert!(matches!(
+            decoded.kind,
+            OperationEventKind::ArtifactCreated { artifact_id: id, kind: ArtifactKind::Markdown, byte_len: 42, .. } if id == artifact_id
+        ));
+    }
+
+    #[test]
+    fn context_bundle_created_event_roundtrips_through_json() {
+        let run_id = RunId::new();
+        let context_bundle_id = ContextBundleId::new();
+        let artifact_id = ArtifactId::new();
+        let event_id = EventId::new();
+        let event = OperationEvent::new_context_bundle_created(
+            run_id,
+            context_bundle_id,
+            "Debug context",
+            "User report and artifact",
+            vec![artifact_id],
+            vec![event_id],
+        );
+
+        let json = serde_json::to_string(&event).unwrap();
+        let decoded: OperationEvent = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(decoded.run_id, run_id);
+        assert!(matches!(
+            decoded.kind,
+            OperationEventKind::ContextBundleCreated { context_bundle_id: id, artifact_ids, event_ids, .. }
+                if id == context_bundle_id && artifact_ids == vec![artifact_id] && event_ids == vec![event_id]
         ));
     }
 

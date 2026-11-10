@@ -1,3 +1,4 @@
+pub mod artifacts;
 pub mod events;
 pub mod health;
 pub mod ids;
@@ -8,9 +9,10 @@ pub mod service;
 pub mod storage;
 pub mod tools;
 
+pub use artifacts::{ArtifactDetail, ArtifactKind, ArtifactRecord, ContextBundleRecord};
 pub use events::{OperationEvent, OperationEventKind};
 pub use health::{kernel_health, KernelHealth};
-pub use ids::{EventId, RunId, ToolCallId};
+pub use ids::{ArtifactId, ContextBundleId, EventId, RunId, ToolCallId};
 pub use ledger::{InMemoryOperationLedger, LedgerError, OperationLedger, SharedOperationLedger};
 pub use projections::{RunProjection, RunProjector, RunStatus};
 pub use runs::{

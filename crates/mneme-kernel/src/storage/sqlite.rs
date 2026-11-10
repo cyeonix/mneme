@@ -255,7 +255,9 @@ impl SqliteRunService {
             | OperationEventKind::ToolCallApproved { .. }
             | OperationEventKind::ToolCallDenied { .. }
             | OperationEventKind::ToolCallCompleted { .. }
-            | OperationEventKind::ToolCallFailed { .. } => {
+            | OperationEventKind::ToolCallFailed { .. }
+            | OperationEventKind::ArtifactCreated { .. }
+            | OperationEventKind::ContextBundleCreated { .. } => {
                 sqlx::query(
                     "update runs set updated_at = ?2 where run_id = ?1 and status = 'running'",
                 )
@@ -562,7 +564,9 @@ impl RunProjectionStore for SqliteRunProjectionStore {
             | OperationEventKind::ToolCallApproved { .. }
             | OperationEventKind::ToolCallDenied { .. }
             | OperationEventKind::ToolCallCompleted { .. }
-            | OperationEventKind::ToolCallFailed { .. } => {
+            | OperationEventKind::ToolCallFailed { .. }
+            | OperationEventKind::ArtifactCreated { .. }
+            | OperationEventKind::ContextBundleCreated { .. } => {
                 sqlx::query(
                     "update runs set updated_at = ?2 where run_id = ?1 and status = 'running'",
                 )
@@ -719,6 +723,8 @@ fn kind_type_for_event(kind: &OperationEventKind) -> &'static str {
         OperationEventKind::ToolCallDenied { .. } => "tool_call_denied",
         OperationEventKind::ToolCallCompleted { .. } => "tool_call_completed",
         OperationEventKind::ToolCallFailed { .. } => "tool_call_failed",
+        OperationEventKind::ArtifactCreated { .. } => "artifact_created",
+        OperationEventKind::ContextBundleCreated { .. } => "context_bundle_created",
     }
 }
 
@@ -776,8 +782,8 @@ pub enum SqliteStoreError {
 mod tests {
     use super::*;
     use crate::{
-        OperationEvent, OperationLedger, RunId, RunProjectionStore, RunProjector, ToolCallId,
-        ToolCallStatus, ToolEffect, ToolProjector,
+        ArtifactId, ArtifactKind, ContextBundleId, OperationEvent, OperationLedger, RunId,
+        RunProjectionStore, RunProjector, ToolCallId, ToolCallStatus, ToolEffect, ToolProjector,
     };
 
     #[tokio::test]
@@ -915,6 +921,60 @@ mod tests {
                 output_json,
             } if actual_tool_call_id == &tool_call_id
                 && output_json == &serde_json::json!({ "content": "hello" })
+        ));
+    }
+
+    #[tokio::test]
+    async fn sqlite_ledger_roundtrips_artifact_and_context_bundle_events() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let ledger = SqliteOperationLedger::new(store);
+        let run_id = RunId::new();
+        let artifact_id = ArtifactId::new();
+        let context_bundle_id = ContextBundleId::new();
+        let event_id = EventId::new();
+        let artifact = OperationEvent::new_artifact_created(
+            run_id,
+            artifact_id,
+            "Run summary",
+            ArtifactKind::Markdown,
+            "text/markdown",
+            "abc123",
+            42,
+        );
+        let context_bundle = OperationEvent::new_context_bundle_created(
+            run_id,
+            context_bundle_id,
+            "Debug context",
+            "User report and artifact",
+            vec![artifact_id],
+            vec![event_id],
+        );
+
+        ledger.append(artifact).await.unwrap();
+        ledger.append(context_bundle).await.unwrap();
+
+        let events = ledger.list_for_run(run_id).await.unwrap();
+
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0].kind,
+            OperationEventKind::ArtifactCreated {
+                artifact_id: actual_artifact_id,
+                kind: ArtifactKind::Markdown,
+                byte_len: 42,
+                ..
+            } if actual_artifact_id == &artifact_id
+        ));
+        assert!(matches!(
+            &events[1].kind,
+            OperationEventKind::ContextBundleCreated {
+                context_bundle_id: actual_context_bundle_id,
+                artifact_ids,
+                event_ids,
+                ..
+            } if actual_context_bundle_id == &context_bundle_id
+                && artifact_ids == &vec![artifact_id]
+                && event_ids == &vec![event_id]
         ));
     }
 

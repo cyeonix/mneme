@@ -15,6 +15,14 @@ pub struct RunId(Uuid);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ToolCallId(Uuid);
 
+/// 运行产物的唯一 ID。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ArtifactId(Uuid);
+
+/// 上下文包的唯一 ID。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ContextBundleId(Uuid);
+
 impl EventId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
@@ -93,6 +101,58 @@ impl FromStr for ToolCallId {
     }
 }
 
+impl ArtifactId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for ArtifactId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for ArtifactId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl FromStr for ArtifactId {
+    type Err = uuid::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self(Uuid::parse_str(value)?))
+    }
+}
+
+impl ContextBundleId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for ContextBundleId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for ContextBundleId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl FromStr for ContextBundleId {
+    type Err = uuid::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self(Uuid::parse_str(value)?))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,5 +179,16 @@ mod tests {
 
         assert_eq!(tool_call_id.len(), 36);
         assert!(tool_call_id.contains('-'));
+    }
+
+    #[test]
+    fn generated_artifact_and_context_bundle_ids_are_displayable() {
+        let artifact_id = ArtifactId::new().to_string();
+        let context_bundle_id = ContextBundleId::new().to_string();
+
+        assert_eq!(artifact_id.len(), 36);
+        assert!(artifact_id.contains('-'));
+        assert_eq!(context_bundle_id.len(), 36);
+        assert!(context_bundle_id.contains('-'));
     }
 }
