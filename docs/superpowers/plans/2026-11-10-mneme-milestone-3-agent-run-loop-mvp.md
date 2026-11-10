@@ -368,7 +368,8 @@ Run:
 
 ```bash
 . "$HOME/.cargo/env"
-cargo test -p mneme-kernel composed_service_records_full_success_lifecycle composed_service_rejects_blank_lifecycle_input
+cargo test -p mneme-kernel composed_service_records_full_success_lifecycle
+cargo test -p mneme-kernel composed_service_rejects_blank_lifecycle_input
 ```
 
 Expected: FAIL，缺少 trait 方法或错误枚举。
