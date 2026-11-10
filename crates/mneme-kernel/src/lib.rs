@@ -9,7 +9,11 @@ pub mod service;
 pub mod storage;
 pub mod tools;
 
-pub use artifacts::{ArtifactDetail, ArtifactKind, ArtifactRecord, ContextBundleRecord};
+pub use artifacts::{
+    ArtifactContentStore, ArtifactDetail, ArtifactKind, ArtifactRecord, ArtifactStoreError,
+    ContextBundleRecord, InMemoryArtifactContentStore, LocalArtifactContentStore,
+    StoredArtifactContent,
+};
 pub use events::{OperationEvent, OperationEventKind};
 pub use health::{kernel_health, KernelHealth};
 pub use ids::{ArtifactId, ContextBundleId, EventId, RunId, ToolCallId};
