@@ -25,8 +25,10 @@ pub use ids::{
     RetrievalTraceId, RunId, ToolCallId,
 };
 pub use knowledge::{
-    DocumentChunkRecord, KnowledgeSourceKind, KnowledgeSourceRecord, MemoryKind, MemoryRecord,
-    RetrievalTraceRecord,
+    ComposedKnowledgeService, CreateKnowledgeSourceOutcome, DocumentChunkRecord,
+    InMemoryKnowledgeSourceProjectionStore, KnowledgeServiceError, KnowledgeSourceKind,
+    KnowledgeSourceProjectionStore, KnowledgeSourceRecord, MemoryKind, MemoryRecord,
+    RetrievalTraceRecord, SharedKnowledgeSourceProjectionStore,
 };
 pub use ledger::{InMemoryOperationLedger, LedgerError, OperationLedger, SharedOperationLedger};
 pub use projections::{RunProjection, RunProjector, RunStatus};
@@ -39,7 +41,7 @@ pub use service::{
 };
 pub use storage::sqlite::{
     SqliteArtifactProjectionStore, SqliteArtifactService, SqliteContextBundleProjectionStore,
-    SqliteContextService,
+    SqliteContextService, SqliteKnowledgeService, SqliteKnowledgeSourceProjectionStore,
 };
 pub use storage::{
     SqliteOperationLedger, SqliteRunProjectionStore, SqliteRunService, SqliteStore,

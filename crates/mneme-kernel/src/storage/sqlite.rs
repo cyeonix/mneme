@@ -1,8 +1,10 @@
 use crate::{
     ArtifactId, ArtifactKind, ArtifactProjectionStore, ArtifactRecord, ArtifactServiceError,
     ContextBundleId, ContextBundleProjectionStore, ContextBundleRecord, ContextServiceError,
-    CreateArtifactOutcome, CreateContextBundleOutcome, CreateRunOutcome, EventId, LedgerError,
-    OperationEvent, OperationEventKind, OperationLedger, RunId, RunLifecycleOutcome, RunProjection,
+    CreateArtifactOutcome, CreateContextBundleOutcome, CreateKnowledgeSourceOutcome,
+    CreateRunOutcome, EventId, KnowledgeServiceError, KnowledgeSourceId, KnowledgeSourceKind,
+    KnowledgeSourceProjectionStore, KnowledgeSourceRecord, LedgerError, OperationEvent,
+    OperationEventKind, OperationLedger, RunId, RunLifecycleOutcome, RunProjection,
     RunProjectionError, RunProjectionStore, RunProjector, RunService, RunServiceError, RunStatus,
     SharedArtifactContentStore, SharedOperationLedger, SharedRunProjectionStore, SharedRunService,
     ToolApprovalDecision, ToolApprovalPolicy, ToolCallId, ToolCallOutcome, ToolEffect,
@@ -274,6 +276,385 @@ impl SqliteContextService {
             .get_context_bundle(context_bundle_id)
             .await
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct SqliteKnowledgeService {
+    store: SqliteStore,
+}
+
+impl SqliteKnowledgeService {
+    pub fn new(store: SqliteStore) -> Self {
+        Self { store }
+    }
+
+    pub async fn create_source_from_artifact(
+        &self,
+        artifact_id: ArtifactId,
+        title: String,
+        summary: String,
+    ) -> Result<CreateKnowledgeSourceOutcome, KnowledgeServiceError> {
+        let title = non_blank_knowledge_input(title)?;
+        let summary = non_blank_knowledge_input(summary)?;
+        let mut tx = self
+            .store
+            .pool()
+            .begin()
+            .await
+            .map_err(|error| KnowledgeServiceError::Ledger(error.to_string()))?;
+
+        let run_id = sqlite_run_id_for_artifact(&mut tx, artifact_id).await?;
+        let outcome = insert_knowledge_source_event(
+            &mut tx,
+            run_id,
+            KnowledgeSourceKind::Artifact,
+            Some(artifact_id),
+            None,
+            title,
+            summary,
+        )
+        .await?;
+
+        tx.commit()
+            .await
+            .map_err(|error| KnowledgeServiceError::Ledger(error.to_string()))?;
+
+        Ok(outcome)
+    }
+
+    pub async fn create_source_from_context_bundle(
+        &self,
+        context_bundle_id: ContextBundleId,
+        title: String,
+        summary: String,
+    ) -> Result<CreateKnowledgeSourceOutcome, KnowledgeServiceError> {
+        let title = non_blank_knowledge_input(title)?;
+        let summary = non_blank_knowledge_input(summary)?;
+        let mut tx = self
+            .store
+            .pool()
+            .begin()
+            .await
+            .map_err(|error| KnowledgeServiceError::Ledger(error.to_string()))?;
+
+        let run_id = sqlite_run_id_for_context_bundle(&mut tx, context_bundle_id).await?;
+        let outcome = insert_knowledge_source_event(
+            &mut tx,
+            run_id,
+            KnowledgeSourceKind::ContextBundle,
+            None,
+            Some(context_bundle_id),
+            title,
+            summary,
+        )
+        .await?;
+
+        tx.commit()
+            .await
+            .map_err(|error| KnowledgeServiceError::Ledger(error.to_string()))?;
+
+        Ok(outcome)
+    }
+
+    pub async fn create_manual_source(
+        &self,
+        run_id: RunId,
+        title: String,
+        summary: String,
+    ) -> Result<CreateKnowledgeSourceOutcome, KnowledgeServiceError> {
+        let title = non_blank_knowledge_input(title)?;
+        let summary = non_blank_knowledge_input(summary)?;
+        let mut tx = self
+            .store
+            .pool()
+            .begin()
+            .await
+            .map_err(|error| KnowledgeServiceError::Ledger(error.to_string()))?;
+
+        ensure_sqlite_knowledge_run(&mut tx, run_id).await?;
+        let outcome = insert_knowledge_source_event(
+            &mut tx,
+            run_id,
+            KnowledgeSourceKind::Manual,
+            None,
+            None,
+            title,
+            summary,
+        )
+        .await?;
+
+        tx.commit()
+            .await
+            .map_err(|error| KnowledgeServiceError::Ledger(error.to_string()))?;
+
+        Ok(outcome)
+    }
+
+    pub async fn rebuild_knowledge_source_projections(
+        &self,
+    ) -> Result<Vec<KnowledgeSourceRecord>, KnowledgeServiceError> {
+        let events = self
+            .store
+            .list_events()
+            .await
+            .map_err(|error| KnowledgeServiceError::Ledger(error.to_string()))?;
+        SqliteKnowledgeSourceProjectionStore::new(self.store.clone())
+            .rebuild(&events)
+            .await?;
+        self.list_sources().await
+    }
+
+    pub async fn list_sources(&self) -> Result<Vec<KnowledgeSourceRecord>, KnowledgeServiceError> {
+        SqliteKnowledgeSourceProjectionStore::new(self.store.clone())
+            .list_sources()
+            .await
+    }
+
+    pub async fn get_source(
+        &self,
+        knowledge_source_id: KnowledgeSourceId,
+    ) -> Result<KnowledgeSourceRecord, KnowledgeServiceError> {
+        SqliteKnowledgeSourceProjectionStore::new(self.store.clone())
+            .get_source(knowledge_source_id)
+            .await
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SqliteKnowledgeSourceProjectionStore {
+    store: SqliteStore,
+}
+
+impl SqliteKnowledgeSourceProjectionStore {
+    pub fn new(store: SqliteStore) -> Self {
+        Self { store }
+    }
+
+    pub async fn rebuild(&self, events: &[OperationEvent]) -> Result<(), KnowledgeServiceError> {
+        let mut tx = self
+            .store
+            .pool()
+            .begin()
+            .await
+            .map_err(|error| KnowledgeServiceError::Projection(error.to_string()))?;
+
+        sqlx::query("delete from knowledge_sources")
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| KnowledgeServiceError::Projection(error.to_string()))?;
+
+        for event in events {
+            apply_knowledge_source_created_to_sqlite_projection(&mut tx, event).await?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|error| KnowledgeServiceError::Projection(error.to_string()))?;
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl KnowledgeSourceProjectionStore for SqliteKnowledgeSourceProjectionStore {
+    async fn apply(&self, event: &OperationEvent) -> Result<(), KnowledgeServiceError> {
+        let mut tx = self
+            .store
+            .pool()
+            .begin()
+            .await
+            .map_err(|error| KnowledgeServiceError::Projection(error.to_string()))?;
+        apply_knowledge_source_created_to_sqlite_projection(&mut tx, event).await?;
+        tx.commit()
+            .await
+            .map_err(|error| KnowledgeServiceError::Projection(error.to_string()))?;
+        Ok(())
+    }
+
+    async fn list_sources(&self) -> Result<Vec<KnowledgeSourceRecord>, KnowledgeServiceError> {
+        let rows = sqlx::query_as::<_, StoredKnowledgeSourceRecord>(
+            "select knowledge_source_id, run_id, source_kind, artifact_id, context_bundle_id, title, summary, created_at from knowledge_sources order by created_at desc",
+        )
+        .fetch_all(self.store.pool())
+        .await
+        .map_err(|error| KnowledgeServiceError::Projection(error.to_string()))?;
+
+        rows.into_iter()
+            .map(KnowledgeSourceRecord::try_from)
+            .collect()
+    }
+
+    async fn get_source(
+        &self,
+        knowledge_source_id: KnowledgeSourceId,
+    ) -> Result<KnowledgeSourceRecord, KnowledgeServiceError> {
+        let row = sqlx::query_as::<_, StoredKnowledgeSourceRecord>(
+            "select knowledge_source_id, run_id, source_kind, artifact_id, context_bundle_id, title, summary, created_at from knowledge_sources where knowledge_source_id = ?1",
+        )
+        .bind(knowledge_source_id.to_string())
+        .fetch_optional(self.store.pool())
+        .await
+        .map_err(|error| KnowledgeServiceError::Projection(error.to_string()))?
+        .ok_or(KnowledgeServiceError::UnknownKnowledgeSource)?;
+        KnowledgeSourceRecord::try_from(row)
+    }
+}
+
+async fn sqlite_run_id_for_artifact(
+    tx: &mut Transaction<'_, Sqlite>,
+    artifact_id: ArtifactId,
+) -> Result<RunId, KnowledgeServiceError> {
+    let run_id: Option<String> =
+        sqlx::query_scalar("select run_id from artifacts where artifact_id = ?1")
+            .bind(artifact_id.to_string())
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|error| KnowledgeServiceError::Projection(error.to_string()))?;
+    parse_required_knowledge_run_id(run_id, KnowledgeServiceError::UnknownArtifact)
+}
+
+async fn sqlite_run_id_for_context_bundle(
+    tx: &mut Transaction<'_, Sqlite>,
+    context_bundle_id: ContextBundleId,
+) -> Result<RunId, KnowledgeServiceError> {
+    let run_id: Option<String> =
+        sqlx::query_scalar("select run_id from context_bundles where context_bundle_id = ?1")
+            .bind(context_bundle_id.to_string())
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|error| KnowledgeServiceError::Projection(error.to_string()))?;
+    parse_required_knowledge_run_id(run_id, KnowledgeServiceError::UnknownContextBundle)
+}
+
+async fn ensure_sqlite_knowledge_run(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: RunId,
+) -> Result<(), KnowledgeServiceError> {
+    let run_exists: Option<String> =
+        sqlx::query_scalar("select run_id from runs where run_id = ?1")
+            .bind(run_id.to_string())
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|error| KnowledgeServiceError::Projection(error.to_string()))?;
+    if run_exists.is_some() {
+        Ok(())
+    } else {
+        Err(KnowledgeServiceError::UnknownRun)
+    }
+}
+
+fn parse_required_knowledge_run_id(
+    run_id: Option<String>,
+    missing: KnowledgeServiceError,
+) -> Result<RunId, KnowledgeServiceError> {
+    run_id.ok_or(missing).and_then(|run_id| {
+        RunId::from_str(&run_id)
+            .map_err(|error| KnowledgeServiceError::Projection(error.to_string()))
+    })
+}
+
+async fn insert_knowledge_source_event(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: RunId,
+    source_kind: KnowledgeSourceKind,
+    artifact_id: Option<ArtifactId>,
+    context_bundle_id: Option<ContextBundleId>,
+    title: String,
+    summary: String,
+) -> Result<CreateKnowledgeSourceOutcome, KnowledgeServiceError> {
+    let knowledge_source_id = KnowledgeSourceId::new();
+    let event = OperationEvent::new_knowledge_source_created(
+        run_id,
+        knowledge_source_id,
+        source_kind,
+        artifact_id,
+        context_bundle_id,
+        title,
+        summary,
+    );
+    let occurred_at = event
+        .occurred_at
+        .format(&Rfc3339)
+        .map_err(|error| KnowledgeServiceError::Ledger(error.to_string()))?;
+    let payload_json = serde_json::to_string(&event.kind)
+        .map_err(|error| KnowledgeServiceError::Ledger(error.to_string()))?;
+
+    sqlx::query(
+        "insert into operation_events (event_id, run_id, occurred_at, kind_type, payload_json) values (?1, ?2, ?3, 'knowledge_source_created', ?4)",
+    )
+    .bind(event.id.to_string())
+    .bind(run_id.to_string())
+    .bind(&occurred_at)
+    .bind(payload_json)
+    .execute(&mut **tx)
+    .await
+    .map_err(|error| KnowledgeServiceError::Ledger(error.to_string()))?;
+
+    apply_knowledge_source_created_to_sqlite_projection(tx, &event).await?;
+    update_running_run_for_knowledge_source_created(tx, &event).await?;
+
+    Ok(CreateKnowledgeSourceOutcome {
+        knowledge_source_id,
+    })
+}
+
+async fn apply_knowledge_source_created_to_sqlite_projection(
+    tx: &mut Transaction<'_, Sqlite>,
+    event: &OperationEvent,
+) -> Result<(), KnowledgeServiceError> {
+    if let OperationEventKind::KnowledgeSourceCreated {
+        knowledge_source_id,
+        source_kind,
+        artifact_id,
+        context_bundle_id,
+        title,
+        summary,
+    } = &event.kind
+    {
+        let occurred_at = event
+            .occurred_at
+            .format(&Rfc3339)
+            .map_err(|error| KnowledgeServiceError::Projection(error.to_string()))?;
+        sqlx::query(
+            "insert into knowledge_sources (knowledge_source_id, run_id, source_kind, artifact_id, context_bundle_id, title, summary, created_at) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) on conflict(knowledge_source_id) do update set run_id = excluded.run_id, source_kind = excluded.source_kind, artifact_id = excluded.artifact_id, context_bundle_id = excluded.context_bundle_id, title = excluded.title, summary = excluded.summary, created_at = excluded.created_at",
+        )
+        .bind(knowledge_source_id.to_string())
+        .bind(event.run_id.to_string())
+        .bind(knowledge_source_kind_to_storage(*source_kind))
+        .bind(artifact_id.map(|id| id.to_string()))
+        .bind(context_bundle_id.map(|id| id.to_string()))
+        .bind(title)
+        .bind(summary)
+        .bind(occurred_at)
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| KnowledgeServiceError::Projection(error.to_string()))?;
+    }
+
+    Ok(())
+}
+
+async fn update_running_run_for_knowledge_source_created(
+    tx: &mut Transaction<'_, Sqlite>,
+    event: &OperationEvent,
+) -> Result<(), KnowledgeServiceError> {
+    if matches!(
+        event.kind,
+        OperationEventKind::KnowledgeSourceCreated { .. }
+    ) {
+        let occurred_at = event
+            .occurred_at
+            .format(&Rfc3339)
+            .map_err(|error| KnowledgeServiceError::Projection(error.to_string()))?;
+        sqlx::query("update runs set updated_at = ?2 where run_id = ?1 and status = 'running'")
+            .bind(event.run_id.to_string())
+            .bind(occurred_at)
+            .execute(&mut **tx)
+            .await
+            .map_err(|error| KnowledgeServiceError::Projection(error.to_string()))?;
+    }
+
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -1312,6 +1693,38 @@ impl TryFrom<StoredContextBundleRecord> for ContextBundleRecord {
 }
 
 #[derive(sqlx::FromRow)]
+struct StoredKnowledgeSourceRecord {
+    knowledge_source_id: String,
+    run_id: String,
+    source_kind: String,
+    artifact_id: Option<String>,
+    context_bundle_id: Option<String>,
+    title: String,
+    summary: String,
+    created_at: String,
+}
+
+impl TryFrom<StoredKnowledgeSourceRecord> for KnowledgeSourceRecord {
+    type Error = KnowledgeServiceError;
+
+    fn try_from(row: StoredKnowledgeSourceRecord) -> Result<Self, Self::Error> {
+        Ok(Self {
+            knowledge_source_id: KnowledgeSourceId::from_str(&row.knowledge_source_id)
+                .map_err(|error| KnowledgeServiceError::Projection(error.to_string()))?,
+            run_id: RunId::from_str(&row.run_id)
+                .map_err(|error| KnowledgeServiceError::Projection(error.to_string()))?,
+            source_kind: knowledge_source_kind_from_storage(&row.source_kind)?,
+            artifact_id: parse_optional_knowledge_id(row.artifact_id)?,
+            context_bundle_id: parse_optional_knowledge_id(row.context_bundle_id)?,
+            title: row.title,
+            summary: row.summary,
+            created_at: OffsetDateTime::parse(&row.created_at, &Rfc3339)
+                .map_err(|error| KnowledgeServiceError::Projection(error.to_string()))?,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
 struct StoredRunProjection {
     run_id: String,
     status: String,
@@ -1393,6 +1806,27 @@ fn artifact_kind_from_storage(kind: &str) -> Result<ArtifactKind, ArtifactServic
     }
 }
 
+fn knowledge_source_kind_to_storage(kind: KnowledgeSourceKind) -> &'static str {
+    match kind {
+        KnowledgeSourceKind::Artifact => "artifact",
+        KnowledgeSourceKind::ContextBundle => "context_bundle",
+        KnowledgeSourceKind::Manual => "manual",
+    }
+}
+
+fn knowledge_source_kind_from_storage(
+    kind: &str,
+) -> Result<KnowledgeSourceKind, KnowledgeServiceError> {
+    match kind {
+        "artifact" => Ok(KnowledgeSourceKind::Artifact),
+        "context_bundle" => Ok(KnowledgeSourceKind::ContextBundle),
+        "manual" => Ok(KnowledgeSourceKind::Manual),
+        other => Err(KnowledgeServiceError::Projection(format!(
+            "unknown knowledge source kind: {other}"
+        ))),
+    }
+}
+
 fn non_blank_artifact_input(value: String) -> Result<String, ArtifactServiceError> {
     let value = value.trim().to_string();
     if value.is_empty() {
@@ -1407,6 +1841,27 @@ fn non_blank_context_input(value: String) -> Result<String, ContextServiceError>
         return Err(ContextServiceError::InvalidInput);
     }
     Ok(value)
+}
+
+fn non_blank_knowledge_input(value: String) -> Result<String, KnowledgeServiceError> {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        return Err(KnowledgeServiceError::InvalidInput);
+    }
+    Ok(value)
+}
+
+fn parse_optional_knowledge_id<T>(value: Option<String>) -> Result<Option<T>, KnowledgeServiceError>
+where
+    T: FromStr,
+    T::Err: std::fmt::Display,
+{
+    value
+        .as_deref()
+        .map(|id| {
+            T::from_str(id).map_err(|error| KnowledgeServiceError::Projection(error.to_string()))
+        })
+        .transpose()
 }
 
 fn ids_to_json<T: ToString>(ids: &[T]) -> Result<String, serde_json::Error> {
@@ -1813,6 +2268,70 @@ mod tests {
         assert_eq!(bundles.len(), 1);
         assert_eq!(bundles[0].context_bundle_id, created.context_bundle_id);
         assert!(events.iter().any(|event| matches!(event.kind, OperationEventKind::ContextBundleCreated { context_bundle_id, .. } if context_bundle_id == created.context_bundle_id)));
+    }
+
+    #[tokio::test]
+    async fn sqlite_knowledge_service_creates_source_projection_and_ledger_event() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let run_service = SqliteRunService::new(store.clone());
+        let run = run_service
+            .create_run("Create source".to_string())
+            .await
+            .unwrap();
+        let content_store = crate::InMemoryArtifactContentStore::new().shared();
+        let artifact_service = SqliteArtifactService::new(store.clone(), content_store);
+        let artifact = artifact_service
+            .create_text_artifact(
+                run.run_id,
+                "Run summary".to_string(),
+                crate::ArtifactKind::Markdown,
+                "text/markdown".to_string(),
+                "Searchable content".to_string(),
+            )
+            .await
+            .unwrap();
+
+        let service = SqliteKnowledgeService::new(store.clone());
+        let outcome = service
+            .create_source_from_artifact(
+                artifact.artifact_id,
+                "Run summary".to_string(),
+                "Summary source".to_string(),
+            )
+            .await
+            .unwrap();
+
+        let sources = service.list_sources().await.unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].knowledge_source_id, outcome.knowledge_source_id);
+
+        let events = SqliteOperationLedger::new(store).list().await.unwrap();
+        assert!(events.iter().any(|event| matches!(event.kind, OperationEventKind::KnowledgeSourceCreated { knowledge_source_id, .. } if knowledge_source_id == outcome.knowledge_source_id)));
+    }
+
+    #[tokio::test]
+    async fn sqlite_ledger_roundtrips_knowledge_source_events_can_rebuild_projection() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let ledger = SqliteOperationLedger::new(store.clone());
+        let projection = SqliteKnowledgeSourceProjectionStore::new(store);
+        let run_id = RunId::new();
+        let source_id = KnowledgeSourceId::new();
+
+        let event = OperationEvent::new_knowledge_source_created(
+            run_id,
+            source_id,
+            KnowledgeSourceKind::Manual,
+            None,
+            None,
+            "Manual source",
+            "Manual summary",
+        );
+        ledger.append(event.clone()).await.unwrap();
+        projection.rebuild(&[event]).await.unwrap();
+
+        let sources = projection.list_sources().await.unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].knowledge_source_id, source_id);
     }
 
     #[tokio::test]

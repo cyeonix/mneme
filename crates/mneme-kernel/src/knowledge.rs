@@ -1,9 +1,15 @@
 use crate::{
-    ArtifactId, ContextBundleId, DocumentChunkId, KnowledgeSourceId, MemoryId, RetrievalTraceId,
-    RunId,
+    ArtifactId, ArtifactServiceError, ContextBundleId, ContextServiceError, DocumentChunkId,
+    KnowledgeSourceId, MemoryId, OperationEvent, OperationEventKind, RetrievalTraceId, RunId,
+    SharedArtifactProjectionStore, SharedContextBundleProjectionStore, SharedOperationLedger,
+    SharedRunProjectionStore,
 };
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use thiserror::Error;
 use time::OffsetDateTime;
+use tokio::sync::RwLock;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -69,10 +75,292 @@ pub struct RetrievalTraceRecord {
     pub created_at: OffsetDateTime,
 }
 
+pub type SharedKnowledgeSourceProjectionStore = Arc<dyn KnowledgeSourceProjectionStore>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateKnowledgeSourceOutcome {
+    pub knowledge_source_id: KnowledgeSourceId,
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum KnowledgeServiceError {
+    #[error("knowledge source input must not be blank")]
+    InvalidInput,
+    #[error("run id is not known to the knowledge service")]
+    UnknownRun,
+    #[error("artifact id is not known to the knowledge service")]
+    UnknownArtifact,
+    #[error("context bundle id is not known to the knowledge service")]
+    UnknownContextBundle,
+    #[error("knowledge source id is not known to the knowledge service")]
+    UnknownKnowledgeSource,
+    #[error("operation ledger failed: {0}")]
+    Ledger(String),
+    #[error("knowledge source projection failed: {0}")]
+    Projection(String),
+}
+
+#[async_trait]
+pub trait KnowledgeSourceProjectionStore: Send + Sync {
+    async fn apply(&self, event: &OperationEvent) -> Result<(), KnowledgeServiceError>;
+    async fn list_sources(&self) -> Result<Vec<KnowledgeSourceRecord>, KnowledgeServiceError>;
+    async fn get_source(
+        &self,
+        knowledge_source_id: KnowledgeSourceId,
+    ) -> Result<KnowledgeSourceRecord, KnowledgeServiceError>;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct InMemoryKnowledgeSourceProjectionStore {
+    sources: Arc<RwLock<Vec<KnowledgeSourceRecord>>>,
+}
+
+impl InMemoryKnowledgeSourceProjectionStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn shared(self) -> SharedKnowledgeSourceProjectionStore {
+        Arc::new(self)
+    }
+}
+
+#[async_trait]
+impl KnowledgeSourceProjectionStore for InMemoryKnowledgeSourceProjectionStore {
+    async fn apply(&self, event: &OperationEvent) -> Result<(), KnowledgeServiceError> {
+        if let OperationEventKind::KnowledgeSourceCreated {
+            knowledge_source_id,
+            source_kind,
+            artifact_id,
+            context_bundle_id,
+            title,
+            summary,
+        } = &event.kind
+        {
+            let mut sources = self.sources.write().await;
+            let record = KnowledgeSourceRecord {
+                knowledge_source_id: *knowledge_source_id,
+                run_id: event.run_id,
+                source_kind: *source_kind,
+                artifact_id: *artifact_id,
+                context_bundle_id: *context_bundle_id,
+                title: title.clone(),
+                summary: summary.clone(),
+                created_at: event.occurred_at,
+            };
+
+            if let Some(existing) = sources
+                .iter_mut()
+                .find(|source| source.knowledge_source_id == *knowledge_source_id)
+            {
+                *existing = record;
+            } else {
+                sources.push(record);
+            }
+            sources.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        }
+
+        Ok(())
+    }
+
+    async fn list_sources(&self) -> Result<Vec<KnowledgeSourceRecord>, KnowledgeServiceError> {
+        Ok(self.sources.read().await.clone())
+    }
+
+    async fn get_source(
+        &self,
+        knowledge_source_id: KnowledgeSourceId,
+    ) -> Result<KnowledgeSourceRecord, KnowledgeServiceError> {
+        self.sources
+            .read()
+            .await
+            .iter()
+            .find(|source| source.knowledge_source_id == knowledge_source_id)
+            .cloned()
+            .ok_or(KnowledgeServiceError::UnknownKnowledgeSource)
+    }
+}
+
+#[derive(Clone)]
+pub struct ComposedKnowledgeService {
+    ledger: SharedOperationLedger,
+    run_store: SharedRunProjectionStore,
+    artifact_projection: SharedArtifactProjectionStore,
+    context_projection: SharedContextBundleProjectionStore,
+    source_projection: SharedKnowledgeSourceProjectionStore,
+}
+
+impl ComposedKnowledgeService {
+    pub fn new(
+        ledger: SharedOperationLedger,
+        run_store: SharedRunProjectionStore,
+        artifact_projection: SharedArtifactProjectionStore,
+        context_projection: SharedContextBundleProjectionStore,
+        source_projection: SharedKnowledgeSourceProjectionStore,
+    ) -> Self {
+        Self {
+            ledger,
+            run_store,
+            artifact_projection,
+            context_projection,
+            source_projection,
+        }
+    }
+
+    async fn ensure_known_run(&self, run_id: RunId) -> Result<(), KnowledgeServiceError> {
+        let runs = self
+            .run_store
+            .list_runs()
+            .await
+            .map_err(|error| KnowledgeServiceError::Projection(error.to_string()))?;
+        if runs.iter().any(|run| run.run_id == run_id) {
+            Ok(())
+        } else {
+            Err(KnowledgeServiceError::UnknownRun)
+        }
+    }
+
+    pub async fn create_source_from_artifact(
+        &self,
+        artifact_id: ArtifactId,
+        title: String,
+        summary: String,
+    ) -> Result<CreateKnowledgeSourceOutcome, KnowledgeServiceError> {
+        let title = non_blank_knowledge_input(title)?;
+        let summary = non_blank_knowledge_input(summary)?;
+        let artifact = self
+            .artifact_projection
+            .get_artifact(artifact_id)
+            .await
+            .map_err(map_artifact_error)?;
+        self.create_source(
+            artifact.run_id,
+            KnowledgeSourceKind::Artifact,
+            Some(artifact_id),
+            None,
+            title,
+            summary,
+        )
+        .await
+    }
+
+    pub async fn create_source_from_context_bundle(
+        &self,
+        context_bundle_id: ContextBundleId,
+        title: String,
+        summary: String,
+    ) -> Result<CreateKnowledgeSourceOutcome, KnowledgeServiceError> {
+        let title = non_blank_knowledge_input(title)?;
+        let summary = non_blank_knowledge_input(summary)?;
+        let bundle = self
+            .context_projection
+            .get_context_bundle(context_bundle_id)
+            .await
+            .map_err(map_context_error)?;
+        self.create_source(
+            bundle.run_id,
+            KnowledgeSourceKind::ContextBundle,
+            None,
+            Some(context_bundle_id),
+            title,
+            summary,
+        )
+        .await
+    }
+
+    pub async fn create_manual_source(
+        &self,
+        run_id: RunId,
+        title: String,
+        summary: String,
+    ) -> Result<CreateKnowledgeSourceOutcome, KnowledgeServiceError> {
+        let title = non_blank_knowledge_input(title)?;
+        let summary = non_blank_knowledge_input(summary)?;
+        self.ensure_known_run(run_id).await?;
+        self.create_source(
+            run_id,
+            KnowledgeSourceKind::Manual,
+            None,
+            None,
+            title,
+            summary,
+        )
+        .await
+    }
+
+    async fn create_source(
+        &self,
+        run_id: RunId,
+        source_kind: KnowledgeSourceKind,
+        artifact_id: Option<ArtifactId>,
+        context_bundle_id: Option<ContextBundleId>,
+        title: String,
+        summary: String,
+    ) -> Result<CreateKnowledgeSourceOutcome, KnowledgeServiceError> {
+        let knowledge_source_id = KnowledgeSourceId::new();
+        let event = OperationEvent::new_knowledge_source_created(
+            run_id,
+            knowledge_source_id,
+            source_kind,
+            artifact_id,
+            context_bundle_id,
+            title,
+            summary,
+        );
+
+        self.ledger
+            .append(event.clone())
+            .await
+            .map_err(|error| KnowledgeServiceError::Ledger(error.to_string()))?;
+        self.run_store
+            .apply(&event)
+            .await
+            .map_err(|error| KnowledgeServiceError::Projection(error.to_string()))?;
+        self.source_projection.apply(&event).await?;
+
+        Ok(CreateKnowledgeSourceOutcome {
+            knowledge_source_id,
+        })
+    }
+
+    pub async fn list_sources(&self) -> Result<Vec<KnowledgeSourceRecord>, KnowledgeServiceError> {
+        self.source_projection.list_sources().await
+    }
+
+    pub async fn get_source(
+        &self,
+        knowledge_source_id: KnowledgeSourceId,
+    ) -> Result<KnowledgeSourceRecord, KnowledgeServiceError> {
+        self.source_projection.get_source(knowledge_source_id).await
+    }
+}
+
+fn non_blank_knowledge_input(value: String) -> Result<String, KnowledgeServiceError> {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        return Err(KnowledgeServiceError::InvalidInput);
+    }
+    Ok(value)
+}
+
+fn map_artifact_error(error: ArtifactServiceError) -> KnowledgeServiceError {
+    match error {
+        ArtifactServiceError::UnknownArtifact => KnowledgeServiceError::UnknownArtifact,
+        other => KnowledgeServiceError::Projection(other.to_string()),
+    }
+}
+
+fn map_context_error(error: ContextServiceError) -> KnowledgeServiceError {
+    match error {
+        ContextServiceError::UnknownContextBundle => KnowledgeServiceError::UnknownContextBundle,
+        other => KnowledgeServiceError::Projection(other.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ArtifactId, RunId};
+    use crate::{ArtifactId, OperationEvent, RunId, RunService};
     use time::OffsetDateTime;
 
     #[test]
@@ -112,5 +400,57 @@ mod tests {
         assert!(json.contains("decision"));
         let decoded: MemoryRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.confidence, 0.8);
+    }
+
+    #[tokio::test]
+    async fn composed_knowledge_service_creates_artifact_source() {
+        let ledger = crate::InMemoryOperationLedger::new().shared();
+        let run_store = crate::InMemoryRunProjectionStore::new().shared();
+        let artifact_projection = crate::InMemoryArtifactProjectionStore::new().shared();
+        let context_projection = crate::InMemoryContextBundleProjectionStore::new().shared();
+        let source_projection = InMemoryKnowledgeSourceProjectionStore::new().shared();
+
+        let run_service = crate::ComposedRunService::new(ledger.clone(), run_store.clone());
+        let run = run_service
+            .create_run("Create a source".to_string())
+            .await
+            .unwrap();
+        let artifact_id = ArtifactId::new();
+        artifact_projection
+            .apply(&OperationEvent::new_artifact_created(
+                run.run_id,
+                artifact_id,
+                "Run summary",
+                crate::ArtifactKind::Markdown,
+                "text/markdown",
+                "abc123",
+                12,
+            ))
+            .await
+            .unwrap();
+
+        let service = ComposedKnowledgeService::new(
+            ledger.clone(),
+            run_store,
+            artifact_projection,
+            context_projection,
+            source_projection,
+        );
+
+        let outcome = service
+            .create_source_from_artifact(
+                artifact_id,
+                "Run summary".to_string(),
+                "Summary source".to_string(),
+            )
+            .await
+            .unwrap();
+
+        let sources = service.list_sources().await.unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].knowledge_source_id, outcome.knowledge_source_id);
+        assert_eq!(sources[0].run_id, run.run_id);
+        assert_eq!(sources[0].source_kind, KnowledgeSourceKind::Artifact);
+        assert_eq!(sources[0].artifact_id, Some(artifact_id));
     }
 }

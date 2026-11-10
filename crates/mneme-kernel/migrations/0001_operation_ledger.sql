@@ -51,3 +51,17 @@ create table if not exists context_bundles (
 
 create index if not exists idx_context_bundles_run_id_created_at
   on context_bundles(run_id, created_at desc);
+
+create table if not exists knowledge_sources (
+  knowledge_source_id text primary key,
+  run_id text not null,
+  source_kind text not null,
+  artifact_id text,
+  context_bundle_id text,
+  title text not null,
+  summary text not null,
+  created_at text not null
+);
+
+create index if not exists idx_knowledge_sources_run_id_created_at
+  on knowledge_sources(run_id, created_at);
