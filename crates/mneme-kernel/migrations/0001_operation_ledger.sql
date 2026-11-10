@@ -24,3 +24,17 @@ create table if not exists runs (
 
 create index if not exists idx_runs_updated_at
   on runs(updated_at desc);
+
+create table if not exists artifacts (
+  artifact_id text primary key,
+  run_id text not null,
+  title text not null,
+  kind text not null,
+  mime_type text not null,
+  sha256 text not null,
+  byte_len integer not null,
+  created_at text not null
+);
+
+create index if not exists idx_artifacts_run_id_created_at
+  on artifacts(run_id, created_at desc);

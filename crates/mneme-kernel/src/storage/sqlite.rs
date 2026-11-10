@@ -1,13 +1,15 @@
 use crate::{
-    CreateRunOutcome, EventId, LedgerError, OperationEvent, OperationEventKind, OperationLedger,
-    RunId, RunLifecycleOutcome, RunProjection, RunProjectionError, RunProjectionStore,
-    RunProjector, RunService, RunServiceError, RunStatus, SharedOperationLedger,
-    SharedRunProjectionStore, SharedRunService, ToolApprovalDecision, ToolApprovalPolicy,
-    ToolCallId, ToolCallOutcome, ToolEffect, ToolLifecycleOutcome,
+    ArtifactId, ArtifactKind, ArtifactProjectionStore, ArtifactRecord, ArtifactServiceError,
+    CreateArtifactOutcome, CreateRunOutcome, EventId, LedgerError, OperationEvent,
+    OperationEventKind, OperationLedger, RunId, RunLifecycleOutcome, RunProjection,
+    RunProjectionError, RunProjectionStore, RunProjector, RunService, RunServiceError, RunStatus,
+    SharedArtifactContentStore, SharedOperationLedger, SharedRunProjectionStore, SharedRunService,
+    ToolApprovalDecision, ToolApprovalPolicy, ToolCallId, ToolCallOutcome, ToolEffect,
+    ToolLifecycleOutcome,
 };
 use async_trait::async_trait;
 use serde_json::Value;
-use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
+use sqlx::{sqlite::SqlitePoolOptions, Sqlite, SqlitePool, Transaction};
 use std::{str::FromStr, sync::Arc};
 use thiserror::Error;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -32,6 +34,281 @@ impl SqliteStore {
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
+
+    pub async fn list_events(&self) -> Result<Vec<OperationEvent>, LedgerError> {
+        SqliteOperationLedger::new(self.clone()).list().await
+    }
+}
+
+#[derive(Clone)]
+pub struct SqliteArtifactService {
+    store: SqliteStore,
+    content_store: SharedArtifactContentStore,
+}
+
+impl SqliteArtifactService {
+    pub fn new(store: SqliteStore, content_store: SharedArtifactContentStore) -> Self {
+        Self {
+            store,
+            content_store,
+        }
+    }
+
+    pub async fn create_text_artifact(
+        &self,
+        run_id: RunId,
+        title: String,
+        kind: ArtifactKind,
+        mime_type: String,
+        content: String,
+    ) -> Result<CreateArtifactOutcome, ArtifactServiceError> {
+        let title = non_blank_artifact_input(title)?;
+        let mime_type = non_blank_artifact_input(mime_type)?;
+        if content.trim().is_empty() {
+            return Err(ArtifactServiceError::InvalidInput);
+        }
+
+        let mut tx = self
+            .store
+            .pool()
+            .begin()
+            .await
+            .map_err(|error| ArtifactServiceError::Ledger(error.to_string()))?;
+
+        let run_exists: Option<String> =
+            sqlx::query_scalar("select run_id from runs where run_id = ?1")
+                .bind(run_id.to_string())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|error| ArtifactServiceError::Projection(error.to_string()))?;
+        if run_exists.is_none() {
+            return Err(ArtifactServiceError::UnknownRun);
+        }
+
+        let stored = self
+            .content_store
+            .put(content.into_bytes())
+            .await
+            .map_err(|error| ArtifactServiceError::ContentStore(error.to_string()))?;
+        let artifact_id = ArtifactId::new();
+        let event = OperationEvent::new_artifact_created(
+            run_id,
+            artifact_id,
+            title.clone(),
+            kind,
+            mime_type.clone(),
+            stored.sha256.clone(),
+            stored.byte_len,
+        );
+        let occurred_at = event
+            .occurred_at
+            .format(&Rfc3339)
+            .map_err(|error| ArtifactServiceError::Ledger(error.to_string()))?;
+        let payload_json = serde_json::to_string(&event.kind)
+            .map_err(|error| ArtifactServiceError::Ledger(error.to_string()))?;
+
+        sqlx::query(
+            "insert into operation_events (event_id, run_id, occurred_at, kind_type, payload_json) values (?1, ?2, ?3, 'artifact_created', ?4)",
+        )
+        .bind(event.id.to_string())
+        .bind(run_id.to_string())
+        .bind(&occurred_at)
+        .bind(payload_json)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| ArtifactServiceError::Ledger(error.to_string()))?;
+
+        apply_artifact_created_to_sqlite_projection(&mut tx, &event).await?;
+        update_running_run_for_artifact_created(&mut tx, &event).await?;
+
+        tx.commit()
+            .await
+            .map_err(|error| ArtifactServiceError::Ledger(error.to_string()))?;
+
+        Ok(CreateArtifactOutcome { artifact_id })
+    }
+
+    pub async fn rebuild_artifact_projections(
+        &self,
+    ) -> Result<Vec<ArtifactRecord>, ArtifactServiceError> {
+        let events = self
+            .store
+            .list_events()
+            .await
+            .map_err(|error| ArtifactServiceError::Ledger(error.to_string()))?;
+        SqliteArtifactProjectionStore::new(self.store.clone())
+            .rebuild(&events)
+            .await?;
+        self.list_artifacts().await
+    }
+
+    pub async fn list_artifacts(&self) -> Result<Vec<ArtifactRecord>, ArtifactServiceError> {
+        let rows = sqlx::query_as::<_, StoredArtifactRecord>(
+            "select artifact_id, run_id, title, kind, mime_type, sha256, byte_len, created_at from artifacts order by created_at desc",
+        )
+        .fetch_all(self.store.pool())
+        .await
+        .map_err(|error| ArtifactServiceError::Projection(error.to_string()))?;
+
+        rows.into_iter().map(ArtifactRecord::try_from).collect()
+    }
+
+    pub async fn get_artifact(
+        &self,
+        artifact_id: ArtifactId,
+    ) -> Result<crate::ArtifactDetail, ArtifactServiceError> {
+        let row = sqlx::query_as::<_, StoredArtifactRecord>(
+            "select artifact_id, run_id, title, kind, mime_type, sha256, byte_len, created_at from artifacts where artifact_id = ?1",
+        )
+        .bind(artifact_id.to_string())
+        .fetch_optional(self.store.pool())
+        .await
+        .map_err(|error| ArtifactServiceError::Projection(error.to_string()))?
+        .ok_or(ArtifactServiceError::UnknownArtifact)?;
+        let artifact = ArtifactRecord::try_from(row)?;
+        let bytes = self
+            .content_store
+            .get(&artifact.sha256)
+            .await
+            .map_err(|error| ArtifactServiceError::ContentStore(error.to_string()))?;
+        let content = String::from_utf8(bytes).ok();
+
+        Ok(crate::ArtifactDetail { artifact, content })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SqliteArtifactProjectionStore {
+    store: SqliteStore,
+}
+
+impl SqliteArtifactProjectionStore {
+    pub fn new(store: SqliteStore) -> Self {
+        Self { store }
+    }
+
+    pub async fn rebuild(&self, events: &[OperationEvent]) -> Result<(), ArtifactServiceError> {
+        let mut tx = self
+            .store
+            .pool()
+            .begin()
+            .await
+            .map_err(|error| ArtifactServiceError::Projection(error.to_string()))?;
+
+        sqlx::query("delete from artifacts")
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| ArtifactServiceError::Projection(error.to_string()))?;
+
+        for event in events {
+            apply_artifact_created_to_sqlite_projection(&mut tx, event).await?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|error| ArtifactServiceError::Projection(error.to_string()))?;
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ArtifactProjectionStore for SqliteArtifactProjectionStore {
+    async fn apply(&self, event: &OperationEvent) -> Result<(), ArtifactServiceError> {
+        let mut tx = self
+            .store
+            .pool()
+            .begin()
+            .await
+            .map_err(|error| ArtifactServiceError::Projection(error.to_string()))?;
+        apply_artifact_created_to_sqlite_projection(&mut tx, event).await?;
+        tx.commit()
+            .await
+            .map_err(|error| ArtifactServiceError::Projection(error.to_string()))?;
+        Ok(())
+    }
+
+    async fn list_artifacts(&self) -> Result<Vec<ArtifactRecord>, ArtifactServiceError> {
+        let rows = sqlx::query_as::<_, StoredArtifactRecord>(
+            "select artifact_id, run_id, title, kind, mime_type, sha256, byte_len, created_at from artifacts order by created_at desc",
+        )
+        .fetch_all(self.store.pool())
+        .await
+        .map_err(|error| ArtifactServiceError::Projection(error.to_string()))?;
+
+        rows.into_iter().map(ArtifactRecord::try_from).collect()
+    }
+
+    async fn get_artifact(
+        &self,
+        artifact_id: ArtifactId,
+    ) -> Result<ArtifactRecord, ArtifactServiceError> {
+        let row = sqlx::query_as::<_, StoredArtifactRecord>(
+            "select artifact_id, run_id, title, kind, mime_type, sha256, byte_len, created_at from artifacts where artifact_id = ?1",
+        )
+        .bind(artifact_id.to_string())
+        .fetch_optional(self.store.pool())
+        .await
+        .map_err(|error| ArtifactServiceError::Projection(error.to_string()))?
+        .ok_or(ArtifactServiceError::UnknownArtifact)?;
+        ArtifactRecord::try_from(row)
+    }
+}
+
+async fn apply_artifact_created_to_sqlite_projection(
+    tx: &mut Transaction<'_, Sqlite>,
+    event: &OperationEvent,
+) -> Result<(), ArtifactServiceError> {
+    if let OperationEventKind::ArtifactCreated {
+        artifact_id,
+        title,
+        kind,
+        mime_type,
+        sha256,
+        byte_len,
+    } = &event.kind
+    {
+        let occurred_at = event
+            .occurred_at
+            .format(&Rfc3339)
+            .map_err(|error| ArtifactServiceError::Projection(error.to_string()))?;
+        sqlx::query(
+            "insert into artifacts (artifact_id, run_id, title, kind, mime_type, sha256, byte_len, created_at) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) on conflict(artifact_id) do update set run_id = excluded.run_id, title = excluded.title, kind = excluded.kind, mime_type = excluded.mime_type, sha256 = excluded.sha256, byte_len = excluded.byte_len, created_at = excluded.created_at",
+        )
+        .bind(artifact_id.to_string())
+        .bind(event.run_id.to_string())
+        .bind(title)
+        .bind(artifact_kind_to_storage(*kind))
+        .bind(mime_type)
+        .bind(sha256)
+        .bind(*byte_len as i64)
+        .bind(occurred_at)
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| ArtifactServiceError::Projection(error.to_string()))?;
+    }
+
+    Ok(())
+}
+
+async fn update_running_run_for_artifact_created(
+    tx: &mut Transaction<'_, Sqlite>,
+    event: &OperationEvent,
+) -> Result<(), ArtifactServiceError> {
+    if matches!(event.kind, OperationEventKind::ArtifactCreated { .. }) {
+        let occurred_at = event
+            .occurred_at
+            .format(&Rfc3339)
+            .map_err(|error| ArtifactServiceError::Projection(error.to_string()))?;
+        sqlx::query("update runs set updated_at = ?2 where run_id = ?1 and status = 'running'")
+            .bind(event.run_id.to_string())
+            .bind(occurred_at)
+            .execute(&mut **tx)
+            .await
+            .map_err(|error| ArtifactServiceError::Projection(error.to_string()))?;
+    }
+
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -680,6 +957,43 @@ impl TryFrom<StoredOperationEvent> for OperationEvent {
 }
 
 #[derive(sqlx::FromRow)]
+struct StoredArtifactRecord {
+    artifact_id: String,
+    run_id: String,
+    title: String,
+    kind: String,
+    mime_type: String,
+    sha256: String,
+    byte_len: i64,
+    created_at: String,
+}
+
+impl TryFrom<StoredArtifactRecord> for ArtifactRecord {
+    type Error = ArtifactServiceError;
+
+    fn try_from(row: StoredArtifactRecord) -> Result<Self, Self::Error> {
+        Ok(Self {
+            artifact_id: ArtifactId::from_str(&row.artifact_id)
+                .map_err(|error| ArtifactServiceError::Projection(error.to_string()))?,
+            run_id: RunId::from_str(&row.run_id)
+                .map_err(|error| ArtifactServiceError::Projection(error.to_string()))?,
+            title: row.title,
+            kind: artifact_kind_from_storage(&row.kind)?,
+            mime_type: row.mime_type,
+            sha256: row.sha256,
+            byte_len: row
+                .byte_len
+                .try_into()
+                .map_err(|error: std::num::TryFromIntError| {
+                    ArtifactServiceError::Projection(error.to_string())
+                })?,
+            created_at: OffsetDateTime::parse(&row.created_at, &Rfc3339)
+                .map_err(|error| ArtifactServiceError::Projection(error.to_string()))?,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
 struct StoredRunProjection {
     run_id: String,
     status: String,
@@ -736,6 +1050,35 @@ fn status_to_storage(status: &RunStatus) -> &'static str {
     }
 }
 
+fn artifact_kind_to_storage(kind: ArtifactKind) -> &'static str {
+    match kind {
+        ArtifactKind::Text => "text",
+        ArtifactKind::Markdown => "markdown",
+        ArtifactKind::Json => "json",
+        ArtifactKind::Binary => "binary",
+    }
+}
+
+fn artifact_kind_from_storage(kind: &str) -> Result<ArtifactKind, ArtifactServiceError> {
+    match kind {
+        "text" => Ok(ArtifactKind::Text),
+        "markdown" => Ok(ArtifactKind::Markdown),
+        "json" => Ok(ArtifactKind::Json),
+        "binary" => Ok(ArtifactKind::Binary),
+        other => Err(ArtifactServiceError::Projection(format!(
+            "unknown artifact kind: {other}"
+        ))),
+    }
+}
+
+fn non_blank_artifact_input(value: String) -> Result<String, ArtifactServiceError> {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        return Err(ArtifactServiceError::InvalidInput);
+    }
+    Ok(value)
+}
+
 fn status_from_storage(status: &str) -> Result<RunStatus, RunProjectionError> {
     match status {
         "running" => Ok(RunStatus::Running),
@@ -782,8 +1125,10 @@ pub enum SqliteStoreError {
 mod tests {
     use super::*;
     use crate::{
-        ArtifactId, ArtifactKind, ContextBundleId, OperationEvent, OperationLedger, RunId,
-        RunProjectionStore, RunProjector, ToolCallId, ToolCallStatus, ToolEffect, ToolProjector,
+        ArtifactId, ArtifactKind, ArtifactProjectionStore, ContextBundleId,
+        InMemoryArtifactContentStore, LocalArtifactContentStore, OperationEvent, OperationLedger,
+        RunId, RunProjectionStore, RunProjector, ToolCallId, ToolCallStatus, ToolEffect,
+        ToolProjector,
     };
 
     #[tokio::test]
@@ -976,6 +1321,174 @@ mod tests {
                 && artifact_ids == &vec![artifact_id]
                 && event_ids == &vec![event_id]
         ));
+    }
+
+    #[tokio::test]
+    async fn sqlite_artifact_service_creates_artifact_projection_and_ledger_event() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let run_service = SqliteRunService::new(store.clone());
+        let run = run_service
+            .create_run("collect artifact".to_string())
+            .await
+            .unwrap();
+        let content_store = InMemoryArtifactContentStore::new().shared();
+        let artifact_service = SqliteArtifactService::new(store.clone(), content_store);
+
+        let created = artifact_service
+            .create_text_artifact(
+                run.run_id,
+                "Collected note".to_string(),
+                ArtifactKind::Text,
+                "text/plain".to_string(),
+                "note body".to_string(),
+            )
+            .await
+            .unwrap();
+
+        let artifacts = artifact_service.list_artifacts().await.unwrap();
+        let detail = artifact_service
+            .get_artifact(created.artifact_id)
+            .await
+            .unwrap();
+        let events = store.list_events().await.unwrap();
+
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].artifact_id, created.artifact_id);
+        assert_eq!(detail.artifact.artifact_id, created.artifact_id);
+        assert_eq!(detail.content.as_deref(), Some("note body"));
+        assert!(events.iter().any(|event| matches!(event.kind, OperationEventKind::ArtifactCreated { artifact_id, .. } if artifact_id == created.artifact_id)));
+    }
+
+    #[tokio::test]
+    async fn sqlite_ledger_roundtrips_artifact_events_can_rebuild_artifact_projection() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let ledger = SqliteOperationLedger::new(store.clone());
+        let projection = SqliteArtifactProjectionStore::new(store.clone());
+        let run_id = RunId::new();
+        let artifact_id = ArtifactId::new();
+        let started = OperationEvent::new_run_started(run_id, "ledger-only artifact rebuild");
+        let artifact = OperationEvent::new_artifact_created(
+            run_id,
+            artifact_id,
+            "Ledger artifact",
+            ArtifactKind::Markdown,
+            "text/markdown",
+            "abc123",
+            42,
+        );
+
+        ledger.append(started).await.unwrap();
+        ledger.append(artifact.clone()).await.unwrap();
+        assert!(projection.list_artifacts().await.unwrap().is_empty());
+
+        let events = ledger.list().await.unwrap();
+        projection.rebuild(&events).await.unwrap();
+
+        let artifacts = projection.list_artifacts().await.unwrap();
+        let stored = projection.get_artifact(artifact_id).await.unwrap();
+        assert_eq!(artifacts, vec![stored.clone()]);
+        assert_eq!(stored.artifact_id, artifact_id);
+        assert_eq!(stored.run_id, run_id);
+        assert_eq!(stored.title, "Ledger artifact");
+        assert_eq!(stored.kind, ArtifactKind::Markdown);
+        assert_eq!(stored.mime_type, "text/markdown");
+        assert_eq!(stored.sha256, "abc123");
+        assert_eq!(stored.byte_len, 42);
+        assert_eq!(stored.created_at, artifact.occurred_at);
+    }
+
+    #[tokio::test]
+    async fn sqlite_artifact_service_updates_running_run_updated_at() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let run_service = SqliteRunService::new(store.clone());
+        let run = run_service
+            .create_run("collect artifact".to_string())
+            .await
+            .unwrap();
+        let artifact_service =
+            SqliteArtifactService::new(store.clone(), InMemoryArtifactContentStore::new().shared());
+
+        let created = artifact_service
+            .create_text_artifact(
+                run.run_id,
+                "Collected note".to_string(),
+                ArtifactKind::Text,
+                "text/plain".to_string(),
+                "note body".to_string(),
+            )
+            .await
+            .unwrap();
+
+        let artifact_event = store
+            .list_events()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|event| matches!(event.kind, OperationEventKind::ArtifactCreated { artifact_id, .. } if artifact_id == created.artifact_id))
+            .unwrap();
+        let runs = run_service.list_runs().await.unwrap();
+        assert_eq!(runs[0].run_id, run.run_id);
+        assert_eq!(runs[0].updated_at, artifact_event.occurred_at);
+    }
+
+    #[tokio::test]
+    async fn sqlite_artifact_service_rejects_unknown_run_without_writing_content_or_ledger() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let content_root = std::env::temp_dir().join(format!(
+            "mneme-sqlite-artifact-unknown-run-{}",
+            std::process::id()
+        ));
+        if content_root.exists() {
+            std::fs::remove_dir_all(&content_root).unwrap();
+        }
+        let artifact_service = SqliteArtifactService::new(
+            store.clone(),
+            LocalArtifactContentStore::new(content_root.clone()).shared(),
+        );
+
+        let error = artifact_service
+            .create_text_artifact(
+                RunId::new(),
+                "Orphan".to_string(),
+                ArtifactKind::Text,
+                "text/plain".to_string(),
+                "orphan body".to_string(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, ArtifactServiceError::UnknownRun);
+        assert!(store.list_events().await.unwrap().is_empty());
+        assert!(artifact_service.list_artifacts().await.unwrap().is_empty());
+        assert!(!content_root.exists());
+    }
+
+    #[tokio::test]
+    async fn sqlite_artifact_service_rejects_blank_inputs_without_side_effects() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let run_service = SqliteRunService::new(store.clone());
+        let run = run_service
+            .create_run("collect artifact".to_string())
+            .await
+            .unwrap();
+        let events_before = store.list_events().await.unwrap().len();
+        let artifact_service =
+            SqliteArtifactService::new(store.clone(), InMemoryArtifactContentStore::new().shared());
+
+        let error = artifact_service
+            .create_text_artifact(
+                run.run_id,
+                "   ".to_string(),
+                ArtifactKind::Text,
+                "text/plain".to_string(),
+                "note body".to_string(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, ArtifactServiceError::InvalidInput);
+        assert_eq!(store.list_events().await.unwrap().len(), events_before);
+        assert!(artifact_service.list_artifacts().await.unwrap().is_empty());
     }
 
     #[tokio::test]
