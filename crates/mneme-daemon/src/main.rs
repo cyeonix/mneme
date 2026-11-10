@@ -1,5 +1,5 @@
-use mneme_api::routes::build_router_with_state;
-use mneme_kernel::{SqliteOperationLedger, SqliteRunProjectionStore, SqliteStore};
+use mneme_api::routes::build_router_with_service;
+use mneme_kernel::{RunService, SqliteRunService, SqliteStore};
 use std::{fs, net::SocketAddr, path::Path};
 use tokio::net::TcpListener;
 use tracing::info;
@@ -12,6 +12,14 @@ fn database_url_from_env() -> String {
 
 fn database_url_from_env_value(value: Option<String>) -> String {
     value.unwrap_or_else(|| DEFAULT_DATABASE_URL.to_string())
+}
+
+fn rebuild_runs_on_start() -> bool {
+    rebuild_runs_on_start_value(std::env::var("MNEME_REBUILD_RUNS_ON_START").ok())
+}
+
+fn rebuild_runs_on_start_value(value: Option<String>) -> bool {
+    matches!(value.as_deref(), Some("1") | Some("true") | Some("yes"))
 }
 
 fn ensure_sqlite_parent_directory(database_url: &str) -> std::io::Result<()> {
@@ -51,9 +59,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database_url = database_url_from_env();
     ensure_sqlite_parent_directory(&database_url)?;
     let store = SqliteStore::connect(&database_url).await?;
-    let ledger = SqliteOperationLedger::new(store.clone()).shared();
-    let run_store = SqliteRunProjectionStore::new(store).shared();
-    let app = build_router_with_state(ledger, run_store);
+    let service = SqliteRunService::new(store);
+    if rebuild_runs_on_start() {
+        let rebuilt = service.rebuild_run_projections().await?;
+        info!(
+            run_count = rebuilt.len(),
+            "rebuilt run projections from operation ledger"
+        );
+    }
+    let app = build_router_with_service(service.shared());
     let listener = TcpListener::bind(addr).await?;
 
     info!(%addr, database_url = %database_url, "mneme daemon listening");
@@ -65,6 +79,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rebuild_runs_on_start_defaults_to_false() {
+        assert!(!rebuild_runs_on_start_value(None));
+    }
+
+    #[test]
+    fn rebuild_runs_on_start_accepts_one_true_and_yes() {
+        assert!(rebuild_runs_on_start_value(Some("1".to_string())));
+        assert!(rebuild_runs_on_start_value(Some("true".to_string())));
+        assert!(rebuild_runs_on_start_value(Some("yes".to_string())));
+    }
+
+    #[test]
+    fn rebuild_runs_on_start_rejects_other_values() {
+        assert!(!rebuild_runs_on_start_value(Some("0".to_string())));
+        assert!(!rebuild_runs_on_start_value(Some("false".to_string())));
+    }
 
     #[test]
     fn default_database_url_uses_local_mneme_directory() {

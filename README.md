@@ -42,6 +42,14 @@ MNEME_DB_URL='sqlite://.mneme-dev/mneme.db?mode=rwc' cargo run -p mneme-daemon
 
 Operation Ledger 的 `operation_events` 表是事实源；`runs` 表是可重建投影。
 
+如需在启动时从 `operation_events` 修复 `runs` 读模型，可以显式开启：
+
+```bash
+MNEME_REBUILD_RUNS_ON_START=1 cargo run -p mneme-daemon
+```
+
+默认不自动 rebuild，避免每次启动都重写读模型；当迁移、调试或怀疑 projection 失配时再开启。
+
 健康检查：
 
 ```bash
