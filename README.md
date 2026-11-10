@@ -12,6 +12,7 @@ Phase 1 构建基础切片：
 - daemon binary
 - TypeScript API client
 - 最小 React Workbench
+- Artifact Workspace 与 Context Inspector 的只读基础面板
 
 ## 环境要求
 
@@ -40,7 +41,7 @@ cargo run -p mneme-daemon
 MNEME_DB_URL='sqlite://.mneme-dev/mneme.db?mode=rwc' cargo run -p mneme-daemon
 ```
 
-Operation Ledger 的 `operation_events` 表是事实源；`runs` 表是可重建投影。
+Operation Ledger 的 `operation_events` 表是事实源；`runs`、`artifacts`、`context_bundles` 表是可重建投影。
 
 ## Kernel service boundary
 
@@ -113,6 +114,31 @@ curl -s http://127.0.0.1:3766/api/v1/runs/$RUN_ID/tool-calls/$TOOL_CALL_ID/resul
 ```
 
 这些 endpoint 只记录工具事件，不执行真实文件读取。
+
+### 创建 artifact 与 context bundle
+
+Milestone 5 提供 artifact/context 的本地手动验证路径。Artifact 内容按 SHA-256 寻址，metadata 通过 `ArtifactCreated` 事件写入 Operation Ledger 并投影到 `artifacts`；context bundle 通过 `ContextBundleCreated` 事件记录 artifact/event 引用并投影到 `context_bundles`。
+
+```bash
+RUN_ID=$(curl -s http://127.0.0.1:3766/api/v1/runs \
+  -H 'content-type: application/json' \
+  -d '{"instruction":"整理 artifact context"}' | jq -r '.run_id')
+
+ARTIFACT_ID=$(curl -s "http://127.0.0.1:3766/api/v1/runs/$RUN_ID/artifacts" \
+  -H 'content-type: application/json' \
+  -d '{"title":"Run summary","kind":"markdown","mime_type":"text/markdown","content":"# Summary\n\n完成了 Artifact Workspace。"}' | jq -r '.artifact_id')
+
+curl -s "http://127.0.0.1:3766/api/v1/artifacts/$ARTIFACT_ID"
+
+CONTEXT_BUNDLE_ID=$(curl -s "http://127.0.0.1:3766/api/v1/runs/$RUN_ID/context-bundles" \
+  -H 'content-type: application/json' \
+  -d "{\"title\":\"Debug context\",\"summary\":\"User report and generated artifact\",\"artifact_ids\":[\"$ARTIFACT_ID\"],\"event_ids\":[]}" | jq -r '.context_bundle_id')
+
+curl -s "http://127.0.0.1:3766/api/v1/context-bundles/$CONTEXT_BUNDLE_ID"
+curl -s http://127.0.0.1:3766/api/v1/context-bundles
+```
+
+这些 endpoint 只创建与读取已记录的 artifact/context 元数据和内容；不做搜索、向量召回、真实模型调用或真实工具执行。
 
 ## 启动基础阶段 Web shell
 
