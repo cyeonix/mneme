@@ -129,6 +129,9 @@ pub struct RetrievalTraceRecord {
 pub type SharedKnowledgeSourceProjectionStore = Arc<dyn KnowledgeSourceProjectionStore>;
 pub type SharedDocumentChunkProjectionStore = Arc<dyn DocumentChunkProjectionStore>;
 pub type SharedMemoryProjectionStore = Arc<dyn MemoryProjectionStore>;
+pub type SharedRetrievalTraceProjectionStore = Arc<dyn RetrievalTraceProjectionStore>;
+pub type SharedSearchIndex = Arc<dyn SearchIndex>;
+pub type SharedVectorIndex = Arc<dyn VectorIndex>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateKnowledgeSourceOutcome {
@@ -431,6 +434,356 @@ impl DocumentChunkProjectionStore for InMemoryDocumentChunkProjectionStore {
             })
             .cloned()
             .collect())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchHit {
+    pub document_chunk_id: DocumentChunkId,
+    pub score: f32,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VectorHit {
+    pub document_chunk_id: DocumentChunkId,
+    pub score: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchResult {
+    pub chunk: DocumentChunkRecord,
+    pub source: KnowledgeSourceRecord,
+    pub score: f32,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchResponse {
+    pub query: String,
+    pub hits: Vec<SearchResult>,
+    pub retrieval_trace_id: RetrievalTraceId,
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum RetrievalServiceError {
+    #[error("retrieval input is invalid")]
+    InvalidInput,
+    #[error("run id is not known to the retrieval service")]
+    UnknownRun,
+    #[error("search index failed: {0}")]
+    Index(String),
+    #[error("operation ledger failed: {0}")]
+    Ledger(String),
+    #[error("retrieval projection failed: {0}")]
+    Projection(String),
+}
+
+#[async_trait]
+pub trait SearchIndex: Send + Sync {
+    async fn rebuild(&self, chunks: Vec<DocumentChunkRecord>) -> Result<(), RetrievalServiceError>;
+    async fn search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchHit>, RetrievalServiceError>;
+}
+
+#[async_trait]
+pub trait VectorIndex: Send + Sync {
+    async fn upsert(&self, chunks: Vec<DocumentChunkRecord>) -> Result<(), RetrievalServiceError>;
+    async fn search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<VectorHit>, RetrievalServiceError>;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct InMemorySearchIndex {
+    chunks: Arc<RwLock<Vec<DocumentChunkRecord>>>,
+}
+
+impl InMemorySearchIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn shared(self) -> SharedSearchIndex {
+        Arc::new(self)
+    }
+}
+
+#[async_trait]
+impl SearchIndex for InMemorySearchIndex {
+    async fn rebuild(&self, chunks: Vec<DocumentChunkRecord>) -> Result<(), RetrievalServiceError> {
+        *self.chunks.write().await = chunks;
+        Ok(())
+    }
+
+    async fn search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchHit>, RetrievalServiceError> {
+        let query = query.trim().to_lowercase();
+        if query.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let chunks = self.chunks.read().await;
+        Ok(chunks
+            .iter()
+            .filter(|chunk| chunk.text.to_lowercase().contains(&query))
+            .take(limit)
+            .map(|chunk| SearchHit {
+                document_chunk_id: chunk.document_chunk_id,
+                score: 1.0,
+                reason: format!("keyword '{query}' matched chunk text"),
+            })
+            .collect())
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NoopVectorIndex;
+
+impl NoopVectorIndex {
+    pub fn new() -> Self {
+        Self
+    }
+
+    pub fn shared(self) -> SharedVectorIndex {
+        Arc::new(self)
+    }
+}
+
+#[async_trait]
+impl VectorIndex for NoopVectorIndex {
+    async fn upsert(&self, _chunks: Vec<DocumentChunkRecord>) -> Result<(), RetrievalServiceError> {
+        Ok(())
+    }
+
+    async fn search(
+        &self,
+        _query: &str,
+        _limit: usize,
+    ) -> Result<Vec<VectorHit>, RetrievalServiceError> {
+        Ok(Vec::new())
+    }
+}
+
+#[async_trait]
+pub trait RetrievalTraceProjectionStore: Send + Sync {
+    async fn apply(&self, event: &OperationEvent) -> Result<(), RetrievalServiceError>;
+    async fn list_retrieval_traces(
+        &self,
+    ) -> Result<Vec<RetrievalTraceRecord>, RetrievalServiceError>;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct InMemoryRetrievalTraceProjectionStore {
+    traces: Arc<RwLock<Vec<RetrievalTraceRecord>>>,
+}
+
+impl InMemoryRetrievalTraceProjectionStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn shared(self) -> SharedRetrievalTraceProjectionStore {
+        Arc::new(self)
+    }
+}
+
+#[async_trait]
+impl RetrievalTraceProjectionStore for InMemoryRetrievalTraceProjectionStore {
+    async fn apply(&self, event: &OperationEvent) -> Result<(), RetrievalServiceError> {
+        if let OperationEventKind::RetrievalTraceRecorded {
+            retrieval_trace_id,
+            query,
+            result_chunk_ids,
+            result_memory_ids,
+            explanation,
+        } = &event.kind
+        {
+            let mut traces = self.traces.write().await;
+            let record = RetrievalTraceRecord {
+                retrieval_trace_id: *retrieval_trace_id,
+                run_id: event.run_id,
+                query: query.clone(),
+                result_chunk_ids: result_chunk_ids.clone(),
+                result_memory_ids: result_memory_ids.clone(),
+                explanation: explanation.clone(),
+                created_at: event.occurred_at,
+            };
+
+            if let Some(existing) = traces
+                .iter_mut()
+                .find(|trace| trace.retrieval_trace_id == *retrieval_trace_id)
+            {
+                *existing = record;
+            } else {
+                traces.push(record);
+            }
+            traces.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        }
+
+        Ok(())
+    }
+
+    async fn list_retrieval_traces(
+        &self,
+    ) -> Result<Vec<RetrievalTraceRecord>, RetrievalServiceError> {
+        Ok(self.traces.read().await.clone())
+    }
+}
+
+#[derive(Clone)]
+pub struct ComposedRetrievalService {
+    ledger: SharedOperationLedger,
+    run_store: SharedRunProjectionStore,
+    source_projection: SharedKnowledgeSourceProjectionStore,
+    chunk_projection: SharedDocumentChunkProjectionStore,
+    memory_projection: SharedMemoryProjectionStore,
+    trace_projection: SharedRetrievalTraceProjectionStore,
+    search_index: SharedSearchIndex,
+}
+
+impl ComposedRetrievalService {
+    pub fn new(
+        ledger: SharedOperationLedger,
+        run_store: SharedRunProjectionStore,
+        source_projection: SharedKnowledgeSourceProjectionStore,
+        chunk_projection: SharedDocumentChunkProjectionStore,
+        memory_projection: SharedMemoryProjectionStore,
+        trace_projection: SharedRetrievalTraceProjectionStore,
+        search_index: SharedSearchIndex,
+    ) -> Self {
+        Self {
+            ledger,
+            run_store,
+            source_projection,
+            chunk_projection,
+            memory_projection,
+            trace_projection,
+            search_index,
+        }
+    }
+
+    pub async fn search(
+        &self,
+        run_id: RunId,
+        query: String,
+        limit: usize,
+    ) -> Result<SearchResponse, RetrievalServiceError> {
+        let query = validate_retrieval_query(query)?;
+        validate_retrieval_limit(limit)?;
+        self.ensure_known_run(run_id).await?;
+
+        let chunks = self
+            .chunk_projection
+            .list_chunks(None)
+            .await
+            .map_err(|error| RetrievalServiceError::Projection(error.to_string()))?;
+        self.search_index.rebuild(chunks.clone()).await?;
+        let hits = self.search_index.search(&query, limit).await?;
+
+        let _memories = self
+            .memory_projection
+            .list_memories(None)
+            .await
+            .map_err(|error| RetrievalServiceError::Projection(error.to_string()))?;
+        let mut results = Vec::with_capacity(hits.len());
+        let mut result_chunk_ids = Vec::with_capacity(hits.len());
+        for hit in hits {
+            let chunk = chunks
+                .iter()
+                .find(|chunk| chunk.document_chunk_id == hit.document_chunk_id)
+                .cloned()
+                .ok_or_else(|| {
+                    RetrievalServiceError::Projection(
+                        "search index returned unknown chunk".to_string(),
+                    )
+                })?;
+            let source = self
+                .source_projection
+                .get_source(chunk.knowledge_source_id)
+                .await
+                .map_err(|error| RetrievalServiceError::Projection(error.to_string()))?;
+            result_chunk_ids.push(chunk.document_chunk_id);
+            results.push(SearchResult {
+                chunk,
+                source,
+                score: hit.score,
+                reason: hit.reason,
+            });
+        }
+
+        let retrieval_trace_id = RetrievalTraceId::new();
+        let explanation = format!(
+            "M6 deterministic keyword retrieval matched {} chunk(s) for query '{query}'",
+            result_chunk_ids.len()
+        );
+        let event = OperationEvent::new_retrieval_trace_recorded(
+            run_id,
+            retrieval_trace_id,
+            query.clone(),
+            result_chunk_ids,
+            Vec::new(),
+            explanation,
+        );
+        self.ledger
+            .append(event.clone())
+            .await
+            .map_err(|error| RetrievalServiceError::Ledger(error.to_string()))?;
+        self.run_store
+            .apply(&event)
+            .await
+            .map_err(|error| RetrievalServiceError::Projection(error.to_string()))?;
+        self.trace_projection.apply(&event).await?;
+
+        Ok(SearchResponse {
+            query,
+            hits: results,
+            retrieval_trace_id,
+        })
+    }
+
+    pub async fn list_retrieval_traces(
+        &self,
+    ) -> Result<Vec<RetrievalTraceRecord>, RetrievalServiceError> {
+        self.trace_projection.list_retrieval_traces().await
+    }
+
+    async fn ensure_known_run(&self, run_id: RunId) -> Result<(), RetrievalServiceError> {
+        let runs = self
+            .run_store
+            .list_runs()
+            .await
+            .map_err(|error| RetrievalServiceError::Projection(error.to_string()))?;
+        if runs.iter().any(|run| run.run_id == run_id) {
+            Ok(())
+        } else {
+            Err(RetrievalServiceError::UnknownRun)
+        }
+    }
+}
+
+fn validate_retrieval_query(query: String) -> Result<String, RetrievalServiceError> {
+    let query = query.trim().to_string();
+    if query.is_empty() {
+        Err(RetrievalServiceError::InvalidInput)
+    } else {
+        Ok(query)
+    }
+}
+
+fn validate_retrieval_limit(limit: usize) -> Result<(), RetrievalServiceError> {
+    if (1..=50).contains(&limit) {
+        Ok(())
+    } else {
+        Err(RetrievalServiceError::InvalidInput)
     }
 }
 
@@ -869,6 +1222,98 @@ mod tests {
         assert_eq!(chunks[0].char_end, 12);
         assert_eq!(chunks[1].text, "jklmnopqrstu");
         assert_eq!(chunks[1].char_start, 9);
+    }
+
+    #[tokio::test]
+    async fn in_memory_search_index_returns_keyword_hits_with_reason() {
+        let run_id = RunId::new();
+        let source_id = KnowledgeSourceId::new();
+        let chunk = DocumentChunkRecord {
+            document_chunk_id: DocumentChunkId::new(),
+            knowledge_source_id: source_id,
+            run_id,
+            sequence: 0,
+            text: "SQLite-first deterministic retrieval".to_string(),
+            char_start: 0,
+            char_end: 36,
+            created_at: OffsetDateTime::now_utc(),
+        };
+        let index = InMemorySearchIndex::new();
+        index.rebuild(vec![chunk.clone()]).await.unwrap();
+
+        let hits = index.search("deterministic", 10).await.unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].document_chunk_id, chunk.document_chunk_id);
+        assert_eq!(hits[0].score, 1.0);
+        assert!(hits[0].reason.contains("deterministic"));
+    }
+
+    #[tokio::test]
+    async fn composed_retrieval_service_searches_chunks_and_records_trace() {
+        let ledger = crate::InMemoryOperationLedger::new().shared();
+        let run_store = crate::InMemoryRunProjectionStore::new().shared();
+        let source_projection = InMemoryKnowledgeSourceProjectionStore::new().shared();
+        let chunk_projection = InMemoryDocumentChunkProjectionStore::new().shared();
+        let memory_projection = InMemoryMemoryProjectionStore::new().shared();
+        let trace_projection = InMemoryRetrievalTraceProjectionStore::new().shared();
+
+        let run_service = crate::ComposedRunService::new(ledger.clone(), run_store.clone());
+        let run = run_service.create_run("Search".to_string()).await.unwrap();
+        let source_id = KnowledgeSourceId::new();
+        source_projection
+            .apply(&OperationEvent::new_knowledge_source_created(
+                run.run_id,
+                source_id,
+                KnowledgeSourceKind::Manual,
+                None,
+                None,
+                "Manual",
+                "SQLite deterministic retrieval",
+            ))
+            .await
+            .unwrap();
+        let chunk_id = DocumentChunkId::new();
+        chunk_projection
+            .apply(&OperationEvent::new_document_chunk_created(
+                run.run_id,
+                chunk_id,
+                source_id,
+                0,
+                "SQLite deterministic retrieval",
+                0,
+                30,
+            ))
+            .await
+            .unwrap();
+
+        let service = ComposedRetrievalService::new(
+            ledger,
+            run_store,
+            source_projection,
+            chunk_projection,
+            memory_projection,
+            trace_projection,
+            InMemorySearchIndex::new().shared(),
+        );
+
+        let response = service
+            .search(run.run_id, "deterministic".to_string(), 5)
+            .await
+            .unwrap();
+
+        assert_eq!(response.query, "deterministic");
+        assert_eq!(response.hits.len(), 1);
+        assert_eq!(response.hits[0].chunk.document_chunk_id, chunk_id);
+        assert!(response.hits[0]
+            .reason
+            .contains("keyword 'deterministic' matched chunk text"));
+        let traces = service.list_retrieval_traces().await.unwrap();
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].retrieval_trace_id, response.retrieval_trace_id);
+        assert!(traces[0]
+            .explanation
+            .starts_with("M6 deterministic keyword retrieval"));
     }
 
     #[tokio::test]

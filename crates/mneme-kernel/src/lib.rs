@@ -26,13 +26,17 @@ pub use ids::{
 };
 pub use knowledge::{
     ChunkDraft, ChunkTextSplitter, ComposedChunkService, ComposedKnowledgeService,
-    ComposedMemoryService, CreateKnowledgeSourceOutcome, DocumentChunkProjectionStore,
-    DocumentChunkRecord, InMemoryDocumentChunkProjectionStore,
-    InMemoryKnowledgeSourceProjectionStore, InMemoryMemoryProjectionStore, KnowledgeServiceError,
+    ComposedMemoryService, ComposedRetrievalService, CreateKnowledgeSourceOutcome,
+    DocumentChunkProjectionStore, DocumentChunkRecord, InMemoryDocumentChunkProjectionStore,
+    InMemoryKnowledgeSourceProjectionStore, InMemoryMemoryProjectionStore,
+    InMemoryRetrievalTraceProjectionStore, InMemorySearchIndex, KnowledgeServiceError,
     KnowledgeSourceKind, KnowledgeSourceProjectionStore, KnowledgeSourceRecord, MemoryKind,
-    MemoryProjectionStore, MemoryRecord, MemoryServiceError, RecordMemoryOutcome,
-    RetrievalTraceRecord, SharedDocumentChunkProjectionStore, SharedKnowledgeSourceProjectionStore,
-    SharedMemoryProjectionStore,
+    MemoryProjectionStore, MemoryRecord, MemoryServiceError, NoopVectorIndex, RecordMemoryOutcome,
+    RetrievalServiceError, RetrievalTraceProjectionStore, RetrievalTraceRecord, SearchHit,
+    SearchIndex, SearchResponse, SearchResult, SharedDocumentChunkProjectionStore,
+    SharedKnowledgeSourceProjectionStore, SharedMemoryProjectionStore,
+    SharedRetrievalTraceProjectionStore, SharedSearchIndex, SharedVectorIndex, VectorHit,
+    VectorIndex,
 };
 pub use ledger::{InMemoryOperationLedger, LedgerError, OperationLedger, SharedOperationLedger};
 pub use projections::{RunProjection, RunProjector, RunStatus};
@@ -47,7 +51,7 @@ pub use storage::sqlite::{
     SqliteArtifactProjectionStore, SqliteArtifactService, SqliteChunkService,
     SqliteContextBundleProjectionStore, SqliteContextService, SqliteDocumentChunkProjectionStore,
     SqliteKnowledgeService, SqliteKnowledgeSourceProjectionStore, SqliteMemoryProjectionStore,
-    SqliteMemoryService,
+    SqliteMemoryService, SqliteRetrievalService, SqliteRetrievalTraceProjectionStore,
 };
 pub use storage::{
     SqliteOperationLedger, SqliteRunProjectionStore, SqliteRunService, SqliteStore,

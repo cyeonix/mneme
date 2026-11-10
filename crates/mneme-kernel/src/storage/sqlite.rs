@@ -6,11 +6,12 @@ use crate::{
     DocumentChunkRecord, EventId, KnowledgeServiceError, KnowledgeSourceId, KnowledgeSourceKind,
     KnowledgeSourceProjectionStore, KnowledgeSourceRecord, LedgerError, MemoryId, MemoryKind,
     MemoryProjectionStore, MemoryRecord, MemoryServiceError, OperationEvent, OperationEventKind,
-    OperationLedger, RecordMemoryOutcome, RunId, RunLifecycleOutcome, RunProjection,
-    RunProjectionError, RunProjectionStore, RunProjector, RunService, RunServiceError, RunStatus,
-    SharedArtifactContentStore, SharedOperationLedger, SharedRunProjectionStore, SharedRunService,
-    ToolApprovalDecision, ToolApprovalPolicy, ToolCallId, ToolCallOutcome, ToolEffect,
-    ToolLifecycleOutcome,
+    OperationLedger, RecordMemoryOutcome, RetrievalServiceError, RetrievalTraceProjectionStore,
+    RetrievalTraceRecord, RunId, RunLifecycleOutcome, RunProjection, RunProjectionError,
+    RunProjectionStore, RunProjector, RunService, RunServiceError, RunStatus, SearchResponse,
+    SearchResult, SharedArtifactContentStore, SharedOperationLedger, SharedRunProjectionStore,
+    SharedRunService, ToolApprovalDecision, ToolApprovalPolicy, ToolCallId, ToolCallOutcome,
+    ToolEffect, ToolLifecycleOutcome,
 };
 use async_trait::async_trait;
 use serde_json::Value;
@@ -507,6 +508,169 @@ impl SqliteMemoryService {
             .rebuild(&events)
             .await?;
         self.list_memories(None).await
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SqliteRetrievalService {
+    store: SqliteStore,
+}
+
+impl SqliteRetrievalService {
+    pub fn new(store: SqliteStore) -> Self {
+        Self { store }
+    }
+
+    pub async fn search(
+        &self,
+        run_id: RunId,
+        query: String,
+        limit: usize,
+    ) -> Result<SearchResponse, RetrievalServiceError> {
+        let query = non_blank_retrieval_input(query)?;
+        ensure_valid_retrieval_limit(limit)?;
+        let mut tx = self
+            .store
+            .pool()
+            .begin()
+            .await
+            .map_err(|error| RetrievalServiceError::Ledger(error.to_string()))?;
+        ensure_sqlite_retrieval_run(&mut tx, run_id).await?;
+
+        let rows = sqlx::query_as::<_, StoredSearchResult>(
+            "select c.document_chunk_id, c.knowledge_source_id, c.run_id, c.sequence, c.text, c.char_start, c.char_end, c.created_at, s.source_kind, s.artifact_id, s.context_bundle_id, s.title, s.summary, s.created_at as source_created_at from document_chunks c join knowledge_sources s on s.knowledge_source_id = c.knowledge_source_id where lower(c.text) like '%' || lower(?1) || '%' order by c.knowledge_source_id asc, c.sequence asc limit ?2",
+        )
+        .bind(&query)
+        .bind(limit as i64)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|error| RetrievalServiceError::Projection(error.to_string()))?;
+
+        let mut hits = Vec::with_capacity(rows.len());
+        let mut result_chunk_ids = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut result = SearchResult::try_from(row)?;
+            result.reason = format!("keyword '{query}' matched chunk text");
+            result_chunk_ids.push(result.chunk.document_chunk_id);
+            hits.push(result);
+        }
+
+        let retrieval_trace_id = crate::RetrievalTraceId::new();
+        let explanation = format!(
+            "M6 deterministic keyword retrieval matched {} chunk(s) for query '{query}'",
+            result_chunk_ids.len()
+        );
+        let event = OperationEvent::new_retrieval_trace_recorded(
+            run_id,
+            retrieval_trace_id,
+            query.clone(),
+            result_chunk_ids,
+            Vec::new(),
+            explanation,
+        );
+        insert_operation_event(&mut tx, &event)
+            .await
+            .map_err(|error| RetrievalServiceError::Ledger(error.to_string()))?;
+        apply_retrieval_trace_recorded_to_sqlite_projection(&mut tx, &event).await?;
+        update_running_run_for_retrieval_trace_recorded(&mut tx, &event).await?;
+        tx.commit()
+            .await
+            .map_err(|error| RetrievalServiceError::Ledger(error.to_string()))?;
+
+        Ok(SearchResponse {
+            query,
+            hits,
+            retrieval_trace_id,
+        })
+    }
+
+    pub async fn list_retrieval_traces(
+        &self,
+    ) -> Result<Vec<RetrievalTraceRecord>, RetrievalServiceError> {
+        SqliteRetrievalTraceProjectionStore::new(self.store.clone())
+            .list_retrieval_traces()
+            .await
+    }
+
+    pub async fn rebuild_retrieval_trace_projections(
+        &self,
+    ) -> Result<Vec<RetrievalTraceRecord>, RetrievalServiceError> {
+        let events = self
+            .store
+            .list_events()
+            .await
+            .map_err(|error| RetrievalServiceError::Ledger(error.to_string()))?;
+        SqliteRetrievalTraceProjectionStore::new(self.store.clone())
+            .rebuild(&events)
+            .await?;
+        self.list_retrieval_traces().await
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SqliteRetrievalTraceProjectionStore {
+    store: SqliteStore,
+}
+
+impl SqliteRetrievalTraceProjectionStore {
+    pub fn new(store: SqliteStore) -> Self {
+        Self { store }
+    }
+
+    pub async fn rebuild(&self, events: &[OperationEvent]) -> Result<(), RetrievalServiceError> {
+        let mut tx = self
+            .store
+            .pool()
+            .begin()
+            .await
+            .map_err(|error| RetrievalServiceError::Projection(error.to_string()))?;
+
+        sqlx::query("delete from retrieval_traces")
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| RetrievalServiceError::Projection(error.to_string()))?;
+
+        for event in events {
+            apply_retrieval_trace_recorded_to_sqlite_projection(&mut tx, event).await?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|error| RetrievalServiceError::Projection(error.to_string()))?;
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl RetrievalTraceProjectionStore for SqliteRetrievalTraceProjectionStore {
+    async fn apply(&self, event: &OperationEvent) -> Result<(), RetrievalServiceError> {
+        let mut tx = self
+            .store
+            .pool()
+            .begin()
+            .await
+            .map_err(|error| RetrievalServiceError::Projection(error.to_string()))?;
+        apply_retrieval_trace_recorded_to_sqlite_projection(&mut tx, event).await?;
+        tx.commit()
+            .await
+            .map_err(|error| RetrievalServiceError::Projection(error.to_string()))?;
+        Ok(())
+    }
+
+    async fn list_retrieval_traces(
+        &self,
+    ) -> Result<Vec<RetrievalTraceRecord>, RetrievalServiceError> {
+        let rows = sqlx::query_as::<_, StoredRetrievalTraceRecord>(
+            "select retrieval_trace_id, run_id, query, result_chunk_ids_json, result_memory_ids_json, explanation, created_at from retrieval_traces order by created_at desc",
+        )
+        .fetch_all(self.store.pool())
+        .await
+        .map_err(|error| RetrievalServiceError::Projection(error.to_string()))?;
+
+        rows.into_iter()
+            .map(RetrievalTraceRecord::try_from)
+            .collect()
     }
 }
 
@@ -1147,6 +1311,84 @@ async fn apply_memory_recorded_to_sqlite_projection(
         .execute(&mut **tx)
         .await
         .map_err(|error| MemoryServiceError::Projection(error.to_string()))?;
+    }
+
+    Ok(())
+}
+
+async fn ensure_sqlite_retrieval_run(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: RunId,
+) -> Result<(), RetrievalServiceError> {
+    let run_exists: Option<String> =
+        sqlx::query_scalar("select run_id from runs where run_id = ?1")
+            .bind(run_id.to_string())
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|error| RetrievalServiceError::Projection(error.to_string()))?;
+    if run_exists.is_some() {
+        Ok(())
+    } else {
+        Err(RetrievalServiceError::UnknownRun)
+    }
+}
+
+async fn apply_retrieval_trace_recorded_to_sqlite_projection(
+    tx: &mut Transaction<'_, Sqlite>,
+    event: &OperationEvent,
+) -> Result<(), RetrievalServiceError> {
+    if let OperationEventKind::RetrievalTraceRecorded {
+        retrieval_trace_id,
+        query,
+        result_chunk_ids,
+        result_memory_ids,
+        explanation,
+    } = &event.kind
+    {
+        let occurred_at = event
+            .occurred_at
+            .format(&Rfc3339)
+            .map_err(|error| RetrievalServiceError::Projection(error.to_string()))?;
+        let result_chunk_ids_json = ids_to_json(result_chunk_ids)
+            .map_err(|error| RetrievalServiceError::Projection(error.to_string()))?;
+        let result_memory_ids_json = ids_to_json(result_memory_ids)
+            .map_err(|error| RetrievalServiceError::Projection(error.to_string()))?;
+        sqlx::query(
+            "insert into retrieval_traces (retrieval_trace_id, run_id, query, result_chunk_ids_json, result_memory_ids_json, explanation, created_at) values (?1, ?2, ?3, ?4, ?5, ?6, ?7) on conflict(retrieval_trace_id) do update set run_id = excluded.run_id, query = excluded.query, result_chunk_ids_json = excluded.result_chunk_ids_json, result_memory_ids_json = excluded.result_memory_ids_json, explanation = excluded.explanation, created_at = excluded.created_at",
+        )
+        .bind(retrieval_trace_id.to_string())
+        .bind(event.run_id.to_string())
+        .bind(query)
+        .bind(result_chunk_ids_json)
+        .bind(result_memory_ids_json)
+        .bind(explanation)
+        .bind(occurred_at)
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| RetrievalServiceError::Projection(error.to_string()))?;
+    }
+
+    Ok(())
+}
+
+async fn update_running_run_for_retrieval_trace_recorded(
+    tx: &mut Transaction<'_, Sqlite>,
+    event: &OperationEvent,
+) -> Result<(), RetrievalServiceError> {
+    if matches!(
+        event.kind,
+        OperationEventKind::RetrievalTraceRecorded { .. }
+    ) {
+        let occurred_at = event
+            .occurred_at
+            .format(&Rfc3339)
+            .map_err(|error| RetrievalServiceError::Projection(error.to_string()))?;
+        sqlx::query("update runs set updated_at = ?2 where run_id = ?1 and status = 'running'")
+            .bind(event.run_id.to_string())
+            .bind(occurred_at)
+            .execute(&mut **tx)
+            .await
+            .map_err(|error| RetrievalServiceError::Projection(error.to_string()))?;
     }
 
     Ok(())
@@ -2322,6 +2564,94 @@ impl TryFrom<StoredDocumentChunkRecord> for DocumentChunkRecord {
 }
 
 #[derive(sqlx::FromRow)]
+struct StoredRetrievalTraceRecord {
+    retrieval_trace_id: String,
+    run_id: String,
+    query: String,
+    result_chunk_ids_json: String,
+    result_memory_ids_json: String,
+    explanation: String,
+    created_at: String,
+}
+
+impl TryFrom<StoredRetrievalTraceRecord> for RetrievalTraceRecord {
+    type Error = RetrievalServiceError;
+
+    fn try_from(row: StoredRetrievalTraceRecord) -> Result<Self, Self::Error> {
+        Ok(Self {
+            retrieval_trace_id: crate::RetrievalTraceId::from_str(&row.retrieval_trace_id)
+                .map_err(|error| RetrievalServiceError::Projection(error.to_string()))?,
+            run_id: RunId::from_str(&row.run_id)
+                .map_err(|error| RetrievalServiceError::Projection(error.to_string()))?,
+            query: row.query,
+            result_chunk_ids: parse_retrieval_ids_json(&row.result_chunk_ids_json)?,
+            result_memory_ids: parse_retrieval_ids_json(&row.result_memory_ids_json)?,
+            explanation: row.explanation,
+            created_at: OffsetDateTime::parse(&row.created_at, &Rfc3339)
+                .map_err(|error| RetrievalServiceError::Projection(error.to_string()))?,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct StoredSearchResult {
+    document_chunk_id: String,
+    knowledge_source_id: String,
+    run_id: String,
+    sequence: i64,
+    text: String,
+    char_start: i64,
+    char_end: i64,
+    created_at: String,
+    source_kind: String,
+    artifact_id: Option<String>,
+    context_bundle_id: Option<String>,
+    title: String,
+    summary: String,
+    source_created_at: String,
+}
+
+impl TryFrom<StoredSearchResult> for SearchResult {
+    type Error = RetrievalServiceError;
+
+    fn try_from(row: StoredSearchResult) -> Result<Self, Self::Error> {
+        let knowledge_source_id = KnowledgeSourceId::from_str(&row.knowledge_source_id)
+            .map_err(|error| RetrievalServiceError::Projection(error.to_string()))?;
+        let query_reason = "keyword matched chunk text".to_string();
+        Ok(Self {
+            chunk: DocumentChunkRecord {
+                document_chunk_id: crate::DocumentChunkId::from_str(&row.document_chunk_id)
+                    .map_err(|error| RetrievalServiceError::Projection(error.to_string()))?,
+                knowledge_source_id,
+                run_id: RunId::from_str(&row.run_id)
+                    .map_err(|error| RetrievalServiceError::Projection(error.to_string()))?,
+                sequence: row.sequence,
+                text: row.text,
+                char_start: row.char_start,
+                char_end: row.char_end,
+                created_at: OffsetDateTime::parse(&row.created_at, &Rfc3339)
+                    .map_err(|error| RetrievalServiceError::Projection(error.to_string()))?,
+            },
+            source: KnowledgeSourceRecord {
+                knowledge_source_id,
+                run_id: RunId::from_str(&row.run_id)
+                    .map_err(|error| RetrievalServiceError::Projection(error.to_string()))?,
+                source_kind: knowledge_source_kind_from_storage(&row.source_kind)
+                    .map_err(|error| RetrievalServiceError::Projection(error.to_string()))?,
+                artifact_id: parse_optional_retrieval_id(row.artifact_id)?,
+                context_bundle_id: parse_optional_retrieval_id(row.context_bundle_id)?,
+                title: row.title,
+                summary: row.summary,
+                created_at: OffsetDateTime::parse(&row.source_created_at, &Rfc3339)
+                    .map_err(|error| RetrievalServiceError::Projection(error.to_string()))?,
+            },
+            score: 1.0,
+            reason: query_reason,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
 struct StoredRunProjection {
     run_id: String,
     status: String,
@@ -2527,6 +2857,49 @@ where
             T::from_str(&id).map_err(|error| ContextServiceError::Projection(error.to_string()))
         })
         .collect()
+}
+
+fn parse_retrieval_ids_json<T>(json: &str) -> Result<Vec<T>, RetrievalServiceError>
+where
+    T: FromStr,
+    T::Err: std::fmt::Display,
+{
+    let ids: Vec<String> = serde_json::from_str(json)
+        .map_err(|error| RetrievalServiceError::Projection(error.to_string()))?;
+    ids.into_iter()
+        .map(|id| {
+            T::from_str(&id).map_err(|error| RetrievalServiceError::Projection(error.to_string()))
+        })
+        .collect()
+}
+
+fn parse_optional_retrieval_id<T>(value: Option<String>) -> Result<Option<T>, RetrievalServiceError>
+where
+    T: FromStr,
+    T::Err: std::fmt::Display,
+{
+    value
+        .as_deref()
+        .map(|id| {
+            T::from_str(id).map_err(|error| RetrievalServiceError::Projection(error.to_string()))
+        })
+        .transpose()
+}
+
+fn non_blank_retrieval_input(value: String) -> Result<String, RetrievalServiceError> {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        return Err(RetrievalServiceError::InvalidInput);
+    }
+    Ok(value)
+}
+
+fn ensure_valid_retrieval_limit(limit: usize) -> Result<(), RetrievalServiceError> {
+    if (1..=50).contains(&limit) {
+        Ok(())
+    } else {
+        Err(RetrievalServiceError::InvalidInput)
+    }
 }
 
 fn status_from_storage(status: &str) -> Result<RunStatus, RunProjectionError> {
@@ -3017,6 +3390,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_retrieval_service_searches_chunks_and_records_trace() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let run_service = SqliteRunService::new(store.clone());
+        let run = run_service.create_run("Search".to_string()).await.unwrap();
+        let knowledge_service = SqliteKnowledgeService::new(store.clone());
+        let source = knowledge_service
+            .create_manual_source(
+                run.run_id,
+                "Manual".to_string(),
+                "SQLite deterministic retrieval".to_string(),
+            )
+            .await
+            .unwrap();
+        let chunk_service = SqliteChunkService::new(store.clone(), ChunkTextSplitter::new(1000, 0));
+        chunk_service
+            .chunk_source(source.knowledge_source_id)
+            .await
+            .unwrap();
+
+        let service = SqliteRetrievalService::new(store.clone());
+        let response = service
+            .search(run.run_id, "deterministic".to_string(), 10)
+            .await
+            .unwrap();
+
+        assert_eq!(response.query, "deterministic");
+        assert_eq!(response.hits.len(), 1);
+        assert!(response.hits[0].reason.contains("deterministic"));
+        assert_eq!(
+            response.hits[0].source.knowledge_source_id,
+            source.knowledge_source_id
+        );
+        let traces = service.list_retrieval_traces().await.unwrap();
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].retrieval_trace_id, response.retrieval_trace_id);
+        assert_eq!(
+            traces[0].result_chunk_ids,
+            vec![response.hits[0].chunk.document_chunk_id]
+        );
+        assert!(traces[0]
+            .explanation
+            .starts_with("M6 deterministic keyword retrieval"));
+    }
+
+    #[tokio::test]
     async fn sqlite_memory_service_rejects_invalid_confidence() {
         let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
         let run_service = SqliteRunService::new(store.clone());
@@ -3067,6 +3485,35 @@ mod tests {
         assert_eq!(memories.len(), 1);
         assert_eq!(memories[0].memory_id, memory_id);
         assert_eq!(memories[0].run_id, run_id);
+    }
+
+    #[tokio::test]
+    async fn sqlite_ledger_roundtrips_retrieval_trace_events_can_rebuild_projection() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let ledger = SqliteOperationLedger::new(store.clone());
+        let projection = SqliteRetrievalTraceProjectionStore::new(store);
+        let run_id = RunId::new();
+        let chunk_id = DocumentChunkId::new();
+        let memory_id = MemoryId::new();
+        let trace_id = RetrievalTraceId::new();
+        let event = OperationEvent::new_retrieval_trace_recorded(
+            run_id,
+            trace_id,
+            "deterministic",
+            vec![chunk_id],
+            vec![memory_id],
+            "M6 deterministic keyword retrieval matched one chunk",
+        );
+
+        ledger.append(event.clone()).await.unwrap();
+        projection.rebuild(&[event]).await.unwrap();
+
+        let traces = projection.list_retrieval_traces().await.unwrap();
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].retrieval_trace_id, trace_id);
+        assert_eq!(traces[0].run_id, run_id);
+        assert_eq!(traces[0].result_chunk_ids, vec![chunk_id]);
+        assert_eq!(traces[0].result_memory_ids, vec![memory_id]);
     }
 
     #[tokio::test]

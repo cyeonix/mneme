@@ -93,3 +93,16 @@ create table if not exists memory_records (
 
 create index if not exists idx_memory_records_source_created_at
   on memory_records(knowledge_source_id, created_at);
+
+create table if not exists retrieval_traces (
+  retrieval_trace_id text primary key,
+  run_id text not null,
+  query text not null,
+  result_chunk_ids_json text not null,
+  result_memory_ids_json text not null,
+  explanation text not null,
+  created_at text not null
+);
+
+create index if not exists idx_retrieval_traces_run_id_created_at
+  on retrieval_traces(run_id, created_at);
