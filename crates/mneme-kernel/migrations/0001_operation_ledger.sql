@@ -38,3 +38,16 @@ create table if not exists artifacts (
 
 create index if not exists idx_artifacts_run_id_created_at
   on artifacts(run_id, created_at desc);
+
+create table if not exists context_bundles (
+  context_bundle_id text primary key,
+  run_id text not null,
+  title text not null,
+  summary text not null,
+  artifact_ids text not null,
+  event_ids text not null,
+  created_at text not null
+);
+
+create index if not exists idx_context_bundles_run_id_created_at
+  on context_bundles(run_id, created_at desc);

@@ -12,6 +12,7 @@ use tokio::sync::RwLock;
 
 pub type SharedArtifactContentStore = Arc<dyn ArtifactContentStore>;
 pub type SharedArtifactProjectionStore = Arc<dyn ArtifactProjectionStore>;
+pub type SharedContextBundleProjectionStore = Arc<dyn ContextBundleProjectionStore>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -62,6 +63,29 @@ pub struct CreateArtifactOutcome {
     pub artifact_id: ArtifactId,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateContextBundleOutcome {
+    pub context_bundle_id: ContextBundleId,
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum ContextServiceError {
+    #[error("context bundle input must not be blank")]
+    InvalidInput,
+    #[error("run id is not known to the context service")]
+    UnknownRun,
+    #[error("context bundle id is not known to the context service")]
+    UnknownContextBundle,
+    #[error("artifact id is not known to the context service")]
+    UnknownArtifact,
+    #[error("event id is not known to the context service")]
+    UnknownEvent,
+    #[error("operation ledger failed: {0}")]
+    Ledger(String),
+    #[error("context projection failed: {0}")]
+    Projection(String),
+}
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ArtifactServiceError {
     #[error("artifact input must not be blank")]
@@ -107,6 +131,16 @@ pub trait ArtifactProjectionStore: Send + Sync {
         &self,
         artifact_id: ArtifactId,
     ) -> Result<ArtifactRecord, ArtifactServiceError>;
+}
+
+#[async_trait]
+pub trait ContextBundleProjectionStore: Send + Sync {
+    async fn apply(&self, event: &OperationEvent) -> Result<(), ContextServiceError>;
+    async fn list_context_bundles(&self) -> Result<Vec<ContextBundleRecord>, ContextServiceError>;
+    async fn get_context_bundle(
+        &self,
+        context_bundle_id: ContextBundleId,
+    ) -> Result<ContextBundleRecord, ContextServiceError>;
 }
 
 #[derive(Debug, Clone, Default)]
@@ -215,6 +249,198 @@ impl ArtifactProjectionStore for InMemoryArtifactProjectionStore {
             .find(|artifact| artifact.artifact_id == artifact_id)
             .cloned()
             .ok_or(ArtifactServiceError::UnknownArtifact)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct InMemoryContextBundleProjectionStore {
+    context_bundles: Arc<RwLock<Vec<ContextBundleRecord>>>,
+}
+
+impl InMemoryContextBundleProjectionStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn shared(self) -> SharedContextBundleProjectionStore {
+        Arc::new(self)
+    }
+}
+
+#[async_trait]
+impl ContextBundleProjectionStore for InMemoryContextBundleProjectionStore {
+    async fn apply(&self, event: &OperationEvent) -> Result<(), ContextServiceError> {
+        if let OperationEventKind::ContextBundleCreated {
+            context_bundle_id,
+            title,
+            summary,
+            artifact_ids,
+            event_ids,
+        } = &event.kind
+        {
+            let mut context_bundles = self.context_bundles.write().await;
+            let record = ContextBundleRecord {
+                context_bundle_id: *context_bundle_id,
+                run_id: event.run_id,
+                title: title.clone(),
+                summary: summary.clone(),
+                artifact_ids: artifact_ids.clone(),
+                event_ids: event_ids.clone(),
+                created_at: event.occurred_at,
+            };
+
+            if let Some(existing) = context_bundles
+                .iter_mut()
+                .find(|bundle| bundle.context_bundle_id == *context_bundle_id)
+            {
+                *existing = record;
+            } else {
+                context_bundles.push(record);
+            }
+            context_bundles.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        }
+
+        Ok(())
+    }
+
+    async fn list_context_bundles(&self) -> Result<Vec<ContextBundleRecord>, ContextServiceError> {
+        Ok(self.context_bundles.read().await.clone())
+    }
+
+    async fn get_context_bundle(
+        &self,
+        context_bundle_id: ContextBundleId,
+    ) -> Result<ContextBundleRecord, ContextServiceError> {
+        self.context_bundles
+            .read()
+            .await
+            .iter()
+            .find(|bundle| bundle.context_bundle_id == context_bundle_id)
+            .cloned()
+            .ok_or(ContextServiceError::UnknownContextBundle)
+    }
+}
+
+#[derive(Clone)]
+pub struct ComposedContextService {
+    ledger: SharedOperationLedger,
+    run_store: SharedRunProjectionStore,
+    artifact_projection: SharedArtifactProjectionStore,
+    context_projection: SharedContextBundleProjectionStore,
+}
+
+impl ComposedContextService {
+    pub fn new(
+        ledger: SharedOperationLedger,
+        run_store: SharedRunProjectionStore,
+        artifact_projection: SharedArtifactProjectionStore,
+        context_projection: SharedContextBundleProjectionStore,
+    ) -> Self {
+        Self {
+            ledger,
+            run_store,
+            artifact_projection,
+            context_projection,
+        }
+    }
+
+    async fn ensure_known_run(&self, run_id: RunId) -> Result<(), ContextServiceError> {
+        let runs = self
+            .run_store
+            .list_runs()
+            .await
+            .map_err(|error| ContextServiceError::Projection(error.to_string()))?;
+        if runs.iter().any(|run| run.run_id == run_id) {
+            Ok(())
+        } else {
+            Err(ContextServiceError::UnknownRun)
+        }
+    }
+
+    async fn ensure_known_artifacts(
+        &self,
+        artifact_ids: &[ArtifactId],
+    ) -> Result<(), ContextServiceError> {
+        for artifact_id in artifact_ids {
+            match self.artifact_projection.get_artifact(*artifact_id).await {
+                Ok(_) => {}
+                Err(ArtifactServiceError::UnknownArtifact) => {
+                    return Err(ContextServiceError::UnknownArtifact);
+                }
+                Err(error) => return Err(ContextServiceError::Projection(error.to_string())),
+            }
+        }
+        Ok(())
+    }
+
+    async fn ensure_known_events(&self, event_ids: &[EventId]) -> Result<(), ContextServiceError> {
+        if event_ids.is_empty() {
+            return Ok(());
+        }
+
+        let events = self
+            .ledger
+            .list()
+            .await
+            .map_err(|error| ContextServiceError::Ledger(error.to_string()))?;
+        for event_id in event_ids {
+            if !events.iter().any(|event| event.id == *event_id) {
+                return Err(ContextServiceError::UnknownEvent);
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn create_context_bundle(
+        &self,
+        run_id: RunId,
+        title: String,
+        summary: String,
+        artifact_ids: Vec<ArtifactId>,
+        event_ids: Vec<EventId>,
+    ) -> Result<CreateContextBundleOutcome, ContextServiceError> {
+        let title = non_blank_context_input(title)?;
+        let summary = non_blank_context_input(summary)?;
+        self.ensure_known_run(run_id).await?;
+        self.ensure_known_artifacts(&artifact_ids).await?;
+        self.ensure_known_events(&event_ids).await?;
+
+        let context_bundle_id = ContextBundleId::new();
+        let event = OperationEvent::new_context_bundle_created(
+            run_id,
+            context_bundle_id,
+            title,
+            summary,
+            artifact_ids,
+            event_ids,
+        );
+
+        self.ledger
+            .append(event.clone())
+            .await
+            .map_err(|error| ContextServiceError::Ledger(error.to_string()))?;
+        self.run_store
+            .apply(&event)
+            .await
+            .map_err(|error| ContextServiceError::Projection(error.to_string()))?;
+        self.context_projection.apply(&event).await?;
+
+        Ok(CreateContextBundleOutcome { context_bundle_id })
+    }
+
+    pub async fn list_context_bundles(
+        &self,
+    ) -> Result<Vec<ContextBundleRecord>, ContextServiceError> {
+        self.context_projection.list_context_bundles().await
+    }
+
+    pub async fn get_context_bundle(
+        &self,
+        context_bundle_id: ContextBundleId,
+    ) -> Result<ContextBundleRecord, ContextServiceError> {
+        self.context_projection
+            .get_context_bundle(context_bundle_id)
+            .await
     }
 }
 
@@ -360,6 +586,14 @@ impl ArtifactContentStore for LocalArtifactContentStore {
     }
 }
 
+fn non_blank_context_input(value: String) -> Result<String, ContextServiceError> {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        return Err(ContextServiceError::InvalidInput);
+    }
+    Ok(value)
+}
+
 fn non_blank(value: String) -> Result<String, ArtifactServiceError> {
     let value = value.trim().to_string();
     if value.is_empty() {
@@ -441,6 +675,130 @@ mod tests {
         assert_eq!(artifacts.len(), 1);
         assert_eq!(artifacts[0].artifact_id, outcome.artifact_id);
         assert_eq!(detail.content.as_deref(), Some("# Summary"));
+    }
+
+    #[tokio::test]
+    async fn composed_context_service_creates_lists_and_gets_context_bundle() {
+        let ledger = crate::InMemoryOperationLedger::new().shared();
+        let run_store = crate::InMemoryRunProjectionStore::new().shared();
+        let run_service = crate::ComposedRunService::new(ledger.clone(), run_store.clone());
+        let run = run_service
+            .create_run("explain context".to_string())
+            .await
+            .unwrap();
+        let artifact_projection = InMemoryArtifactProjectionStore::new().shared();
+        let context_projection = InMemoryContextBundleProjectionStore::new().shared();
+        let service =
+            ComposedContextService::new(ledger, run_store, artifact_projection, context_projection);
+
+        let outcome = service
+            .create_context_bundle(
+                run.run_id,
+                "Debug context".to_string(),
+                "User request and selected events".to_string(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let bundles = service.list_context_bundles().await.unwrap();
+        let bundle = service
+            .get_context_bundle(outcome.context_bundle_id)
+            .await
+            .unwrap();
+
+        assert_eq!(bundles.len(), 1);
+        assert_eq!(bundle.context_bundle_id, outcome.context_bundle_id);
+        assert_eq!(bundle.summary, "User request and selected events");
+    }
+
+    #[tokio::test]
+    async fn composed_context_service_validates_inputs_and_references() {
+        let ledger = crate::InMemoryOperationLedger::new().shared();
+        let run_store = crate::InMemoryRunProjectionStore::new().shared();
+        let artifact_projection = InMemoryArtifactProjectionStore::new().shared();
+        let context_projection = InMemoryContextBundleProjectionStore::new().shared();
+        let service = ComposedContextService::new(
+            ledger.clone(),
+            run_store.clone(),
+            artifact_projection,
+            context_projection,
+        );
+        let run_service = crate::ComposedRunService::new(ledger.clone(), run_store);
+        let run = run_service
+            .create_run("validate context".to_string())
+            .await
+            .unwrap();
+        let existing_event_id = ledger.list().await.unwrap()[0].id;
+
+        assert_eq!(
+            service
+                .create_context_bundle(
+                    run.run_id,
+                    "   ".to_string(),
+                    "summary".to_string(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .await
+                .unwrap_err(),
+            ContextServiceError::InvalidInput
+        );
+        assert_eq!(
+            service
+                .create_context_bundle(
+                    run.run_id,
+                    "title".to_string(),
+                    "   ".to_string(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .await
+                .unwrap_err(),
+            ContextServiceError::InvalidInput
+        );
+        assert_eq!(
+            service
+                .create_context_bundle(
+                    RunId::new(),
+                    "title".to_string(),
+                    "summary".to_string(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .await
+                .unwrap_err(),
+            ContextServiceError::UnknownRun
+        );
+        assert_eq!(
+            service
+                .create_context_bundle(
+                    run.run_id,
+                    "title".to_string(),
+                    "summary".to_string(),
+                    vec![ArtifactId::new()],
+                    Vec::new(),
+                )
+                .await
+                .unwrap_err(),
+            ContextServiceError::UnknownArtifact
+        );
+        assert_eq!(
+            service
+                .create_context_bundle(
+                    run.run_id,
+                    "title".to_string(),
+                    "summary".to_string(),
+                    Vec::new(),
+                    vec![EventId::new()],
+                )
+                .await
+                .unwrap_err(),
+            ContextServiceError::UnknownEvent
+        );
+        assert!(service.list_context_bundles().await.unwrap().is_empty());
+        assert_eq!(ledger.list().await.unwrap()[0].id, existing_event_id);
     }
 
     #[tokio::test]

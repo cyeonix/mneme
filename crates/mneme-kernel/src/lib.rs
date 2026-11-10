@@ -11,10 +11,11 @@ pub mod tools;
 
 pub use artifacts::{
     ArtifactContentStore, ArtifactDetail, ArtifactKind, ArtifactProjectionStore, ArtifactRecord,
-    ArtifactServiceError, ArtifactStoreError, ComposedArtifactService, ContextBundleRecord,
-    CreateArtifactOutcome, InMemoryArtifactContentStore, InMemoryArtifactProjectionStore,
-    LocalArtifactContentStore, SharedArtifactContentStore, SharedArtifactProjectionStore,
-    StoredArtifactContent,
+    ArtifactServiceError, ArtifactStoreError, ComposedArtifactService, ComposedContextService,
+    ContextBundleProjectionStore, ContextBundleRecord, ContextServiceError, CreateArtifactOutcome,
+    CreateContextBundleOutcome, InMemoryArtifactContentStore, InMemoryArtifactProjectionStore,
+    InMemoryContextBundleProjectionStore, LocalArtifactContentStore, SharedArtifactContentStore,
+    SharedArtifactProjectionStore, SharedContextBundleProjectionStore, StoredArtifactContent,
 };
 pub use events::{OperationEvent, OperationEventKind};
 pub use health::{kernel_health, KernelHealth};
@@ -28,7 +29,10 @@ pub use service::{
     ComposedRunService, CreateRunOutcome, RunLifecycleOutcome, RunService, RunServiceError,
     SharedRunService, ToolCallOutcome, ToolLifecycleOutcome,
 };
-pub use storage::sqlite::{SqliteArtifactProjectionStore, SqliteArtifactService};
+pub use storage::sqlite::{
+    SqliteArtifactProjectionStore, SqliteArtifactService, SqliteContextBundleProjectionStore,
+    SqliteContextService,
+};
 pub use storage::{
     SqliteOperationLedger, SqliteRunProjectionStore, SqliteRunService, SqliteStore,
     SqliteStoreError,

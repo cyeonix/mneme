@@ -1,7 +1,8 @@
 use crate::{
     ArtifactId, ArtifactKind, ArtifactProjectionStore, ArtifactRecord, ArtifactServiceError,
-    CreateArtifactOutcome, CreateRunOutcome, EventId, LedgerError, OperationEvent,
-    OperationEventKind, OperationLedger, RunId, RunLifecycleOutcome, RunProjection,
+    ContextBundleId, ContextBundleProjectionStore, ContextBundleRecord, ContextServiceError,
+    CreateArtifactOutcome, CreateContextBundleOutcome, CreateRunOutcome, EventId, LedgerError,
+    OperationEvent, OperationEventKind, OperationLedger, RunId, RunLifecycleOutcome, RunProjection,
     RunProjectionError, RunProjectionStore, RunProjector, RunService, RunServiceError, RunStatus,
     SharedArtifactContentStore, SharedOperationLedger, SharedRunProjectionStore, SharedRunService,
     ToolApprovalDecision, ToolApprovalPolicy, ToolCallId, ToolCallOutcome, ToolEffect,
@@ -175,6 +176,285 @@ impl SqliteArtifactService {
 
         Ok(crate::ArtifactDetail { artifact, content })
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct SqliteContextService {
+    store: SqliteStore,
+}
+
+impl SqliteContextService {
+    pub fn new(store: SqliteStore) -> Self {
+        Self { store }
+    }
+
+    pub async fn create_context_bundle(
+        &self,
+        run_id: RunId,
+        title: String,
+        summary: String,
+        artifact_ids: Vec<ArtifactId>,
+        event_ids: Vec<EventId>,
+    ) -> Result<CreateContextBundleOutcome, ContextServiceError> {
+        let title = non_blank_context_input(title)?;
+        let summary = non_blank_context_input(summary)?;
+        let mut tx = self
+            .store
+            .pool()
+            .begin()
+            .await
+            .map_err(|error| ContextServiceError::Ledger(error.to_string()))?;
+
+        ensure_sqlite_context_references(&mut tx, run_id, &artifact_ids, &event_ids).await?;
+
+        let context_bundle_id = ContextBundleId::new();
+        let event = OperationEvent::new_context_bundle_created(
+            run_id,
+            context_bundle_id,
+            title,
+            summary,
+            artifact_ids,
+            event_ids,
+        );
+        let occurred_at = event
+            .occurred_at
+            .format(&Rfc3339)
+            .map_err(|error| ContextServiceError::Ledger(error.to_string()))?;
+        let payload_json = serde_json::to_string(&event.kind)
+            .map_err(|error| ContextServiceError::Ledger(error.to_string()))?;
+
+        sqlx::query(
+            "insert into operation_events (event_id, run_id, occurred_at, kind_type, payload_json) values (?1, ?2, ?3, 'context_bundle_created', ?4)",
+        )
+        .bind(event.id.to_string())
+        .bind(run_id.to_string())
+        .bind(&occurred_at)
+        .bind(payload_json)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| ContextServiceError::Ledger(error.to_string()))?;
+
+        apply_context_bundle_created_to_sqlite_projection(&mut tx, &event).await?;
+        update_running_run_for_context_bundle_created(&mut tx, &event).await?;
+
+        tx.commit()
+            .await
+            .map_err(|error| ContextServiceError::Ledger(error.to_string()))?;
+
+        Ok(CreateContextBundleOutcome { context_bundle_id })
+    }
+
+    pub async fn rebuild_context_bundle_projections(
+        &self,
+    ) -> Result<Vec<ContextBundleRecord>, ContextServiceError> {
+        let events = self
+            .store
+            .list_events()
+            .await
+            .map_err(|error| ContextServiceError::Ledger(error.to_string()))?;
+        SqliteContextBundleProjectionStore::new(self.store.clone())
+            .rebuild(&events)
+            .await?;
+        self.list_context_bundles().await
+    }
+
+    pub async fn list_context_bundles(
+        &self,
+    ) -> Result<Vec<ContextBundleRecord>, ContextServiceError> {
+        SqliteContextBundleProjectionStore::new(self.store.clone())
+            .list_context_bundles()
+            .await
+    }
+
+    pub async fn get_context_bundle(
+        &self,
+        context_bundle_id: ContextBundleId,
+    ) -> Result<ContextBundleRecord, ContextServiceError> {
+        SqliteContextBundleProjectionStore::new(self.store.clone())
+            .get_context_bundle(context_bundle_id)
+            .await
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SqliteContextBundleProjectionStore {
+    store: SqliteStore,
+}
+
+impl SqliteContextBundleProjectionStore {
+    pub fn new(store: SqliteStore) -> Self {
+        Self { store }
+    }
+
+    pub async fn rebuild(&self, events: &[OperationEvent]) -> Result<(), ContextServiceError> {
+        let mut tx = self
+            .store
+            .pool()
+            .begin()
+            .await
+            .map_err(|error| ContextServiceError::Projection(error.to_string()))?;
+
+        sqlx::query("delete from context_bundles")
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| ContextServiceError::Projection(error.to_string()))?;
+
+        for event in events {
+            apply_context_bundle_created_to_sqlite_projection(&mut tx, event).await?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|error| ContextServiceError::Projection(error.to_string()))?;
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ContextBundleProjectionStore for SqliteContextBundleProjectionStore {
+    async fn apply(&self, event: &OperationEvent) -> Result<(), ContextServiceError> {
+        let mut tx = self
+            .store
+            .pool()
+            .begin()
+            .await
+            .map_err(|error| ContextServiceError::Projection(error.to_string()))?;
+        apply_context_bundle_created_to_sqlite_projection(&mut tx, event).await?;
+        tx.commit()
+            .await
+            .map_err(|error| ContextServiceError::Projection(error.to_string()))?;
+        Ok(())
+    }
+
+    async fn list_context_bundles(&self) -> Result<Vec<ContextBundleRecord>, ContextServiceError> {
+        let rows = sqlx::query_as::<_, StoredContextBundleRecord>(
+            "select context_bundle_id, run_id, title, summary, artifact_ids, event_ids, created_at from context_bundles order by created_at desc",
+        )
+        .fetch_all(self.store.pool())
+        .await
+        .map_err(|error| ContextServiceError::Projection(error.to_string()))?;
+
+        rows.into_iter()
+            .map(ContextBundleRecord::try_from)
+            .collect()
+    }
+
+    async fn get_context_bundle(
+        &self,
+        context_bundle_id: ContextBundleId,
+    ) -> Result<ContextBundleRecord, ContextServiceError> {
+        let row = sqlx::query_as::<_, StoredContextBundleRecord>(
+            "select context_bundle_id, run_id, title, summary, artifact_ids, event_ids, created_at from context_bundles where context_bundle_id = ?1",
+        )
+        .bind(context_bundle_id.to_string())
+        .fetch_optional(self.store.pool())
+        .await
+        .map_err(|error| ContextServiceError::Projection(error.to_string()))?
+        .ok_or(ContextServiceError::UnknownContextBundle)?;
+        ContextBundleRecord::try_from(row)
+    }
+}
+
+async fn ensure_sqlite_context_references(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: RunId,
+    artifact_ids: &[ArtifactId],
+    event_ids: &[EventId],
+) -> Result<(), ContextServiceError> {
+    let run_exists: Option<String> =
+        sqlx::query_scalar("select run_id from runs where run_id = ?1")
+            .bind(run_id.to_string())
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|error| ContextServiceError::Projection(error.to_string()))?;
+    if run_exists.is_none() {
+        return Err(ContextServiceError::UnknownRun);
+    }
+
+    for artifact_id in artifact_ids {
+        let artifact_exists: Option<String> =
+            sqlx::query_scalar("select artifact_id from artifacts where artifact_id = ?1")
+                .bind(artifact_id.to_string())
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(|error| ContextServiceError::Projection(error.to_string()))?;
+        if artifact_exists.is_none() {
+            return Err(ContextServiceError::UnknownArtifact);
+        }
+    }
+
+    for event_id in event_ids {
+        let event_exists: Option<String> =
+            sqlx::query_scalar("select event_id from operation_events where event_id = ?1")
+                .bind(event_id.to_string())
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(|error| ContextServiceError::Projection(error.to_string()))?;
+        if event_exists.is_none() {
+            return Err(ContextServiceError::UnknownEvent);
+        }
+    }
+
+    Ok(())
+}
+
+async fn apply_context_bundle_created_to_sqlite_projection(
+    tx: &mut Transaction<'_, Sqlite>,
+    event: &OperationEvent,
+) -> Result<(), ContextServiceError> {
+    if let OperationEventKind::ContextBundleCreated {
+        context_bundle_id,
+        title,
+        summary,
+        artifact_ids,
+        event_ids,
+    } = &event.kind
+    {
+        let occurred_at = event
+            .occurred_at
+            .format(&Rfc3339)
+            .map_err(|error| ContextServiceError::Projection(error.to_string()))?;
+        let artifact_ids_json = ids_to_json(artifact_ids)
+            .map_err(|error| ContextServiceError::Projection(error.to_string()))?;
+        let event_ids_json = ids_to_json(event_ids)
+            .map_err(|error| ContextServiceError::Projection(error.to_string()))?;
+        sqlx::query(
+            "insert into context_bundles (context_bundle_id, run_id, title, summary, artifact_ids, event_ids, created_at) values (?1, ?2, ?3, ?4, ?5, ?6, ?7) on conflict(context_bundle_id) do update set run_id = excluded.run_id, title = excluded.title, summary = excluded.summary, artifact_ids = excluded.artifact_ids, event_ids = excluded.event_ids, created_at = excluded.created_at",
+        )
+        .bind(context_bundle_id.to_string())
+        .bind(event.run_id.to_string())
+        .bind(title)
+        .bind(summary)
+        .bind(artifact_ids_json)
+        .bind(event_ids_json)
+        .bind(occurred_at)
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| ContextServiceError::Projection(error.to_string()))?;
+    }
+
+    Ok(())
+}
+
+async fn update_running_run_for_context_bundle_created(
+    tx: &mut Transaction<'_, Sqlite>,
+    event: &OperationEvent,
+) -> Result<(), ContextServiceError> {
+    if matches!(event.kind, OperationEventKind::ContextBundleCreated { .. }) {
+        let occurred_at = event
+            .occurred_at
+            .format(&Rfc3339)
+            .map_err(|error| ContextServiceError::Projection(error.to_string()))?;
+        sqlx::query("update runs set updated_at = ?2 where run_id = ?1 and status = 'running'")
+            .bind(event.run_id.to_string())
+            .bind(occurred_at)
+            .execute(&mut **tx)
+            .await
+            .map_err(|error| ContextServiceError::Projection(error.to_string()))?;
+    }
+
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -994,6 +1274,36 @@ impl TryFrom<StoredArtifactRecord> for ArtifactRecord {
 }
 
 #[derive(sqlx::FromRow)]
+struct StoredContextBundleRecord {
+    context_bundle_id: String,
+    run_id: String,
+    title: String,
+    summary: String,
+    artifact_ids: String,
+    event_ids: String,
+    created_at: String,
+}
+
+impl TryFrom<StoredContextBundleRecord> for ContextBundleRecord {
+    type Error = ContextServiceError;
+
+    fn try_from(row: StoredContextBundleRecord) -> Result<Self, Self::Error> {
+        Ok(Self {
+            context_bundle_id: ContextBundleId::from_str(&row.context_bundle_id)
+                .map_err(|error| ContextServiceError::Projection(error.to_string()))?,
+            run_id: RunId::from_str(&row.run_id)
+                .map_err(|error| ContextServiceError::Projection(error.to_string()))?,
+            title: row.title,
+            summary: row.summary,
+            artifact_ids: parse_ids_json(&row.artifact_ids)?,
+            event_ids: parse_ids_json(&row.event_ids)?,
+            created_at: OffsetDateTime::parse(&row.created_at, &Rfc3339)
+                .map_err(|error| ContextServiceError::Projection(error.to_string()))?,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
 struct StoredRunProjection {
     run_id: String,
     status: String,
@@ -1077,6 +1387,32 @@ fn non_blank_artifact_input(value: String) -> Result<String, ArtifactServiceErro
         return Err(ArtifactServiceError::InvalidInput);
     }
     Ok(value)
+}
+
+fn non_blank_context_input(value: String) -> Result<String, ContextServiceError> {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        return Err(ContextServiceError::InvalidInput);
+    }
+    Ok(value)
+}
+
+fn ids_to_json<T: ToString>(ids: &[T]) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&ids.iter().map(ToString::to_string).collect::<Vec<String>>())
+}
+
+fn parse_ids_json<T>(json: &str) -> Result<Vec<T>, ContextServiceError>
+where
+    T: FromStr,
+    T::Err: std::fmt::Display,
+{
+    let ids: Vec<String> = serde_json::from_str(json)
+        .map_err(|error| ContextServiceError::Projection(error.to_string()))?;
+    ids.into_iter()
+        .map(|id| {
+            T::from_str(&id).map_err(|error| ContextServiceError::Projection(error.to_string()))
+        })
+        .collect()
 }
 
 fn status_from_storage(status: &str) -> Result<RunStatus, RunProjectionError> {
@@ -1357,6 +1693,169 @@ mod tests {
         assert_eq!(detail.artifact.artifact_id, created.artifact_id);
         assert_eq!(detail.content.as_deref(), Some("note body"));
         assert!(events.iter().any(|event| matches!(event.kind, OperationEventKind::ArtifactCreated { artifact_id, .. } if artifact_id == created.artifact_id)));
+    }
+
+    #[tokio::test]
+    async fn sqlite_context_service_creates_context_bundle_projection_and_ledger_event() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let run_service = SqliteRunService::new(store.clone());
+        let run = run_service
+            .create_run("bundle context".to_string())
+            .await
+            .unwrap();
+        let context_service = SqliteContextService::new(store.clone());
+
+        let created = context_service
+            .create_context_bundle(
+                run.run_id,
+                "Context".to_string(),
+                "Important inputs".to_string(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let bundles = context_service.list_context_bundles().await.unwrap();
+        let events = store.list_events().await.unwrap();
+
+        assert_eq!(bundles.len(), 1);
+        assert_eq!(bundles[0].context_bundle_id, created.context_bundle_id);
+        assert!(events.iter().any(|event| matches!(event.kind, OperationEventKind::ContextBundleCreated { context_bundle_id, .. } if context_bundle_id == created.context_bundle_id)));
+    }
+
+    #[tokio::test]
+    async fn sqlite_context_service_validates_inputs_and_references_without_side_effects() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let run_service = SqliteRunService::new(store.clone());
+        let run = run_service
+            .create_run("validate context".to_string())
+            .await
+            .unwrap();
+        let event_count_before = store.list_events().await.unwrap().len();
+        let context_service = SqliteContextService::new(store.clone());
+
+        assert_eq!(
+            context_service
+                .create_context_bundle(
+                    run.run_id,
+                    "   ".to_string(),
+                    "summary".to_string(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .await
+                .unwrap_err(),
+            ContextServiceError::InvalidInput
+        );
+        assert_eq!(
+            context_service
+                .create_context_bundle(
+                    run.run_id,
+                    "title".to_string(),
+                    "   ".to_string(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .await
+                .unwrap_err(),
+            ContextServiceError::InvalidInput
+        );
+        assert_eq!(
+            context_service
+                .create_context_bundle(
+                    RunId::new(),
+                    "title".to_string(),
+                    "summary".to_string(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .await
+                .unwrap_err(),
+            ContextServiceError::UnknownRun
+        );
+        assert_eq!(
+            context_service
+                .create_context_bundle(
+                    run.run_id,
+                    "title".to_string(),
+                    "summary".to_string(),
+                    vec![ArtifactId::new()],
+                    Vec::new(),
+                )
+                .await
+                .unwrap_err(),
+            ContextServiceError::UnknownArtifact
+        );
+        assert_eq!(
+            context_service
+                .create_context_bundle(
+                    run.run_id,
+                    "title".to_string(),
+                    "summary".to_string(),
+                    Vec::new(),
+                    vec![EventId::new()],
+                )
+                .await
+                .unwrap_err(),
+            ContextServiceError::UnknownEvent
+        );
+        assert_eq!(store.list_events().await.unwrap().len(), event_count_before);
+        assert!(context_service
+            .list_context_bundles()
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn sqlite_ledger_roundtrips_context_bundle_events_can_rebuild_context_projection() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let ledger = SqliteOperationLedger::new(store.clone());
+        let projection = SqliteContextBundleProjectionStore::new(store.clone());
+        let context_service = SqliteContextService::new(store.clone());
+        let run_id = RunId::new();
+        let context_bundle_id = ContextBundleId::new();
+        let started = OperationEvent::new_run_started(run_id, "ledger-only context rebuild");
+        let context_bundle = OperationEvent::new_context_bundle_created(
+            run_id,
+            context_bundle_id,
+            "Ledger context",
+            "Facts selected from the ledger",
+            Vec::new(),
+            vec![started.id],
+        );
+
+        ledger.append(started.clone()).await.unwrap();
+        ledger.append(context_bundle.clone()).await.unwrap();
+        assert!(projection.list_context_bundles().await.unwrap().is_empty());
+
+        let events = ledger.list().await.unwrap();
+        projection.rebuild(&events).await.unwrap();
+
+        let bundles = context_service.list_context_bundles().await.unwrap();
+        let stored = context_service
+            .get_context_bundle(context_bundle_id)
+            .await
+            .unwrap();
+        assert_eq!(bundles, vec![stored.clone()]);
+        assert_eq!(stored.context_bundle_id, context_bundle_id);
+        assert_eq!(stored.run_id, run_id);
+        assert_eq!(stored.title, "Ledger context");
+        assert_eq!(stored.summary, "Facts selected from the ledger");
+        assert!(stored.artifact_ids.is_empty());
+        assert_eq!(stored.event_ids, vec![started.id]);
+        assert_eq!(stored.created_at, context_bundle.occurred_at);
+
+        sqlx::query("delete from context_bundles")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let rebuilt = context_service
+            .rebuild_context_bundle_projections()
+            .await
+            .unwrap();
+        assert_eq!(rebuilt, vec![stored]);
     }
 
     #[tokio::test]
