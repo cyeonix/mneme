@@ -128,10 +128,16 @@ pub struct RetrievalTraceRecord {
 
 pub type SharedKnowledgeSourceProjectionStore = Arc<dyn KnowledgeSourceProjectionStore>;
 pub type SharedDocumentChunkProjectionStore = Arc<dyn DocumentChunkProjectionStore>;
+pub type SharedMemoryProjectionStore = Arc<dyn MemoryProjectionStore>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateKnowledgeSourceOutcome {
     pub knowledge_source_id: KnowledgeSourceId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordMemoryOutcome {
+    pub memory_id: MemoryId,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -230,6 +236,114 @@ impl KnowledgeSourceProjectionStore for InMemoryKnowledgeSourceProjectionStore {
             .find(|source| source.knowledge_source_id == knowledge_source_id)
             .cloned()
             .ok_or(KnowledgeServiceError::UnknownKnowledgeSource)
+    }
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum MemoryServiceError {
+    #[error("memory input must not be blank")]
+    InvalidInput,
+    #[error("run id is not known to the memory service")]
+    UnknownRun,
+    #[error("knowledge source id is not known to the memory service")]
+    UnknownKnowledgeSource,
+    #[error("memory id is not known to the memory service")]
+    UnknownMemory,
+    #[error("operation ledger failed: {0}")]
+    Ledger(String),
+    #[error("memory projection failed: {0}")]
+    Projection(String),
+}
+
+#[async_trait]
+pub trait MemoryProjectionStore: Send + Sync {
+    async fn apply(&self, event: &OperationEvent) -> Result<(), MemoryServiceError>;
+    async fn list_memories(
+        &self,
+        knowledge_source_id: Option<KnowledgeSourceId>,
+    ) -> Result<Vec<MemoryRecord>, MemoryServiceError>;
+    async fn get_memory(&self, memory_id: MemoryId) -> Result<MemoryRecord, MemoryServiceError>;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct InMemoryMemoryProjectionStore {
+    memories: Arc<RwLock<Vec<MemoryRecord>>>,
+}
+
+impl InMemoryMemoryProjectionStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn shared(self) -> SharedMemoryProjectionStore {
+        Arc::new(self)
+    }
+}
+
+#[async_trait]
+impl MemoryProjectionStore for InMemoryMemoryProjectionStore {
+    async fn apply(&self, event: &OperationEvent) -> Result<(), MemoryServiceError> {
+        if let OperationEventKind::MemoryRecorded {
+            memory_id,
+            knowledge_source_id,
+            kind,
+            title,
+            body,
+            confidence,
+        } = &event.kind
+        {
+            let mut memories = self.memories.write().await;
+            let record = MemoryRecord {
+                memory_id: *memory_id,
+                knowledge_source_id: *knowledge_source_id,
+                run_id: event.run_id,
+                kind: *kind,
+                title: title.clone(),
+                body: body.clone(),
+                confidence: *confidence,
+                created_at: event.occurred_at,
+            };
+
+            if let Some(existing) = memories
+                .iter_mut()
+                .find(|memory| memory.memory_id == *memory_id)
+            {
+                *existing = record;
+            } else {
+                memories.push(record);
+            }
+            memories.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        }
+
+        Ok(())
+    }
+
+    async fn list_memories(
+        &self,
+        knowledge_source_id: Option<KnowledgeSourceId>,
+    ) -> Result<Vec<MemoryRecord>, MemoryServiceError> {
+        Ok(self
+            .memories
+            .read()
+            .await
+            .iter()
+            .filter(|memory| {
+                knowledge_source_id
+                    .map(|source_id| memory.knowledge_source_id == Some(source_id))
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect())
+    }
+
+    async fn get_memory(&self, memory_id: MemoryId) -> Result<MemoryRecord, MemoryServiceError> {
+        self.memories
+            .read()
+            .await
+            .iter()
+            .find(|memory| memory.memory_id == memory_id)
+            .cloned()
+            .ok_or(MemoryServiceError::UnknownMemory)
     }
 }
 
@@ -475,6 +589,102 @@ impl ComposedKnowledgeService {
 }
 
 #[derive(Clone)]
+pub struct ComposedMemoryService {
+    ledger: SharedOperationLedger,
+    run_store: SharedRunProjectionStore,
+    source_projection: SharedKnowledgeSourceProjectionStore,
+    memory_projection: SharedMemoryProjectionStore,
+}
+
+impl ComposedMemoryService {
+    pub fn new(
+        ledger: SharedOperationLedger,
+        run_store: SharedRunProjectionStore,
+        source_projection: SharedKnowledgeSourceProjectionStore,
+        memory_projection: SharedMemoryProjectionStore,
+    ) -> Self {
+        Self {
+            ledger,
+            run_store,
+            source_projection,
+            memory_projection,
+        }
+    }
+
+    async fn ensure_known_run(&self, run_id: RunId) -> Result<(), MemoryServiceError> {
+        let runs = self
+            .run_store
+            .list_runs()
+            .await
+            .map_err(|error| MemoryServiceError::Projection(error.to_string()))?;
+        if runs.iter().any(|run| run.run_id == run_id) {
+            Ok(())
+        } else {
+            Err(MemoryServiceError::UnknownRun)
+        }
+    }
+
+    pub async fn record_memory(
+        &self,
+        run_id: RunId,
+        knowledge_source_id: Option<KnowledgeSourceId>,
+        kind: MemoryKind,
+        title: String,
+        body: String,
+        confidence: f32,
+    ) -> Result<RecordMemoryOutcome, MemoryServiceError> {
+        let title = non_blank_memory_input(title)?;
+        let body = non_blank_memory_input(body)?;
+        ensure_valid_confidence(confidence)?;
+        self.ensure_known_run(run_id).await?;
+        if let Some(source_id) = knowledge_source_id {
+            self.source_projection
+                .get_source(source_id)
+                .await
+                .map_err(map_memory_knowledge_error)?;
+        }
+
+        let memory_id = MemoryId::new();
+        let event = OperationEvent::new_memory_recorded(
+            run_id,
+            memory_id,
+            knowledge_source_id,
+            kind,
+            title,
+            body,
+            confidence,
+        );
+        self.ledger
+            .append(event.clone())
+            .await
+            .map_err(|error| MemoryServiceError::Ledger(error.to_string()))?;
+        self.run_store
+            .apply(&event)
+            .await
+            .map_err(|error| MemoryServiceError::Projection(error.to_string()))?;
+        self.memory_projection.apply(&event).await?;
+
+        Ok(RecordMemoryOutcome { memory_id })
+    }
+
+    pub async fn list_memories(
+        &self,
+        knowledge_source_id: Option<KnowledgeSourceId>,
+    ) -> Result<Vec<MemoryRecord>, MemoryServiceError> {
+        self.memory_projection
+            .list_memories(knowledge_source_id)
+            .await
+    }
+
+    pub async fn get_memory(
+        &self,
+        memory_id: MemoryId,
+    ) -> Result<MemoryRecord, MemoryServiceError> {
+        self.memory_projection.get_memory(memory_id).await
+    }
+}
+
+#[derive(Clone)]
 pub struct ComposedChunkService {
     ledger: SharedOperationLedger,
     source_projection: SharedKnowledgeSourceProjectionStore,
@@ -565,6 +775,29 @@ fn non_blank_knowledge_input(value: String) -> Result<String, KnowledgeServiceEr
     Ok(value)
 }
 
+fn non_blank_memory_input(value: String) -> Result<String, MemoryServiceError> {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        return Err(MemoryServiceError::InvalidInput);
+    }
+    Ok(value)
+}
+
+fn ensure_valid_confidence(confidence: f32) -> Result<(), MemoryServiceError> {
+    if (0.0..=1.0).contains(&confidence) {
+        Ok(())
+    } else {
+        Err(MemoryServiceError::InvalidInput)
+    }
+}
+
+fn map_memory_knowledge_error(error: KnowledgeServiceError) -> MemoryServiceError {
+    match error {
+        KnowledgeServiceError::UnknownKnowledgeSource => MemoryServiceError::UnknownKnowledgeSource,
+        other => MemoryServiceError::Projection(other.to_string()),
+    }
+}
+
 fn map_artifact_error(error: ArtifactServiceError) -> KnowledgeServiceError {
     match error {
         ArtifactServiceError::UnknownArtifact => KnowledgeServiceError::UnknownArtifact,
@@ -636,6 +869,45 @@ mod tests {
         assert_eq!(chunks[0].char_end, 12);
         assert_eq!(chunks[1].text, "jklmnopqrstu");
         assert_eq!(chunks[1].char_start, 9);
+    }
+
+    #[tokio::test]
+    async fn composed_memory_service_records_and_lists_memory() {
+        let ledger = crate::InMemoryOperationLedger::new().shared();
+        let run_store = crate::InMemoryRunProjectionStore::new().shared();
+        let source_projection = InMemoryKnowledgeSourceProjectionStore::new().shared();
+        let memory_projection = InMemoryMemoryProjectionStore::new().shared();
+
+        let run_service = crate::ComposedRunService::new(ledger.clone(), run_store.clone());
+        let run = run_service
+            .create_run("Record memory".to_string())
+            .await
+            .unwrap();
+
+        let service = ComposedMemoryService::new(
+            ledger.clone(),
+            run_store,
+            source_projection,
+            memory_projection,
+        );
+        let outcome = service
+            .record_memory(
+                run.run_id,
+                None,
+                MemoryKind::Decision,
+                "Decision".to_string(),
+                "Use SQLite-first search.".to_string(),
+                0.9,
+            )
+            .await
+            .unwrap();
+
+        let memories = service.list_memories(None).await.unwrap();
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].memory_id, outcome.memory_id);
+        assert_eq!(memories[0].run_id, run.run_id);
+        assert_eq!(memories[0].kind, MemoryKind::Decision);
+        assert_eq!(memories[0].confidence, 0.9);
     }
 
     #[tokio::test]

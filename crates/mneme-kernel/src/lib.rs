@@ -26,11 +26,13 @@ pub use ids::{
 };
 pub use knowledge::{
     ChunkDraft, ChunkTextSplitter, ComposedChunkService, ComposedKnowledgeService,
-    CreateKnowledgeSourceOutcome, DocumentChunkProjectionStore, DocumentChunkRecord,
-    InMemoryDocumentChunkProjectionStore, InMemoryKnowledgeSourceProjectionStore,
-    KnowledgeServiceError, KnowledgeSourceKind, KnowledgeSourceProjectionStore,
-    KnowledgeSourceRecord, MemoryKind, MemoryRecord, RetrievalTraceRecord,
-    SharedDocumentChunkProjectionStore, SharedKnowledgeSourceProjectionStore,
+    ComposedMemoryService, CreateKnowledgeSourceOutcome, DocumentChunkProjectionStore,
+    DocumentChunkRecord, InMemoryDocumentChunkProjectionStore,
+    InMemoryKnowledgeSourceProjectionStore, InMemoryMemoryProjectionStore, KnowledgeServiceError,
+    KnowledgeSourceKind, KnowledgeSourceProjectionStore, KnowledgeSourceRecord, MemoryKind,
+    MemoryProjectionStore, MemoryRecord, MemoryServiceError, RecordMemoryOutcome,
+    RetrievalTraceRecord, SharedDocumentChunkProjectionStore, SharedKnowledgeSourceProjectionStore,
+    SharedMemoryProjectionStore,
 };
 pub use ledger::{InMemoryOperationLedger, LedgerError, OperationLedger, SharedOperationLedger};
 pub use projections::{RunProjection, RunProjector, RunStatus};
@@ -44,7 +46,8 @@ pub use service::{
 pub use storage::sqlite::{
     SqliteArtifactProjectionStore, SqliteArtifactService, SqliteChunkService,
     SqliteContextBundleProjectionStore, SqliteContextService, SqliteDocumentChunkProjectionStore,
-    SqliteKnowledgeService, SqliteKnowledgeSourceProjectionStore,
+    SqliteKnowledgeService, SqliteKnowledgeSourceProjectionStore, SqliteMemoryProjectionStore,
+    SqliteMemoryService,
 };
 pub use storage::{
     SqliteOperationLedger, SqliteRunProjectionStore, SqliteRunService, SqliteStore,

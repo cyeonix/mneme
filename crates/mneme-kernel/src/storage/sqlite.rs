@@ -4,8 +4,9 @@ use crate::{
     ContextServiceError, CreateArtifactOutcome, CreateContextBundleOutcome,
     CreateKnowledgeSourceOutcome, CreateRunOutcome, DocumentChunkProjectionStore,
     DocumentChunkRecord, EventId, KnowledgeServiceError, KnowledgeSourceId, KnowledgeSourceKind,
-    KnowledgeSourceProjectionStore, KnowledgeSourceRecord, LedgerError, OperationEvent,
-    OperationEventKind, OperationLedger, RunId, RunLifecycleOutcome, RunProjection,
+    KnowledgeSourceProjectionStore, KnowledgeSourceRecord, LedgerError, MemoryId, MemoryKind,
+    MemoryProjectionStore, MemoryRecord, MemoryServiceError, OperationEvent, OperationEventKind,
+    OperationLedger, RecordMemoryOutcome, RunId, RunLifecycleOutcome, RunProjection,
     RunProjectionError, RunProjectionStore, RunProjector, RunService, RunServiceError, RunStatus,
     SharedArtifactContentStore, SharedOperationLedger, SharedRunProjectionStore, SharedRunService,
     ToolApprovalDecision, ToolApprovalPolicy, ToolCallId, ToolCallOutcome, ToolEffect,
@@ -422,6 +423,180 @@ impl SqliteKnowledgeService {
 }
 
 #[derive(Clone, Debug)]
+pub struct SqliteMemoryService {
+    store: SqliteStore,
+}
+
+impl SqliteMemoryService {
+    pub fn new(store: SqliteStore) -> Self {
+        Self { store }
+    }
+
+    pub async fn record_memory(
+        &self,
+        run_id: RunId,
+        knowledge_source_id: Option<KnowledgeSourceId>,
+        kind: MemoryKind,
+        title: String,
+        body: String,
+        confidence: f32,
+    ) -> Result<RecordMemoryOutcome, MemoryServiceError> {
+        let title = non_blank_memory_input(title)?;
+        let body = non_blank_memory_input(body)?;
+        ensure_valid_memory_confidence(confidence)?;
+        let mut tx = self
+            .store
+            .pool()
+            .begin()
+            .await
+            .map_err(|error| MemoryServiceError::Ledger(error.to_string()))?;
+        ensure_sqlite_memory_run(&mut tx, run_id).await?;
+        if let Some(source_id) = knowledge_source_id {
+            ensure_sqlite_memory_source(&mut tx, source_id).await?;
+        }
+
+        let memory_id = MemoryId::new();
+        let event = OperationEvent::new_memory_recorded(
+            run_id,
+            memory_id,
+            knowledge_source_id,
+            kind,
+            title,
+            body,
+            confidence,
+        );
+        insert_operation_event(&mut tx, &event)
+            .await
+            .map_err(|error| MemoryServiceError::Ledger(error.to_string()))?;
+        apply_memory_recorded_to_sqlite_projection(&mut tx, &event).await?;
+        update_running_run_for_memory_recorded(&mut tx, &event).await?;
+        tx.commit()
+            .await
+            .map_err(|error| MemoryServiceError::Ledger(error.to_string()))?;
+
+        Ok(RecordMemoryOutcome { memory_id })
+    }
+
+    pub async fn list_memories(
+        &self,
+        knowledge_source_id: Option<KnowledgeSourceId>,
+    ) -> Result<Vec<MemoryRecord>, MemoryServiceError> {
+        SqliteMemoryProjectionStore::new(self.store.clone())
+            .list_memories(knowledge_source_id)
+            .await
+    }
+
+    pub async fn get_memory(
+        &self,
+        memory_id: MemoryId,
+    ) -> Result<MemoryRecord, MemoryServiceError> {
+        SqliteMemoryProjectionStore::new(self.store.clone())
+            .get_memory(memory_id)
+            .await
+    }
+
+    pub async fn rebuild_memory_projections(
+        &self,
+    ) -> Result<Vec<MemoryRecord>, MemoryServiceError> {
+        let events = self
+            .store
+            .list_events()
+            .await
+            .map_err(|error| MemoryServiceError::Ledger(error.to_string()))?;
+        SqliteMemoryProjectionStore::new(self.store.clone())
+            .rebuild(&events)
+            .await?;
+        self.list_memories(None).await
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SqliteMemoryProjectionStore {
+    store: SqliteStore,
+}
+
+impl SqliteMemoryProjectionStore {
+    pub fn new(store: SqliteStore) -> Self {
+        Self { store }
+    }
+
+    pub async fn rebuild(&self, events: &[OperationEvent]) -> Result<(), MemoryServiceError> {
+        let mut tx = self
+            .store
+            .pool()
+            .begin()
+            .await
+            .map_err(|error| MemoryServiceError::Projection(error.to_string()))?;
+
+        sqlx::query("delete from memory_records")
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| MemoryServiceError::Projection(error.to_string()))?;
+
+        for event in events {
+            apply_memory_recorded_to_sqlite_projection(&mut tx, event).await?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|error| MemoryServiceError::Projection(error.to_string()))?;
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl MemoryProjectionStore for SqliteMemoryProjectionStore {
+    async fn apply(&self, event: &OperationEvent) -> Result<(), MemoryServiceError> {
+        let mut tx = self
+            .store
+            .pool()
+            .begin()
+            .await
+            .map_err(|error| MemoryServiceError::Projection(error.to_string()))?;
+        apply_memory_recorded_to_sqlite_projection(&mut tx, event).await?;
+        tx.commit()
+            .await
+            .map_err(|error| MemoryServiceError::Projection(error.to_string()))?;
+        Ok(())
+    }
+
+    async fn list_memories(
+        &self,
+        knowledge_source_id: Option<KnowledgeSourceId>,
+    ) -> Result<Vec<MemoryRecord>, MemoryServiceError> {
+        let rows = match knowledge_source_id {
+            Some(source_id) => sqlx::query_as::<_, StoredMemoryRecord>(
+                "select memory_id, knowledge_source_id, run_id, kind, title, body, confidence, created_at from memory_records where knowledge_source_id = ?1 order by created_at desc",
+            )
+            .bind(source_id.to_string())
+            .fetch_all(self.store.pool())
+            .await,
+            None => sqlx::query_as::<_, StoredMemoryRecord>(
+                "select memory_id, knowledge_source_id, run_id, kind, title, body, confidence, created_at from memory_records order by created_at desc",
+            )
+            .fetch_all(self.store.pool())
+            .await,
+        }
+        .map_err(|error| MemoryServiceError::Projection(error.to_string()))?;
+
+        rows.into_iter().map(MemoryRecord::try_from).collect()
+    }
+
+    async fn get_memory(&self, memory_id: MemoryId) -> Result<MemoryRecord, MemoryServiceError> {
+        let row = sqlx::query_as::<_, StoredMemoryRecord>(
+            "select memory_id, knowledge_source_id, run_id, kind, title, body, confidence, created_at from memory_records where memory_id = ?1",
+        )
+        .bind(memory_id.to_string())
+        .fetch_optional(self.store.pool())
+        .await
+        .map_err(|error| MemoryServiceError::Projection(error.to_string()))?
+        .ok_or(MemoryServiceError::UnknownMemory)?;
+        MemoryRecord::try_from(row)
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct SqliteChunkService {
     store: SqliteStore,
     splitter: ChunkTextSplitter,
@@ -671,6 +846,41 @@ impl KnowledgeSourceProjectionStore for SqliteKnowledgeSourceProjectionStore {
     }
 }
 
+async fn ensure_sqlite_memory_run(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: RunId,
+) -> Result<(), MemoryServiceError> {
+    let run_exists: Option<String> =
+        sqlx::query_scalar("select run_id from runs where run_id = ?1")
+            .bind(run_id.to_string())
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|error| MemoryServiceError::Projection(error.to_string()))?;
+    if run_exists.is_some() {
+        Ok(())
+    } else {
+        Err(MemoryServiceError::UnknownRun)
+    }
+}
+
+async fn ensure_sqlite_memory_source(
+    tx: &mut Transaction<'_, Sqlite>,
+    knowledge_source_id: KnowledgeSourceId,
+) -> Result<(), MemoryServiceError> {
+    let source_exists: Option<String> = sqlx::query_scalar(
+        "select knowledge_source_id from knowledge_sources where knowledge_source_id = ?1",
+    )
+    .bind(knowledge_source_id.to_string())
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|error| MemoryServiceError::Projection(error.to_string()))?;
+    if source_exists.is_some() {
+        Ok(())
+    } else {
+        Err(MemoryServiceError::UnknownKnowledgeSource)
+    }
+}
+
 async fn insert_operation_event(
     tx: &mut Transaction<'_, Sqlite>,
     event: &OperationEvent,
@@ -901,6 +1111,62 @@ async fn update_running_run_for_document_chunk_created(
 ) -> Result<(), KnowledgeServiceError> {
     if matches!(event.kind, OperationEventKind::DocumentChunkCreated { .. }) {
         update_running_run_for_knowledge_event(tx, event).await?;
+    }
+
+    Ok(())
+}
+
+async fn apply_memory_recorded_to_sqlite_projection(
+    tx: &mut Transaction<'_, Sqlite>,
+    event: &OperationEvent,
+) -> Result<(), MemoryServiceError> {
+    if let OperationEventKind::MemoryRecorded {
+        memory_id,
+        knowledge_source_id,
+        kind,
+        title,
+        body,
+        confidence,
+    } = &event.kind
+    {
+        let occurred_at = event
+            .occurred_at
+            .format(&Rfc3339)
+            .map_err(|error| MemoryServiceError::Projection(error.to_string()))?;
+        sqlx::query(
+            "insert into memory_records (memory_id, knowledge_source_id, run_id, kind, title, body, confidence, created_at) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) on conflict(memory_id) do update set knowledge_source_id = excluded.knowledge_source_id, run_id = excluded.run_id, kind = excluded.kind, title = excluded.title, body = excluded.body, confidence = excluded.confidence, created_at = excluded.created_at",
+        )
+        .bind(memory_id.to_string())
+        .bind(knowledge_source_id.map(|id| id.to_string()))
+        .bind(event.run_id.to_string())
+        .bind(memory_kind_to_storage(*kind))
+        .bind(title)
+        .bind(body)
+        .bind(*confidence)
+        .bind(occurred_at)
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| MemoryServiceError::Projection(error.to_string()))?;
+    }
+
+    Ok(())
+}
+
+async fn update_running_run_for_memory_recorded(
+    tx: &mut Transaction<'_, Sqlite>,
+    event: &OperationEvent,
+) -> Result<(), MemoryServiceError> {
+    if matches!(event.kind, OperationEventKind::MemoryRecorded { .. }) {
+        let occurred_at = event
+            .occurred_at
+            .format(&Rfc3339)
+            .map_err(|error| MemoryServiceError::Projection(error.to_string()))?;
+        sqlx::query("update runs set updated_at = ?2 where run_id = ?1 and status = 'running'")
+            .bind(event.run_id.to_string())
+            .bind(occurred_at)
+            .execute(&mut **tx)
+            .await
+            .map_err(|error| MemoryServiceError::Projection(error.to_string()))?;
     }
 
     Ok(())
@@ -1991,6 +2257,38 @@ impl TryFrom<StoredKnowledgeSourceRecord> for KnowledgeSourceRecord {
 }
 
 #[derive(sqlx::FromRow)]
+struct StoredMemoryRecord {
+    memory_id: String,
+    knowledge_source_id: Option<String>,
+    run_id: String,
+    kind: String,
+    title: String,
+    body: String,
+    confidence: f32,
+    created_at: String,
+}
+
+impl TryFrom<StoredMemoryRecord> for MemoryRecord {
+    type Error = MemoryServiceError;
+
+    fn try_from(row: StoredMemoryRecord) -> Result<Self, Self::Error> {
+        Ok(Self {
+            memory_id: MemoryId::from_str(&row.memory_id)
+                .map_err(|error| MemoryServiceError::Projection(error.to_string()))?,
+            knowledge_source_id: parse_optional_memory_id(row.knowledge_source_id)?,
+            run_id: RunId::from_str(&row.run_id)
+                .map_err(|error| MemoryServiceError::Projection(error.to_string()))?,
+            kind: memory_kind_from_storage(&row.kind)?,
+            title: row.title,
+            body: row.body,
+            confidence: row.confidence,
+            created_at: OffsetDateTime::parse(&row.created_at, &Rfc3339)
+                .map_err(|error| MemoryServiceError::Projection(error.to_string()))?,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
 struct StoredDocumentChunkRecord {
     document_chunk_id: String,
     knowledge_source_id: String,
@@ -2126,6 +2424,27 @@ fn knowledge_source_kind_from_storage(
     }
 }
 
+fn memory_kind_to_storage(kind: MemoryKind) -> &'static str {
+    match kind {
+        MemoryKind::Fact => "fact",
+        MemoryKind::Decision => "decision",
+        MemoryKind::Preference => "preference",
+        MemoryKind::Insight => "insight",
+    }
+}
+
+fn memory_kind_from_storage(kind: &str) -> Result<MemoryKind, MemoryServiceError> {
+    match kind {
+        "fact" => Ok(MemoryKind::Fact),
+        "decision" => Ok(MemoryKind::Decision),
+        "preference" => Ok(MemoryKind::Preference),
+        "insight" => Ok(MemoryKind::Insight),
+        other => Err(MemoryServiceError::Projection(format!(
+            "unknown memory kind: {other}"
+        ))),
+    }
+}
+
 fn non_blank_artifact_input(value: String) -> Result<String, ArtifactServiceError> {
     let value = value.trim().to_string();
     if value.is_empty() {
@@ -2148,6 +2467,35 @@ fn non_blank_knowledge_input(value: String) -> Result<String, KnowledgeServiceEr
         return Err(KnowledgeServiceError::InvalidInput);
     }
     Ok(value)
+}
+
+fn non_blank_memory_input(value: String) -> Result<String, MemoryServiceError> {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        return Err(MemoryServiceError::InvalidInput);
+    }
+    Ok(value)
+}
+
+fn ensure_valid_memory_confidence(confidence: f32) -> Result<(), MemoryServiceError> {
+    if (0.0..=1.0).contains(&confidence) {
+        Ok(())
+    } else {
+        Err(MemoryServiceError::InvalidInput)
+    }
+}
+
+fn parse_optional_memory_id<T>(value: Option<String>) -> Result<Option<T>, MemoryServiceError>
+where
+    T: FromStr,
+    T::Err: std::fmt::Display,
+{
+    value
+        .as_deref()
+        .map(|id| {
+            T::from_str(id).map_err(|error| MemoryServiceError::Projection(error.to_string()))
+        })
+        .transpose()
 }
 
 fn parse_optional_knowledge_id<T>(value: Option<String>) -> Result<Option<T>, KnowledgeServiceError>
@@ -2636,6 +2984,89 @@ mod tests {
         assert_eq!(chunks[0].text, "abcdefghij");
         let events = SqliteOperationLedger::new(store).list().await.unwrap();
         assert!(events.iter().any(|event| matches!(event.kind, OperationEventKind::DocumentChunkCreated { document_chunk_id, .. } if document_chunk_id == chunks[0].document_chunk_id)));
+    }
+
+    #[tokio::test]
+    async fn sqlite_memory_service_records_memory_and_ledger_event() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let run_service = SqliteRunService::new(store.clone());
+        let run = run_service
+            .create_run("Record memory".to_string())
+            .await
+            .unwrap();
+        let service = SqliteMemoryService::new(store.clone());
+
+        let outcome = service
+            .record_memory(
+                run.run_id,
+                None,
+                MemoryKind::Decision,
+                "Decision".to_string(),
+                "Use SQLite-first search.".to_string(),
+                0.9,
+            )
+            .await
+            .unwrap();
+
+        let memories = service.list_memories(None).await.unwrap();
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].memory_id, outcome.memory_id);
+        assert_eq!(memories[0].confidence, 0.9);
+        let events = SqliteOperationLedger::new(store).list().await.unwrap();
+        assert!(events.iter().any(|event| matches!(event.kind, OperationEventKind::MemoryRecorded { memory_id, .. } if memory_id == outcome.memory_id)));
+    }
+
+    #[tokio::test]
+    async fn sqlite_memory_service_rejects_invalid_confidence() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let run_service = SqliteRunService::new(store.clone());
+        let run = run_service
+            .create_run("Reject memory".to_string())
+            .await
+            .unwrap();
+        let service = SqliteMemoryService::new(store.clone());
+
+        assert_eq!(
+            service
+                .record_memory(
+                    run.run_id,
+                    None,
+                    MemoryKind::Fact,
+                    "Fact".to_string(),
+                    "Body".to_string(),
+                    1.1,
+                )
+                .await
+                .unwrap_err(),
+            crate::MemoryServiceError::InvalidInput
+        );
+        assert_eq!(store.list_events().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_ledger_roundtrips_memory_events_can_rebuild_projection() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let ledger = SqliteOperationLedger::new(store.clone());
+        let projection = SqliteMemoryProjectionStore::new(store);
+        let run_id = RunId::new();
+        let memory_id = MemoryId::new();
+        let event = OperationEvent::new_memory_recorded(
+            run_id,
+            memory_id,
+            None,
+            MemoryKind::Insight,
+            "Insight",
+            "SQLite ledger can rebuild memory projections.",
+            0.8,
+        );
+
+        ledger.append(event.clone()).await.unwrap();
+        projection.rebuild(&[event]).await.unwrap();
+
+        let memories = projection.list_memories(None).await.unwrap();
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].memory_id, memory_id);
+        assert_eq!(memories[0].run_id, run_id);
     }
 
     #[tokio::test]

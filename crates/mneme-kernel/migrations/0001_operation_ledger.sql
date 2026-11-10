@@ -79,3 +79,17 @@ create table if not exists document_chunks (
 
 create index if not exists idx_document_chunks_source_sequence
   on document_chunks(knowledge_source_id, sequence);
+
+create table if not exists memory_records (
+  memory_id text primary key,
+  knowledge_source_id text,
+  run_id text not null,
+  kind text not null,
+  title text not null,
+  body text not null,
+  confidence real not null,
+  created_at text not null
+);
+
+create index if not exists idx_memory_records_source_created_at
+  on memory_records(knowledge_source_id, created_at);
