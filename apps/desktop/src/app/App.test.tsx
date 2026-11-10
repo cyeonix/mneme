@@ -1,6 +1,6 @@
 import '@testing-library/jest-dom/vitest';
 import { render, screen, waitFor } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { MnemeApiClient } from '../api/client';
 import { App } from './App';
 
@@ -58,5 +58,48 @@ describe('App', () => {
     });
     expect(await screen.findByText('展示 runs 投影')).toBeInTheDocument();
     expect(screen.getByText('running')).toBeInTheDocument();
+  });
+
+  it('shows lifecycle result details for completed and failed runs', async () => {
+    const client: MnemeApiClient = {
+      getHealth: vi.fn(async () => ({ service: 'mneme-kernel', status: 'ready', version: '0.1.0' })),
+      listEvents: vi.fn(async () => ({ events: [] })),
+      listRuns: vi.fn(async () => ({
+        runs: [
+          {
+            run_id: 'run-completed',
+            status: 'completed' as const,
+            instruction: '整理今天',
+            started_at: '2026-11-10T00:00:00Z',
+            completed_at: '2026-11-10T00:01:00Z',
+            failed_at: null,
+            summary: '总结完成',
+            error: null,
+            updated_at: '2026-11-10T00:01:00Z',
+          },
+          {
+            run_id: 'run-failed',
+            status: 'failed' as const,
+            instruction: '失败示例',
+            started_at: '2026-11-10T00:00:00Z',
+            completed_at: null,
+            failed_at: '2026-11-10T00:02:00Z',
+            summary: null,
+            error: '模型不可用',
+            updated_at: '2026-11-10T00:02:00Z',
+          },
+        ],
+      })),
+      createRun: vi.fn(),
+      requestModel: vi.fn(),
+      recordAssistantMessage: vi.fn(),
+      completeRun: vi.fn(),
+      failRun: vi.fn(),
+    };
+
+    render(<App client={client} />);
+
+    expect(await screen.findByText('总结完成')).toBeInTheDocument();
+    expect(await screen.findByText('模型不可用')).toBeInTheDocument();
   });
 });

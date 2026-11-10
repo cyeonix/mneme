@@ -73,6 +73,16 @@ export function App({ client }: AppProps) {
                 <span className="run-status">{run.status}</span>
                 <strong>{run.instruction}</strong>
                 <small>{run.updated_at}</small>
+                {run.summary ? (
+                  <p className="run-result">
+                    总结：<span>{run.summary}</span>
+                  </p>
+                ) : null}
+                {run.error ? (
+                  <p className="run-error">
+                    错误：<span>{run.error}</span>
+                  </p>
+                ) : null}
               </li>
             ))}
           </ul>

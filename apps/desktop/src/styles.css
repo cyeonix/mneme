@@ -131,6 +131,18 @@ h1 {
   font-family: var(--mneme-font-mono);
 }
 
+.run-result,
+.run-error {
+  margin: 0;
+  color: var(--mneme-color-muted);
+  font-size: 0.92rem;
+  line-height: 1.5;
+}
+
+.run-error {
+  color: #fca5a5;
+}
+
 .run-status {
   width: fit-content;
   padding: 0.2rem 0.55rem;
