@@ -69,8 +69,10 @@ impl RunProjectionStore for InMemoryRunProjectionStore {
             }
             OperationEventKind::RunModelRequested { .. }
             | OperationEventKind::RunAssistantMessage { .. } => {
-                if let Some(run) = runs.iter_mut().find(|run| run.run_id == event.run_id) {
-                    run.status = RunStatus::Running;
+                if let Some(run) = runs
+                    .iter_mut()
+                    .find(|run| run.run_id == event.run_id && run.status == RunStatus::Running)
+                {
                     run.updated_at = event.occurred_at;
                 }
             }
@@ -146,5 +148,24 @@ mod tests {
             store.list_runs().await.unwrap(),
             RunProjector::replay(&events)
         );
+    }
+
+    #[tokio::test]
+    async fn in_memory_run_store_keeps_completed_run_terminal_after_late_intermediate_event() {
+        let store = InMemoryRunProjectionStore::new();
+        let run_id = RunId::new();
+        let started = OperationEvent::new_run_started(run_id, "执行任务");
+        let completed = OperationEvent::new_run_completed(run_id, "完成任务");
+        let late_model_request = OperationEvent::new_run_model_requested(run_id, "不应恢复运行");
+
+        store.apply(&started).await.unwrap();
+        store.apply(&completed).await.unwrap();
+        store.apply(&late_model_request).await.unwrap();
+
+        let runs = store.list_runs().await.unwrap();
+        assert_eq!(runs[0].status, RunStatus::Completed);
+        assert_eq!(runs[0].summary.as_deref(), Some("完成任务"));
+        assert_eq!(runs[0].completed_at, Some(completed.occurred_at));
+        assert_eq!(runs[0].updated_at, completed.occurred_at);
     }
 }

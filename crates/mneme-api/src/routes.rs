@@ -164,7 +164,8 @@ fn service_error_to_status(error: RunServiceError) -> StatusCode {
     match error {
         RunServiceError::InvalidInstruction
         | RunServiceError::InvalidRunId
-        | RunServiceError::InvalidLifecycleInput => StatusCode::BAD_REQUEST,
+        | RunServiceError::InvalidLifecycleInput
+        | RunServiceError::RunAlreadyTerminal => StatusCode::BAD_REQUEST,
         RunServiceError::Ledger(_) | RunServiceError::Projection(_) => {
             StatusCode::INTERNAL_SERVER_ERROR
         }
@@ -362,6 +363,61 @@ mod tests {
                     .uri(format!("/api/v1/runs/{run_id}/model-requests"))
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(r#"{"text":"   "}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn api_lifecycle_rejects_model_request_after_run_is_completed() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let app = build_router_with_service(SqliteRunService::new(store).shared());
+
+        let create_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/runs")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"instruction":"端到端生命周期"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_response.status(), StatusCode::OK);
+        let create_body = create_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let created: CreateRunResponse = serde_json::from_slice(&create_body).unwrap();
+
+        let complete_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/v1/runs/{}/complete", created.run_id))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"text":"总结完成"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(complete_response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/v1/runs/{}/model-requests", created.run_id))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"text":"不应恢复运行"}"#))
                     .unwrap(),
             )
             .await

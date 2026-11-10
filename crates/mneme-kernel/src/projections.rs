@@ -58,8 +58,10 @@ impl RunProjector {
                 }
                 OperationEventKind::RunModelRequested { .. }
                 | OperationEventKind::RunAssistantMessage { .. } => {
-                    if let Some(run) = runs.iter_mut().find(|run| run.run_id == event.run_id) {
-                        run.status = RunStatus::Running;
+                    if let Some(run) = runs
+                        .iter_mut()
+                        .find(|run| run.run_id == event.run_id && run.status == RunStatus::Running)
+                    {
                         run.updated_at = event.occurred_at;
                     }
                 }
@@ -149,5 +151,45 @@ mod tests {
         assert_eq!(runs[0].status, RunStatus::Running);
         assert_eq!(runs[0].instruction, "整理今天的工作");
         assert_eq!(runs[0].updated_at, events[2].occurred_at);
+    }
+
+    #[test]
+    fn replay_keeps_completed_run_terminal_after_late_intermediate_events() {
+        let run_id = RunId::new();
+        let events = vec![
+            OperationEvent::new_run_started(run_id, "整理今天的工作"),
+            OperationEvent::new_run_completed(run_id, "总结完成"),
+            OperationEvent::new_run_model_requested(run_id, "不应恢复运行"),
+            OperationEvent::new_run_assistant_message(run_id, "不应覆盖终态"),
+        ];
+
+        let runs = RunProjector::replay(&events);
+
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, RunStatus::Completed);
+        assert_eq!(runs[0].summary.as_deref(), Some("总结完成"));
+        assert!(runs[0].error.is_none());
+        assert_eq!(runs[0].completed_at, Some(events[1].occurred_at));
+        assert_eq!(runs[0].updated_at, events[1].occurred_at);
+    }
+
+    #[test]
+    fn replay_keeps_failed_run_terminal_after_late_intermediate_events() {
+        let run_id = RunId::new();
+        let events = vec![
+            OperationEvent::new_run_started(run_id, "整理今天的工作"),
+            OperationEvent::new_run_failed(run_id, "模型不可用"),
+            OperationEvent::new_run_model_requested(run_id, "不应恢复运行"),
+            OperationEvent::new_run_assistant_message(run_id, "不应覆盖终态"),
+        ];
+
+        let runs = RunProjector::replay(&events);
+
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, RunStatus::Failed);
+        assert_eq!(runs[0].error.as_deref(), Some("模型不可用"));
+        assert!(runs[0].summary.is_none());
+        assert_eq!(runs[0].failed_at, Some(events[1].occurred_at));
+        assert_eq!(runs[0].updated_at, events[1].occurred_at);
     }
 }

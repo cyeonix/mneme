@@ -153,14 +153,16 @@ impl SqliteRunService {
             .await
             .map_err(|error| RunServiceError::Ledger(error.to_string()))?;
 
-        let known_run_count: i64 =
-            sqlx::query_scalar("select count(*) from runs where run_id = ?1")
+        let current_status: Option<String> =
+            sqlx::query_scalar("select status from runs where run_id = ?1")
                 .bind(run_id.to_string())
-                .fetch_one(&mut *tx)
+                .fetch_optional(&mut *tx)
                 .await
                 .map_err(|error| RunServiceError::Projection(error.to_string()))?;
-        if known_run_count == 0 {
-            return Err(RunServiceError::InvalidRunId);
+        match current_status.as_deref() {
+            None => return Err(RunServiceError::InvalidRunId),
+            Some("running") => {}
+            Some(_) => return Err(RunServiceError::RunAlreadyTerminal),
         }
 
         sqlx::query(
@@ -179,7 +181,7 @@ impl SqliteRunService {
             OperationEventKind::RunModelRequested { .. }
             | OperationEventKind::RunAssistantMessage { .. } => {
                 sqlx::query(
-                    "update runs set status = 'running', updated_at = ?2 where run_id = ?1",
+                    "update runs set updated_at = ?2 where run_id = ?1 and status = 'running'",
                 )
                 .bind(run_id.to_string())
                 .bind(&occurred_at)
@@ -366,7 +368,7 @@ impl RunProjectionStore for SqliteRunProjectionStore {
             OperationEventKind::RunModelRequested { .. }
             | OperationEventKind::RunAssistantMessage { .. } => {
                 sqlx::query(
-                    "update runs set status = 'running', updated_at = ?2 where run_id = ?1",
+                    "update runs set updated_at = ?2 where run_id = ?1 and status = 'running'",
                 )
                 .bind(event.run_id.to_string())
                 .bind(occurred_at)
@@ -797,6 +799,57 @@ mod tests {
 
         assert_eq!(error, RunServiceError::InvalidRunId);
         assert!(service.list_events().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sqlite_run_service_rejects_post_completed_lifecycle_without_side_effects() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let service = SqliteRunService::new(store.clone());
+
+        let created = service.create_run("整理今天".to_string()).await.unwrap();
+        service
+            .complete_run(created.run_id, "总结完成".to_string())
+            .await
+            .unwrap();
+        let event_count_before: i64 = sqlx::query_scalar("select count(*) from operation_events")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+
+        let error = service
+            .request_model(created.run_id, "不应恢复运行".to_string())
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, RunServiceError::RunAlreadyTerminal);
+        let event_count_after: i64 = sqlx::query_scalar("select count(*) from operation_events")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(event_count_after, event_count_before);
+        let runs = service.list_runs().await.unwrap();
+        assert_eq!(runs[0].status, RunStatus::Completed);
+        assert_eq!(runs[0].summary.as_deref(), Some("总结完成"));
+    }
+
+    #[tokio::test]
+    async fn sqlite_run_store_keeps_failed_run_terminal_after_late_intermediate_event() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let runs = SqliteRunProjectionStore::new(store);
+        let run_id = RunId::new();
+        let started = OperationEvent::new_run_started(run_id, "执行任务");
+        let failed = OperationEvent::new_run_failed(run_id, "模型不可用");
+        let late_message = OperationEvent::new_run_assistant_message(run_id, "不应恢复运行");
+
+        runs.apply(&started).await.unwrap();
+        runs.apply(&failed).await.unwrap();
+        runs.apply(&late_message).await.unwrap();
+
+        let listed = runs.list_runs().await.unwrap();
+        assert_eq!(listed[0].status, RunStatus::Failed);
+        assert_eq!(listed[0].error.as_deref(), Some("模型不可用"));
+        assert_eq!(listed[0].failed_at, Some(failed.occurred_at));
+        assert_eq!(listed[0].updated_at, failed.occurred_at);
     }
 
     #[tokio::test]

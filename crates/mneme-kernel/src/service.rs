@@ -27,6 +27,8 @@ pub enum RunServiceError {
     InvalidRunId,
     #[error("run lifecycle input must not be blank")]
     InvalidLifecycleInput,
+    #[error("run is already terminal")]
+    RunAlreadyTerminal,
     #[error("operation ledger failed: {0}")]
     Ledger(String),
     #[error("run projection failed: {0}")]
@@ -81,15 +83,17 @@ impl ComposedRunService {
         event: OperationEvent,
     ) -> Result<RunLifecycleOutcome, RunServiceError> {
         let run_id = event.run_id;
-        if !self
+        let runs = self
             .run_store
             .list_runs()
             .await
-            .map_err(|error| RunServiceError::Projection(error.to_string()))?
+            .map_err(|error| RunServiceError::Projection(error.to_string()))?;
+        let run = runs
             .iter()
-            .any(|run| run.run_id == run_id)
-        {
-            return Err(RunServiceError::InvalidRunId);
+            .find(|run| run.run_id == run_id)
+            .ok_or(RunServiceError::InvalidRunId)?;
+        if run.status != crate::RunStatus::Running {
+            return Err(RunServiceError::RunAlreadyTerminal);
         }
 
         self.ledger
@@ -319,5 +323,55 @@ mod tests {
 
         assert_eq!(error, RunServiceError::InvalidRunId);
         assert!(service.list_events().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn composed_service_rejects_post_completed_lifecycle_without_side_effects() {
+        let ledger = InMemoryOperationLedger::new();
+        let run_store = InMemoryRunProjectionStore::new();
+        let service = ComposedRunService::new(ledger.clone().shared(), run_store.shared());
+
+        let created = service.create_run("整理今天".to_string()).await.unwrap();
+        service
+            .complete_run(created.run_id, "总结完成".to_string())
+            .await
+            .unwrap();
+        let events_before = service.list_events().await.unwrap().len();
+
+        let error = service
+            .request_model(created.run_id, "不应恢复运行".to_string())
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, RunServiceError::RunAlreadyTerminal);
+        assert_eq!(service.list_events().await.unwrap().len(), events_before);
+        let runs = service.list_runs().await.unwrap();
+        assert_eq!(runs[0].status, RunStatus::Completed);
+        assert_eq!(runs[0].summary.as_deref(), Some("总结完成"));
+    }
+
+    #[tokio::test]
+    async fn composed_service_rejects_post_failed_lifecycle_without_side_effects() {
+        let ledger = InMemoryOperationLedger::new();
+        let run_store = InMemoryRunProjectionStore::new();
+        let service = ComposedRunService::new(ledger.clone().shared(), run_store.shared());
+
+        let created = service.create_run("整理今天".to_string()).await.unwrap();
+        service
+            .fail_run(created.run_id, "模型不可用".to_string())
+            .await
+            .unwrap();
+        let events_before = service.list_events().await.unwrap().len();
+
+        let error = service
+            .record_assistant_message(created.run_id, "不应恢复运行".to_string())
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, RunServiceError::RunAlreadyTerminal);
+        assert_eq!(service.list_events().await.unwrap().len(), events_before);
+        let runs = service.list_runs().await.unwrap();
+        assert_eq!(runs[0].status, RunStatus::Failed);
+        assert_eq!(runs[0].error.as_deref(), Some("模型不可用"));
     }
 }
