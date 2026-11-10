@@ -46,6 +46,10 @@ curl -s "http://127.0.0.1:3766/api/v1/runs/$RUN_ID/complete" \
 curl -s http://127.0.0.1:3766/api/v1/runs
 ```
 
+## Milestone 4 衔接
+
+Milestone 4 在同一个 Operation Ledger 和 `RunService` 边界上扩展 tool events：tool request 记录工具名、effect 和 input JSON；approval/denial/result/failure 记录审批与结果状态。它仍然不执行真实工具，只把工具意图和审批结果写成可审计事件。
+
 ## 后续衔接
 
 Milestone 4 可以把 tool request/approval 作为新的事件类型追加到同一个 ledger；Milestone 7 可以让 worker runtime 调用同一组 `RunService` lifecycle 方法，而不是直接写 SQLite。

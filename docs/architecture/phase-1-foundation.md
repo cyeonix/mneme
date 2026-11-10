@@ -29,6 +29,8 @@ Milestone 1 在不改变外部 API 基本形状的前提下，把内存 ledger �
 
 Milestone 2 进一步把创建 run 的业务流程收敛进 Kernel service，避免 HTTP route 直接组合多个存储写入。
 
+Milestone 4 增加 effect-typed tool approval event 记录，同时保持 daemon/API adapters 位于 `RunService` 之后。
+
 ## 验证
 
 ```bash

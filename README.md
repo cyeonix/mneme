@@ -94,6 +94,26 @@ curl -s "http://127.0.0.1:3766/api/v1/runs/$RUN_ID/complete" \
 curl -s http://127.0.0.1:3766/api/v1/runs
 ```
 
+### 记录工具事件
+
+Milestone 4 提供本地手动验证路径，用来确认 tool request、approval、result 事件会追加到 Operation Ledger，并更新 Workbench tool activity。启动 daemon 后可以用以下请求记录工具事件：
+
+```bash
+RUN_ID=$(curl -s http://127.0.0.1:3766/api/v1/runs \
+  -H 'content-type: application/json' \
+  -d '{"instruction":"读取 README"}' | jq -r '.run_id')
+
+TOOL_CALL_ID=$(curl -s http://127.0.0.1:3766/api/v1/runs/$RUN_ID/tool-calls \
+  -H 'content-type: application/json' \
+  -d '{"tool_name":"read_file","effect":"read_only","input_json":{"path":"README.md"}}' | jq -r '.tool_call_id')
+
+curl -s http://127.0.0.1:3766/api/v1/runs/$RUN_ID/tool-calls/$TOOL_CALL_ID/result \
+  -H 'content-type: application/json' \
+  -d '{"output_json":{"content":"示例内容"}}'
+```
+
+这些 endpoint 只记录工具事件，不执行真实文件读取。
+
 ## 启动基础阶段 Web shell
 
 ```bash
