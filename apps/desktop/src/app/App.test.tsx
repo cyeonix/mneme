@@ -32,6 +32,18 @@ function createClient(): MnemeApiClient {
     async createRun() {
       return { run_id: 'run-123' };
     },
+    async requestModel() {
+      return { run_id: 'run-123' };
+    },
+    async recordAssistantMessage() {
+      return { run_id: 'run-123' };
+    },
+    async completeRun() {
+      return { run_id: 'run-123' };
+    },
+    async failRun() {
+      return { run_id: 'run-123' };
+    },
   };
 }
 

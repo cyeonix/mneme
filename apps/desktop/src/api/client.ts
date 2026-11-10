@@ -37,11 +37,23 @@ export interface CreateRunResponse {
   run_id: string;
 }
 
+export interface LifecycleTextRequest {
+  text: string;
+}
+
+export interface RunLifecycleResponse {
+  run_id: string;
+}
+
 export interface MnemeApiClient {
   getHealth(): Promise<KernelHealth>;
   listEvents(): Promise<EventsResponse>;
   listRuns(): Promise<RunsResponse>;
   createRun(instruction: string): Promise<CreateRunResponse>;
+  requestModel(runId: string, text: string): Promise<RunLifecycleResponse>;
+  recordAssistantMessage(runId: string, text: string): Promise<RunLifecycleResponse>;
+  completeRun(runId: string, text: string): Promise<RunLifecycleResponse>;
+  failRun(runId: string, text: string): Promise<RunLifecycleResponse>;
 }
 
 type FetchLike = typeof fetch;
@@ -51,6 +63,21 @@ async function parseJsonResponse<T>(response: Response): Promise<T> {
     throw new Error(`Mneme API request failed with status ${response.status}`);
   }
   return (await response.json()) as T;
+}
+
+async function postLifecycleText(
+  normalizedBaseUrl: string,
+  fetchImpl: FetchLike,
+  runId: string,
+  suffix: string,
+  text: string,
+): Promise<RunLifecycleResponse> {
+  const response = await fetchImpl(`${normalizedBaseUrl}/api/v1/runs/${runId}/${suffix}`, {
+    method: 'POST',
+    headers: { accept: 'application/json', 'content-type': 'application/json' },
+    body: JSON.stringify({ text }),
+  });
+  return parseJsonResponse<RunLifecycleResponse>(response);
 }
 
 export function createMnemeApiClient(baseUrl: string, fetchImpl: FetchLike = fetch): MnemeApiClient {
@@ -86,6 +113,22 @@ export function createMnemeApiClient(baseUrl: string, fetchImpl: FetchLike = fet
         body: JSON.stringify({ instruction }),
       });
       return parseJsonResponse<CreateRunResponse>(response);
+    },
+
+    requestModel(runId: string, text: string) {
+      return postLifecycleText(normalizedBaseUrl, fetchImpl, runId, 'model-requests', text);
+    },
+
+    recordAssistantMessage(runId: string, text: string) {
+      return postLifecycleText(normalizedBaseUrl, fetchImpl, runId, 'assistant-messages', text);
+    },
+
+    completeRun(runId: string, text: string) {
+      return postLifecycleText(normalizedBaseUrl, fetchImpl, runId, 'complete', text);
+    },
+
+    failRun(runId: string, text: string) {
+      return postLifecycleText(normalizedBaseUrl, fetchImpl, runId, 'fail', text);
     },
   };
 }

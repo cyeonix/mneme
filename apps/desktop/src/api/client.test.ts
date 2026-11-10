@@ -67,4 +67,27 @@ describe('createMnemeApiClient', () => {
     });
     expect(fetchImpl).toHaveBeenCalledWith('http://127.0.0.1:3766/api/v1/runs', expect.any(Object));
   });
+
+  it('posts lifecycle updates to run-specific endpoints', async () => {
+    const calls: Array<{ url: string; body?: string }> = [];
+    const fetchImpl = vi.fn(async (url: string, init?: RequestInit) => {
+      calls.push({ url, body: init?.body?.toString() });
+      return new Response(JSON.stringify({ run_id: 'run-1' }), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const client = createMnemeApiClient('http://127.0.0.1:3766/', fetchImpl);
+
+    await client.requestModel('run-1', '请总结今天');
+    await client.recordAssistantMessage('run-1', '今天完成了 M2。');
+    await client.completeRun('run-1', '总结完成');
+    await client.failRun('run-1', '模型不可用');
+
+    expect(calls.map((call) => call.url)).toEqual([
+      'http://127.0.0.1:3766/api/v1/runs/run-1/model-requests',
+      'http://127.0.0.1:3766/api/v1/runs/run-1/assistant-messages',
+      'http://127.0.0.1:3766/api/v1/runs/run-1/complete',
+      'http://127.0.0.1:3766/api/v1/runs/run-1/fail',
+    ]);
+    expect(calls[0].body).toBe(JSON.stringify({ text: '请总结今天' }));
+  });
 });
