@@ -73,6 +73,8 @@ impl OperationLedger for SqliteOperationLedger {
     async fn append(&self, event: OperationEvent) -> Result<(), LedgerError> {
         let kind_type = match &event.kind {
             OperationEventKind::RunStarted { .. } => "run_started",
+            OperationEventKind::RunModelRequested { .. } => "run_model_requested",
+            OperationEventKind::RunAssistantMessage { .. } => "run_assistant_message",
             OperationEventKind::RunCompleted { .. } => "run_completed",
             OperationEventKind::RunFailed { .. } => "run_failed",
         };
@@ -225,6 +227,17 @@ impl RunProjectionStore for SqliteRunProjectionStore {
                 )
                 .bind(event.run_id.to_string())
                 .bind(instruction)
+                .bind(occurred_at)
+                .execute(self.store.pool())
+                .await
+                .map_err(|error| RunProjectionError::Storage(error.to_string()))?;
+            }
+            OperationEventKind::RunModelRequested { .. }
+            | OperationEventKind::RunAssistantMessage { .. } => {
+                sqlx::query(
+                    "update runs set status = 'running', updated_at = ?2 where run_id = ?1",
+                )
+                .bind(event.run_id.to_string())
                 .bind(occurred_at)
                 .execute(self.store.pool())
                 .await
@@ -462,6 +475,44 @@ mod tests {
             ledger.list_for_run(selected_run).await.unwrap(),
             vec![selected]
         );
+    }
+
+    #[tokio::test]
+    async fn sqlite_ledger_roundtrips_model_and_assistant_events() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let ledger = SqliteOperationLedger::new(store);
+        let run_id = RunId::new();
+
+        ledger
+            .append(OperationEvent::new_run_started(run_id, "整理今天"))
+            .await
+            .unwrap();
+        ledger
+            .append(OperationEvent::new_run_model_requested(
+                run_id,
+                "请总结今天",
+            ))
+            .await
+            .unwrap();
+        ledger
+            .append(OperationEvent::new_run_assistant_message(
+                run_id,
+                "今天完成了 M2。",
+            ))
+            .await
+            .unwrap();
+
+        let events = ledger.list_for_run(run_id).await.unwrap();
+
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            events[1].kind,
+            OperationEventKind::RunModelRequested { .. }
+        ));
+        assert!(matches!(
+            events[2].kind,
+            OperationEventKind::RunAssistantMessage { .. }
+        ));
     }
 
     #[tokio::test]

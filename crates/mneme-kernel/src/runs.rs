@@ -67,6 +67,13 @@ impl RunProjectionStore for InMemoryRunProjectionStore {
                     });
                 }
             }
+            OperationEventKind::RunModelRequested { .. }
+            | OperationEventKind::RunAssistantMessage { .. } => {
+                if let Some(run) = runs.iter_mut().find(|run| run.run_id == event.run_id) {
+                    run.status = RunStatus::Running;
+                    run.updated_at = event.occurred_at;
+                }
+            }
             OperationEventKind::RunCompleted { summary } => {
                 if let Some(run) = runs.iter_mut().find(|run| run.run_id == event.run_id) {
                     run.status = RunStatus::Completed;

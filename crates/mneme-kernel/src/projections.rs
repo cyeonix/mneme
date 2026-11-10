@@ -56,6 +56,13 @@ impl RunProjector {
                         });
                     }
                 }
+                OperationEventKind::RunModelRequested { .. }
+                | OperationEventKind::RunAssistantMessage { .. } => {
+                    if let Some(run) = runs.iter_mut().find(|run| run.run_id == event.run_id) {
+                        run.status = RunStatus::Running;
+                        run.updated_at = event.occurred_at;
+                    }
+                }
                 OperationEventKind::RunCompleted { summary } => {
                     if let Some(run) = runs.iter_mut().find(|run| run.run_id == event.run_id) {
                         run.status = RunStatus::Completed;
@@ -124,5 +131,23 @@ mod tests {
         assert_eq!(runs[0].run_id, run_id);
         assert_eq!(runs[0].instruction, "第二次启动");
         assert_eq!(runs[0].status, RunStatus::Running);
+    }
+
+    #[test]
+    fn replay_keeps_run_running_after_model_and_assistant_events() {
+        let run_id = RunId::new();
+        let events = vec![
+            OperationEvent::new_run_started(run_id, "整理今天的工作"),
+            OperationEvent::new_run_model_requested(run_id, "请总结今天的工作"),
+            OperationEvent::new_run_assistant_message(run_id, "今天完成了服务边界收敛。"),
+        ];
+
+        let runs = RunProjector::replay(&events);
+
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].run_id, run_id);
+        assert_eq!(runs[0].status, RunStatus::Running);
+        assert_eq!(runs[0].instruction, "整理今天的工作");
+        assert_eq!(runs[0].updated_at, events[2].occurred_at);
     }
 }
