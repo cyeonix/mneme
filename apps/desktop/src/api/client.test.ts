@@ -178,4 +178,65 @@ describe('createMnemeApiClient', () => {
       },
     ]);
   });
+
+  it('creates an artifact for a run through the local API', async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(JSON.stringify({ artifact_id: 'artifact-123' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+    const client = createMnemeApiClient('http://127.0.0.1:3766/', fetchMock as typeof fetch);
+
+    const response = await client.createArtifact('run-1', {
+      title: 'Run summary',
+      kind: 'markdown',
+      mime_type: 'text/markdown',
+      content: '# Summary',
+    });
+
+    expect(response.artifact_id).toBe('artifact-123');
+    expect(fetchMock).toHaveBeenCalledWith('http://127.0.0.1:3766/api/v1/runs/run-1/artifacts', {
+      method: 'POST',
+      headers: { accept: 'application/json', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        title: 'Run summary',
+        kind: 'markdown',
+        mime_type: 'text/markdown',
+        content: '# Summary',
+      }),
+    });
+  });
+
+  it('creates a context bundle for a run through the local API', async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(JSON.stringify({ context_bundle_id: 'context-bundle-123' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+    const client = createMnemeApiClient('http://127.0.0.1:3766/', fetchMock as typeof fetch);
+
+    const response = await client.createContextBundle('run-1', {
+      title: 'Debug context',
+      summary: 'User report',
+      artifact_ids: [],
+      event_ids: [],
+    });
+
+    expect(response.context_bundle_id).toBe('context-bundle-123');
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://127.0.0.1:3766/api/v1/runs/run-1/context-bundles',
+      {
+        method: 'POST',
+        headers: { accept: 'application/json', 'content-type': 'application/json' },
+        body: JSON.stringify({
+          title: 'Debug context',
+          summary: 'User report',
+          artifact_ids: [],
+          event_ids: [],
+        }),
+      },
+    );
+  });
 });

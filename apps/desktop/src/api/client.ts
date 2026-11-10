@@ -74,6 +74,64 @@ export interface ToolLifecycleResponse {
   tool_call_id: string;
 }
 
+export type ArtifactKind = 'text' | 'markdown' | 'json' | 'binary';
+
+export interface ArtifactRecord {
+  artifact_id: string;
+  run_id: string;
+  title: string;
+  kind: ArtifactKind;
+  mime_type: string;
+  sha256: string;
+  byte_len: number;
+  created_at: string;
+}
+
+export interface ArtifactDetail {
+  artifact: ArtifactRecord;
+  content: string | null;
+}
+
+export interface CreateArtifactRequest {
+  title: string;
+  kind: ArtifactKind;
+  mime_type: string;
+  content: string;
+}
+
+export interface CreateArtifactResponse {
+  artifact_id: string;
+}
+
+export interface ArtifactsResponse {
+  artifacts: ArtifactRecord[];
+}
+
+export interface ContextBundleRecord {
+  context_bundle_id: string;
+  run_id: string;
+  title: string;
+  summary: string;
+  artifact_ids: string[];
+  event_ids: string[];
+  created_at: string;
+}
+
+export interface CreateContextBundleRequest {
+  title: string;
+  summary: string;
+  artifact_ids: string[];
+  event_ids: string[];
+}
+
+export interface CreateContextBundleResponse {
+  context_bundle_id: string;
+}
+
+export interface ContextBundlesResponse {
+  context_bundles: ContextBundleRecord[];
+}
+
 export interface MnemeApiClient {
   getHealth(): Promise<KernelHealth>;
   listEvents(): Promise<EventsResponse>;
@@ -92,6 +150,15 @@ export interface MnemeApiClient {
     outputJson: unknown,
   ): Promise<ToolLifecycleResponse>;
   recordToolFailure(runId: string, toolCallId: string, text: string): Promise<ToolLifecycleResponse>;
+  listArtifacts(): Promise<ArtifactsResponse>;
+  createArtifact(runId: string, request: CreateArtifactRequest): Promise<CreateArtifactResponse>;
+  getArtifact(artifactId: string): Promise<ArtifactDetail>;
+  listContextBundles(): Promise<ContextBundlesResponse>;
+  createContextBundle(
+    runId: string,
+    request: CreateContextBundleRequest,
+  ): Promise<CreateContextBundleResponse>;
+  getContextBundle(contextBundleId: string): Promise<ContextBundleRecord>;
 }
 
 type FetchLike = typeof fetch;
@@ -219,6 +286,58 @@ export function createMnemeApiClient(baseUrl: string, fetchImpl: FetchLike = fet
 
     recordToolFailure(runId: string, toolCallId: string, text: string) {
       return postToolText(normalizedBaseUrl, fetchImpl, runId, toolCallId, 'fail', text);
+    },
+
+    async listArtifacts() {
+      const response = await fetchImpl(`${normalizedBaseUrl}/api/v1/artifacts`, {
+        headers: { accept: 'application/json' },
+      });
+      return parseJsonResponse<ArtifactsResponse>(response);
+    },
+
+    async createArtifact(runId: string, request: CreateArtifactRequest) {
+      const response = await fetchImpl(`${normalizedBaseUrl}/api/v1/runs/${runId}/artifacts`, {
+        method: 'POST',
+        headers: { accept: 'application/json', 'content-type': 'application/json' },
+        body: JSON.stringify(request),
+      });
+      return parseJsonResponse<CreateArtifactResponse>(response);
+    },
+
+    async getArtifact(artifactId: string) {
+      const response = await fetchImpl(`${normalizedBaseUrl}/api/v1/artifacts/${artifactId}`, {
+        headers: { accept: 'application/json' },
+      });
+      return parseJsonResponse<ArtifactDetail>(response);
+    },
+
+    async listContextBundles() {
+      const response = await fetchImpl(`${normalizedBaseUrl}/api/v1/context-bundles`, {
+        headers: { accept: 'application/json' },
+      });
+      return parseJsonResponse<ContextBundlesResponse>(response);
+    },
+
+    async createContextBundle(runId: string, request: CreateContextBundleRequest) {
+      const response = await fetchImpl(
+        `${normalizedBaseUrl}/api/v1/runs/${runId}/context-bundles`,
+        {
+          method: 'POST',
+          headers: { accept: 'application/json', 'content-type': 'application/json' },
+          body: JSON.stringify(request),
+        },
+      );
+      return parseJsonResponse<CreateContextBundleResponse>(response);
+    },
+
+    async getContextBundle(contextBundleId: string) {
+      const response = await fetchImpl(
+        `${normalizedBaseUrl}/api/v1/context-bundles/${contextBundleId}`,
+        {
+          headers: { accept: 'application/json' },
+        },
+      );
+      return parseJsonResponse<ContextBundleRecord>(response);
     },
   };
 }

@@ -65,6 +65,44 @@ function createTestClient(state: TestClientState = {}): MnemeApiClient {
     async recordToolFailure() {
       return { run_id: 'run-123', tool_call_id: 'tool-123' };
     },
+    async listArtifacts() {
+      return { artifacts: [] };
+    },
+    async createArtifact() {
+      return { artifact_id: 'artifact-123' };
+    },
+    async getArtifact() {
+      return {
+        artifact: {
+          artifact_id: 'artifact-123',
+          run_id: 'run-123',
+          title: 'Run summary',
+          kind: 'markdown',
+          mime_type: 'text/markdown',
+          sha256: 'sha256',
+          byte_len: 9,
+          created_at: '2026-11-10T00:00:00Z',
+        },
+        content: '# Summary',
+      };
+    },
+    async listContextBundles() {
+      return { context_bundles: [] };
+    },
+    async createContextBundle() {
+      return { context_bundle_id: 'context-bundle-123' };
+    },
+    async getContextBundle() {
+      return {
+        context_bundle_id: 'context-bundle-123',
+        run_id: 'run-123',
+        title: 'Debug context',
+        summary: 'User report',
+        artifact_ids: [],
+        event_ids: [],
+        created_at: '2026-11-10T00:00:00Z',
+      };
+    },
   };
 }
 
