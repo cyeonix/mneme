@@ -92,7 +92,7 @@ mod tests {
         http::{header, Method, Request},
     };
     use http_body_util::BodyExt;
-    use mneme_kernel::{ComposedRunService, OperationLedger};
+    use mneme_kernel::{ComposedRunService, OperationLedger, SqliteRunService, SqliteStore};
     use serde_json::json;
     use tower::ServiceExt;
 
@@ -201,5 +201,65 @@ mod tests {
         let payload: RunsResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload.runs.len(), 1);
         assert_eq!(payload.runs[0].instruction, "展示 runs");
+    }
+
+    #[tokio::test]
+    async fn api_create_run_uses_sqlite_run_service_projection() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let app = build_router_with_service(SqliteRunService::new(store).shared());
+
+        let create_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/runs")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"instruction":"SQLite service run"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_response.status(), StatusCode::OK);
+
+        let events_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(events_response.status(), StatusCode::OK);
+        let events_body = events_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let events_payload: EventsResponse = serde_json::from_slice(&events_body).unwrap();
+        assert_eq!(events_payload.events.len(), 1);
+
+        let runs_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/runs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(runs_response.status(), StatusCode::OK);
+        let body = runs_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let payload: RunsResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.runs.len(), 1);
+        assert_eq!(payload.runs[0].instruction, "SQLite service run");
     }
 }
