@@ -27,6 +27,8 @@ React Workbench
 
 Milestone 1 在不改变外部 API 基本形状的前提下，把内存 ledger 替换为 SQLite ledger，并加入 runs 投影。Phase 1 的 API route、daemon、TypeScript client 和 Workbench 会继续存在，只是数据来源从内存对象变成可持久化 Kernel 数据面。
 
+Milestone 2 进一步把创建 run 的业务流程收敛进 Kernel service，避免 HTTP route 直接组合多个存储写入。
+
 ## 验证
 
 ```bash

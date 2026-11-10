@@ -32,6 +32,10 @@ Daemon 启动时通过 `MNEME_DB_URL` 选择 SQLite 数据库；未设置时使�
 
 这种分工让写入路径保持可追溯，同时允许读模型随 UI 和查询需求调整；只要 `operation_events` 保留完整，`runs` 就可以通过 `RunProjector::replay()` 确定性恢复。
 
+## Milestone 2 之后的服务边界
+
+Milestone 1 建立了 SQLite 数据面；Milestone 2 在其上新增 `RunService`，让 API/daemon/未来 typed RPC 共享同一业务入口。`operation_events` 与 `runs` 的职责不变，但 run 创建不再由 API route 直接编排。
+
 ## 验证
 
 常用验证：

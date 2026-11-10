@@ -42,6 +42,10 @@ MNEME_DB_URL='sqlite://.mneme-dev/mneme.db?mode=rwc' cargo run -p mneme-daemon
 
 Operation Ledger 的 `operation_events` 表是事实源；`runs` 表是可重建投影。
 
+## Kernel service boundary
+
+HTTP API 不直接拼接 ledger 与 projection 写入流程。创建 run 会进入 Kernel `RunService`；daemon 默认使用 SQLite service，在同一事务内写入 `operation_events` 与 `runs`。
+
 如需在启动时从 `operation_events` 修复 `runs` 读模型，可以显式开启：
 
 ```bash
