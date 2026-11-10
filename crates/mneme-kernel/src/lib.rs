@@ -18,7 +18,7 @@ pub use runs::{
 };
 pub use service::{
     ComposedRunService, CreateRunOutcome, RunLifecycleOutcome, RunService, RunServiceError,
-    SharedRunService,
+    SharedRunService, ToolCallOutcome, ToolLifecycleOutcome,
 };
 pub use storage::{
     SqliteOperationLedger, SqliteRunProjectionStore, SqliteRunService, SqliteStore,

@@ -2,9 +2,11 @@ use crate::{
     CreateRunOutcome, EventId, LedgerError, OperationEvent, OperationEventKind, OperationLedger,
     RunId, RunLifecycleOutcome, RunProjection, RunProjectionError, RunProjectionStore,
     RunProjector, RunService, RunServiceError, RunStatus, SharedOperationLedger,
-    SharedRunProjectionStore, SharedRunService,
+    SharedRunProjectionStore, SharedRunService, ToolApprovalDecision, ToolApprovalPolicy,
+    ToolCallId, ToolCallOutcome, ToolEffect, ToolLifecycleOutcome,
 };
 use async_trait::async_trait;
+use serde_json::Value;
 use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
 use std::{str::FromStr, sync::Arc};
 use thiserror::Error;
@@ -133,6 +135,75 @@ impl SqliteRunService {
         Arc::new(self)
     }
 
+    async fn append_tool_events_transactionally(
+        &self,
+        events: Vec<OperationEvent>,
+    ) -> Result<(), RunServiceError> {
+        let run_id = events
+            .first()
+            .map(|event| event.run_id)
+            .ok_or(RunServiceError::InvalidToolInput)?;
+        let updated_at = events
+            .last()
+            .ok_or(RunServiceError::InvalidToolInput)?
+            .occurred_at
+            .format(&Rfc3339)
+            .map_err(|error| RunServiceError::Ledger(error.to_string()))?;
+
+        let mut tx = self
+            .store
+            .pool()
+            .begin()
+            .await
+            .map_err(|error| RunServiceError::Ledger(error.to_string()))?;
+
+        let current_status: Option<String> =
+            sqlx::query_scalar("select status from runs where run_id = ?1")
+                .bind(run_id.to_string())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|error| RunServiceError::Projection(error.to_string()))?;
+        match current_status.as_deref() {
+            None => return Err(RunServiceError::InvalidRunId),
+            Some("running") => {}
+            Some(_) => return Err(RunServiceError::RunAlreadyTerminal),
+        }
+
+        for event in events {
+            let occurred_at = event
+                .occurred_at
+                .format(&Rfc3339)
+                .map_err(|error| RunServiceError::Ledger(error.to_string()))?;
+            let kind_type = kind_type_for_event(&event.kind);
+            let payload_json = serde_json::to_string(&event.kind)
+                .map_err(|error| RunServiceError::Ledger(error.to_string()))?;
+            sqlx::query(
+                "insert into operation_events (event_id, run_id, occurred_at, kind_type, payload_json) values (?1, ?2, ?3, ?4, ?5)",
+            )
+            .bind(event.id.to_string())
+            .bind(run_id.to_string())
+            .bind(occurred_at)
+            .bind(kind_type)
+            .bind(payload_json)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| RunServiceError::Ledger(error.to_string()))?;
+        }
+
+        sqlx::query("update runs set updated_at = ?2 where run_id = ?1 and status = 'running'")
+            .bind(run_id.to_string())
+            .bind(updated_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| RunServiceError::Projection(error.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|error| RunServiceError::Ledger(error.to_string()))?;
+
+        Ok(())
+    }
+
     async fn append_lifecycle_event_transactionally(
         &self,
         event: OperationEvent,
@@ -226,6 +297,14 @@ impl SqliteRunService {
         let value = value.trim().to_string();
         if value.is_empty() {
             return Err(RunServiceError::InvalidLifecycleInput);
+        }
+        Ok(value)
+    }
+
+    fn non_blank_tool_text(value: String) -> Result<String, RunServiceError> {
+        let value = value.trim().to_string();
+        if value.is_empty() {
+            return Err(RunServiceError::InvalidToolInput);
         }
         Ok(value)
     }
@@ -327,6 +406,113 @@ impl RunService for SqliteRunService {
         let reason = Self::non_blank_lifecycle_input(reason)?;
         self.append_lifecycle_event_transactionally(OperationEvent::new_run_failed(run_id, reason))
             .await
+    }
+
+    async fn request_tool_call(
+        &self,
+        run_id: RunId,
+        tool_name: String,
+        effect: ToolEffect,
+        input_json: Value,
+    ) -> Result<ToolCallOutcome, RunServiceError> {
+        let tool_name = Self::non_blank_tool_text(tool_name)?;
+        let tool_call_id = ToolCallId::new();
+        let mut events = vec![OperationEvent::new_tool_call_requested(
+            run_id,
+            tool_call_id,
+            tool_name,
+            effect.clone(),
+            input_json,
+        )];
+        let approval = ToolApprovalPolicy::default().decision_for(&effect);
+        if approval == ToolApprovalDecision::AutoApproved {
+            events.push(OperationEvent::new_tool_call_approved(
+                run_id,
+                tool_call_id,
+                "mneme-policy",
+            ));
+        }
+        self.append_tool_events_transactionally(events).await?;
+        Ok(ToolCallOutcome {
+            run_id,
+            tool_call_id,
+            approval,
+        })
+    }
+
+    async fn approve_tool_call(
+        &self,
+        run_id: RunId,
+        tool_call_id: ToolCallId,
+        approved_by: String,
+    ) -> Result<ToolLifecycleOutcome, RunServiceError> {
+        let approved_by = Self::non_blank_tool_text(approved_by)?;
+        self.append_tool_events_transactionally(vec![OperationEvent::new_tool_call_approved(
+            run_id,
+            tool_call_id,
+            approved_by,
+        )])
+        .await?;
+        Ok(ToolLifecycleOutcome {
+            run_id,
+            tool_call_id,
+        })
+    }
+
+    async fn deny_tool_call(
+        &self,
+        run_id: RunId,
+        tool_call_id: ToolCallId,
+        reason: String,
+    ) -> Result<ToolLifecycleOutcome, RunServiceError> {
+        let reason = Self::non_blank_tool_text(reason)?;
+        self.append_tool_events_transactionally(vec![OperationEvent::new_tool_call_denied(
+            run_id,
+            tool_call_id,
+            reason,
+        )])
+        .await?;
+        Ok(ToolLifecycleOutcome {
+            run_id,
+            tool_call_id,
+        })
+    }
+
+    async fn record_tool_result(
+        &self,
+        run_id: RunId,
+        tool_call_id: ToolCallId,
+        output_json: Value,
+    ) -> Result<ToolLifecycleOutcome, RunServiceError> {
+        self.append_tool_events_transactionally(vec![OperationEvent::new_tool_call_completed(
+            run_id,
+            tool_call_id,
+            output_json,
+        )])
+        .await?;
+        Ok(ToolLifecycleOutcome {
+            run_id,
+            tool_call_id,
+        })
+    }
+
+    async fn record_tool_failure(
+        &self,
+        run_id: RunId,
+        tool_call_id: ToolCallId,
+        reason: String,
+    ) -> Result<ToolLifecycleOutcome, RunServiceError> {
+        let reason = Self::non_blank_tool_text(reason)?;
+        self.append_tool_events_transactionally(vec![OperationEvent::new_tool_call_failed(
+            run_id,
+            tool_call_id,
+            reason,
+        )])
+        .await?;
+        Ok(ToolLifecycleOutcome {
+            run_id,
+            tool_call_id,
+        })
     }
 
     async fn list_events(&self) -> Result<Vec<OperationEvent>, RunServiceError> {
@@ -591,7 +777,7 @@ mod tests {
     use super::*;
     use crate::{
         OperationEvent, OperationLedger, RunId, RunProjectionStore, RunProjector, ToolCallId,
-        ToolEffect,
+        ToolCallStatus, ToolEffect, ToolProjector,
     };
 
     #[tokio::test]
@@ -835,6 +1021,68 @@ mod tests {
         assert_eq!(runs[0].run_id, created.run_id);
         assert_eq!(runs[0].status, RunStatus::Completed);
         assert_eq!(runs[0].summary.as_deref(), Some("总结完成"));
+    }
+
+    #[tokio::test]
+    async fn sqlite_run_service_records_tool_request_and_result() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let service = SqliteRunService::new(store.clone());
+        let created = service.create_run("读取文件".to_string()).await.unwrap();
+
+        let requested = service
+            .request_tool_call(
+                created.run_id,
+                "read_file".to_string(),
+                ToolEffect::ReadOnly,
+                serde_json::json!({ "path": "README.md" }),
+            )
+            .await
+            .unwrap();
+        service
+            .record_tool_result(
+                created.run_id,
+                requested.tool_call_id,
+                serde_json::json!({ "content": "hello" }),
+            )
+            .await
+            .unwrap();
+
+        let events = service.list_events().await.unwrap();
+        let tools = ToolProjector::replay(&events);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].tool_call_id, requested.tool_call_id);
+        assert_eq!(tools[0].status, ToolCallStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn sqlite_run_service_rejects_tool_request_after_failed_run_without_side_effects() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let service = SqliteRunService::new(store.clone());
+        let created = service
+            .create_run("失败后不能请求工具".to_string())
+            .await
+            .unwrap();
+        service
+            .fail_run(created.run_id, "模型失败".to_string())
+            .await
+            .unwrap();
+        let event_count_before = service.list_events().await.unwrap().len();
+
+        let error = service
+            .request_tool_call(
+                created.run_id,
+                "read_file".to_string(),
+                ToolEffect::ReadOnly,
+                serde_json::json!({ "path": "README.md" }),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, RunServiceError::RunAlreadyTerminal);
+        assert_eq!(
+            service.list_events().await.unwrap().len(),
+            event_count_before
+        );
     }
 
     #[tokio::test]

@@ -3,8 +3,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use thiserror::Error;
 
+use serde_json::Value;
+
 use crate::{
-    OperationEvent, RunId, RunProjection, SharedOperationLedger, SharedRunProjectionStore,
+    OperationEvent, OperationEventKind, RunId, RunProjection, SharedOperationLedger,
+    SharedRunProjectionStore, ToolApprovalDecision, ToolApprovalPolicy, ToolCallId, ToolEffect,
 };
 
 pub type SharedRunService = Arc<dyn RunService>;
@@ -19,6 +22,19 @@ pub struct RunLifecycleOutcome {
     pub run_id: RunId,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCallOutcome {
+    pub run_id: RunId,
+    pub tool_call_id: ToolCallId,
+    pub approval: ToolApprovalDecision,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolLifecycleOutcome {
+    pub run_id: RunId,
+    pub tool_call_id: ToolCallId,
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum RunServiceError {
     #[error("run instruction must not be blank")]
@@ -27,6 +43,8 @@ pub enum RunServiceError {
     InvalidRunId,
     #[error("run lifecycle input must not be blank")]
     InvalidLifecycleInput,
+    #[error("tool input must not be blank")]
+    InvalidToolInput,
     #[error("run is already terminal")]
     RunAlreadyTerminal,
     #[error("operation ledger failed: {0}")]
@@ -58,6 +76,37 @@ pub trait RunService: Send + Sync {
         run_id: RunId,
         reason: String,
     ) -> Result<RunLifecycleOutcome, RunServiceError>;
+    async fn request_tool_call(
+        &self,
+        run_id: RunId,
+        tool_name: String,
+        effect: ToolEffect,
+        input_json: Value,
+    ) -> Result<ToolCallOutcome, RunServiceError>;
+    async fn approve_tool_call(
+        &self,
+        run_id: RunId,
+        tool_call_id: ToolCallId,
+        approved_by: String,
+    ) -> Result<ToolLifecycleOutcome, RunServiceError>;
+    async fn deny_tool_call(
+        &self,
+        run_id: RunId,
+        tool_call_id: ToolCallId,
+        reason: String,
+    ) -> Result<ToolLifecycleOutcome, RunServiceError>;
+    async fn record_tool_result(
+        &self,
+        run_id: RunId,
+        tool_call_id: ToolCallId,
+        output_json: Value,
+    ) -> Result<ToolLifecycleOutcome, RunServiceError>;
+    async fn record_tool_failure(
+        &self,
+        run_id: RunId,
+        tool_call_id: ToolCallId,
+        reason: String,
+    ) -> Result<ToolLifecycleOutcome, RunServiceError>;
     async fn list_events(&self) -> Result<Vec<OperationEvent>, RunServiceError>;
     async fn list_runs(&self) -> Result<Vec<RunProjection>, RunServiceError>;
     async fn rebuild_run_projections(&self) -> Result<Vec<RunProjection>, RunServiceError>;
@@ -83,18 +132,7 @@ impl ComposedRunService {
         event: OperationEvent,
     ) -> Result<RunLifecycleOutcome, RunServiceError> {
         let run_id = event.run_id;
-        let runs = self
-            .run_store
-            .list_runs()
-            .await
-            .map_err(|error| RunServiceError::Projection(error.to_string()))?;
-        let run = runs
-            .iter()
-            .find(|run| run.run_id == run_id)
-            .ok_or(RunServiceError::InvalidRunId)?;
-        if run.status != crate::RunStatus::Running {
-            return Err(RunServiceError::RunAlreadyTerminal);
-        }
+        self.ensure_running_run(run_id).await?;
 
         self.ledger
             .append(event.clone())
@@ -107,12 +145,69 @@ impl ComposedRunService {
         Ok(RunLifecycleOutcome { run_id })
     }
 
+    async fn ensure_running_run(&self, run_id: RunId) -> Result<(), RunServiceError> {
+        let runs = self
+            .run_store
+            .list_runs()
+            .await
+            .map_err(|error| RunServiceError::Projection(error.to_string()))?;
+        let run = runs
+            .iter()
+            .find(|run| run.run_id == run_id)
+            .ok_or(RunServiceError::InvalidRunId)?;
+        if run.status != crate::RunStatus::Running {
+            return Err(RunServiceError::RunAlreadyTerminal);
+        }
+        Ok(())
+    }
+
+    async fn append_and_apply_tool_event(
+        &self,
+        event: OperationEvent,
+    ) -> Result<ToolLifecycleOutcome, RunServiceError> {
+        let run_id = event.run_id;
+        let tool_call_id =
+            tool_call_id_for_event(&event).ok_or(RunServiceError::InvalidToolInput)?;
+        self.ensure_running_run(run_id).await?;
+        self.ledger
+            .append(event.clone())
+            .await
+            .map_err(|error| RunServiceError::Ledger(error.to_string()))?;
+        self.run_store
+            .apply(&event)
+            .await
+            .map_err(|error| RunServiceError::Projection(error.to_string()))?;
+        Ok(ToolLifecycleOutcome {
+            run_id,
+            tool_call_id,
+        })
+    }
+
     fn non_blank_lifecycle_input(value: String) -> Result<String, RunServiceError> {
         let value = value.trim().to_string();
         if value.is_empty() {
             return Err(RunServiceError::InvalidLifecycleInput);
         }
         Ok(value)
+    }
+
+    fn non_blank_tool_text(value: String) -> Result<String, RunServiceError> {
+        let value = value.trim().to_string();
+        if value.is_empty() {
+            return Err(RunServiceError::InvalidToolInput);
+        }
+        Ok(value)
+    }
+}
+
+fn tool_call_id_for_event(event: &OperationEvent) -> Option<ToolCallId> {
+    match &event.kind {
+        OperationEventKind::ToolCallRequested { tool_call_id, .. }
+        | OperationEventKind::ToolCallApproved { tool_call_id, .. }
+        | OperationEventKind::ToolCallDenied { tool_call_id, .. }
+        | OperationEventKind::ToolCallCompleted { tool_call_id, .. }
+        | OperationEventKind::ToolCallFailed { tool_call_id, .. } => Some(*tool_call_id),
+        _ => None,
     }
 }
 
@@ -182,6 +277,112 @@ impl RunService for ComposedRunService {
             .await
     }
 
+    async fn request_tool_call(
+        &self,
+        run_id: RunId,
+        tool_name: String,
+        effect: ToolEffect,
+        input_json: Value,
+    ) -> Result<ToolCallOutcome, RunServiceError> {
+        let tool_name = Self::non_blank_tool_text(tool_name)?;
+        self.ensure_running_run(run_id).await?;
+        let tool_call_id = ToolCallId::new();
+        let requested = OperationEvent::new_tool_call_requested(
+            run_id,
+            tool_call_id,
+            tool_name,
+            effect.clone(),
+            input_json,
+        );
+        self.ledger
+            .append(requested.clone())
+            .await
+            .map_err(|error| RunServiceError::Ledger(error.to_string()))?;
+        self.run_store
+            .apply(&requested)
+            .await
+            .map_err(|error| RunServiceError::Projection(error.to_string()))?;
+
+        let approval = ToolApprovalPolicy::default().decision_for(&effect);
+        if approval == ToolApprovalDecision::AutoApproved {
+            let approved =
+                OperationEvent::new_tool_call_approved(run_id, tool_call_id, "mneme-policy");
+            self.ledger
+                .append(approved.clone())
+                .await
+                .map_err(|error| RunServiceError::Ledger(error.to_string()))?;
+            self.run_store
+                .apply(&approved)
+                .await
+                .map_err(|error| RunServiceError::Projection(error.to_string()))?;
+        }
+
+        Ok(ToolCallOutcome {
+            run_id,
+            tool_call_id,
+            approval,
+        })
+    }
+
+    async fn approve_tool_call(
+        &self,
+        run_id: RunId,
+        tool_call_id: ToolCallId,
+        approved_by: String,
+    ) -> Result<ToolLifecycleOutcome, RunServiceError> {
+        let approved_by = Self::non_blank_tool_text(approved_by)?;
+        self.append_and_apply_tool_event(OperationEvent::new_tool_call_approved(
+            run_id,
+            tool_call_id,
+            approved_by,
+        ))
+        .await
+    }
+
+    async fn deny_tool_call(
+        &self,
+        run_id: RunId,
+        tool_call_id: ToolCallId,
+        reason: String,
+    ) -> Result<ToolLifecycleOutcome, RunServiceError> {
+        let reason = Self::non_blank_tool_text(reason)?;
+        self.append_and_apply_tool_event(OperationEvent::new_tool_call_denied(
+            run_id,
+            tool_call_id,
+            reason,
+        ))
+        .await
+    }
+
+    async fn record_tool_result(
+        &self,
+        run_id: RunId,
+        tool_call_id: ToolCallId,
+        output_json: Value,
+    ) -> Result<ToolLifecycleOutcome, RunServiceError> {
+        self.append_and_apply_tool_event(OperationEvent::new_tool_call_completed(
+            run_id,
+            tool_call_id,
+            output_json,
+        ))
+        .await
+    }
+
+    async fn record_tool_failure(
+        &self,
+        run_id: RunId,
+        tool_call_id: ToolCallId,
+        reason: String,
+    ) -> Result<ToolLifecycleOutcome, RunServiceError> {
+        let reason = Self::non_blank_tool_text(reason)?;
+        self.append_and_apply_tool_event(OperationEvent::new_tool_call_failed(
+            run_id,
+            tool_call_id,
+            reason,
+        ))
+        .await
+    }
+
     async fn list_events(&self) -> Result<Vec<OperationEvent>, RunServiceError> {
         self.ledger
             .list()
@@ -210,8 +411,8 @@ impl RunService for ComposedRunService {
 mod tests {
     use super::*;
     use crate::{
-        InMemoryOperationLedger, InMemoryRunProjectionStore, OperationLedger, RunProjectionStore,
-        RunStatus,
+        InMemoryOperationLedger, InMemoryRunProjectionStore, OperationEventKind, OperationLedger,
+        RunProjectionStore, RunStatus, ToolApprovalDecision, ToolEffect,
     };
 
     #[tokio::test]
@@ -262,6 +463,86 @@ mod tests {
 
         assert_eq!(rebuilt.len(), 1);
         assert_eq!(rebuilt[0].run_id, outcome.run_id);
+    }
+
+    #[tokio::test]
+    async fn composed_service_records_read_only_tool_request_as_auto_approved() {
+        let ledger = InMemoryOperationLedger::new();
+        let run_store = InMemoryRunProjectionStore::new();
+        let service = ComposedRunService::new(ledger.clone().shared(), run_store.clone().shared());
+        let created = service.create_run("读取文件".to_string()).await.unwrap();
+
+        let outcome = service
+            .request_tool_call(
+                created.run_id,
+                "read_file".to_string(),
+                ToolEffect::ReadOnly,
+                serde_json::json!({ "path": "README.md" }),
+            )
+            .await
+            .unwrap();
+
+        let events = ledger.list().await.unwrap();
+        assert_eq!(outcome.run_id, created.run_id);
+        assert_eq!(outcome.approval, ToolApprovalDecision::AutoApproved);
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            events[1].kind,
+            OperationEventKind::ToolCallRequested { .. }
+        ));
+        assert!(matches!(
+            events[2].kind,
+            OperationEventKind::ToolCallApproved { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn composed_service_records_side_effect_tool_request_as_requires_approval() {
+        let ledger = InMemoryOperationLedger::new();
+        let run_store = InMemoryRunProjectionStore::new();
+        let service = ComposedRunService::new(ledger.clone().shared(), run_store.clone().shared());
+        let created = service.create_run("写文件".to_string()).await.unwrap();
+
+        let outcome = service
+            .request_tool_call(
+                created.run_id,
+                "write_file".to_string(),
+                ToolEffect::LocalWrite,
+                serde_json::json!({ "path": "README.md", "content": "hello" }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.approval, ToolApprovalDecision::RequiresApproval);
+        assert_eq!(ledger.list().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn composed_service_rejects_tool_request_after_run_completed() {
+        let service = ComposedRunService::new(
+            InMemoryOperationLedger::new().shared(),
+            InMemoryRunProjectionStore::new().shared(),
+        );
+        let created = service
+            .create_run("完成后不能请求工具".to_string())
+            .await
+            .unwrap();
+        service
+            .complete_run(created.run_id, "完成".to_string())
+            .await
+            .unwrap();
+
+        let error = service
+            .request_tool_call(
+                created.run_id,
+                "read_file".to_string(),
+                ToolEffect::ReadOnly,
+                serde_json::json!({ "path": "README.md" }),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, RunServiceError::RunAlreadyTerminal);
     }
 
     #[tokio::test]
