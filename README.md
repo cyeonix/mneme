@@ -12,7 +12,7 @@ Phase 1 构建基础切片：
 - daemon binary
 - TypeScript API client
 - 最小 React Workbench
-- Artifact Workspace 与 Context Inspector 的只读基础面板
+- Artifact Workspace、Context Inspector 与 Search / Memory / Knowledge inspector 的只读基础面板
 
 ## 环境要求
 
@@ -41,7 +41,7 @@ cargo run -p mneme-daemon
 MNEME_DB_URL='sqlite://.mneme-dev/mneme.db?mode=rwc' cargo run -p mneme-daemon
 ```
 
-Operation Ledger 的 `operation_events` 表是事实源；`runs`、`artifacts`、`context_bundles` 表是可重建投影。
+Operation Ledger 的 `operation_events` 表是事实源；`runs`、`artifacts`、`context_bundles`、`knowledge_sources`、`document_chunks`、`memory_records`、`retrieval_traces` 表是可重建投影。
 
 ## Kernel service boundary
 
@@ -139,6 +139,27 @@ curl -s http://127.0.0.1:3766/api/v1/context-bundles
 ```
 
 这些 endpoint 只创建与读取已记录的 artifact/context 元数据和内容；不做搜索、向量召回、真实模型调用或真实工具执行。
+
+### Milestone 6：Search / Memory / Knowledge
+
+Milestone 6 提供 SQLite-first deterministic keyword retrieval 与可解释 metadata：知识来源写入 `knowledge_sources`，chunk 写入 `document_chunks`，手动 memory metadata 写入 `memory_records`，每次搜索写入 `retrieval_traces`。这些读模型都可从 `operation_events` 重建。
+
+本阶段不实现 real embeddings、Tantivy production index、vector DB、Worker Runtime、OCR/PDF/web ingestion、automatic long-term memory、automatic agent recall 或 prompt injection；M7 才负责 worker/embedding execution。
+
+启动 daemon 后可用以下请求手动观察知识来源、搜索和检索轨迹。示例中的 `<run-id>` 是文档占位字面值；实际调用时替换为已有 run id。
+
+```bash
+curl -s http://127.0.0.1:3000/api/v1/knowledge-sources
+curl -s -X POST http://127.0.0.1:3000/api/v1/knowledge-sources/manual \
+  -H 'content-type: application/json' \
+  -d '{"run_id":"<run-id>","title":"Manual source","summary":"SQLite deterministic retrieval"}'
+curl -s -X POST http://127.0.0.1:3000/api/v1/search \
+  -H 'content-type: application/json' \
+  -d '{"run_id":"<run-id>","query":"sqlite","limit":5}'
+curl -s http://127.0.0.1:3000/api/v1/retrieval-traces
+```
+
+补充 endpoints：`POST /api/v1/artifacts/:artifact_id/knowledge-source`、`POST /api/v1/context-bundles/:context_bundle_id/knowledge-source`、`POST /api/v1/knowledge-sources/:knowledge_source_id/chunks`、`GET /api/v1/document-chunks`、`GET /api/v1/memories`、`POST /api/v1/memories`。
 
 ## 启动基础阶段 Web shell
 
