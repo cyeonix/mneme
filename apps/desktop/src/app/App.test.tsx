@@ -1,19 +1,25 @@
 import '@testing-library/jest-dom/vitest';
 import { render, screen, waitFor } from '@testing-library/react';
-import { describe, expect, it, vi } from 'vitest';
-import type { MnemeApiClient } from '../api/client';
+import { describe, expect, it } from 'vitest';
+import type { EventsResponse, KernelHealth, MnemeApiClient, RunsResponse } from '../api/client';
 import { App } from './App';
 
-function createClient(): MnemeApiClient {
+interface TestClientState {
+  health?: KernelHealth;
+  events?: EventsResponse;
+  runs?: RunsResponse;
+}
+
+function createTestClient(state: TestClientState = {}): MnemeApiClient {
   return {
     async getHealth() {
-      return { service: 'mneme-kernel', status: 'ready', version: '0.1.0' };
+      return state.health ?? { service: 'mneme-kernel', status: 'ready', version: '0.1.0' };
     },
     async listEvents() {
-      return { events: [] };
+      return state.events ?? { events: [] };
     },
     async listRuns() {
-      return {
+      return state.runs ?? {
         runs: [
           {
             run_id: 'run-1',
@@ -64,7 +70,7 @@ function createClient(): MnemeApiClient {
 
 describe('App', () => {
   it('渲染 Mneme Workbench 和 Kernel 健康状态', async () => {
-    render(<App client={createClient()} />);
+    render(<App client={createTestClient()} />);
 
     expect(screen.getByRole('heading', { name: 'Mneme Workbench' })).toBeInTheDocument();
 
@@ -76,10 +82,8 @@ describe('App', () => {
   });
 
   it('shows lifecycle result details for completed and failed runs', async () => {
-    const client: MnemeApiClient = {
-      getHealth: vi.fn(async () => ({ service: 'mneme-kernel', status: 'ready', version: '0.1.0' })),
-      listEvents: vi.fn(async () => ({ events: [] })),
-      listRuns: vi.fn(async () => ({
+    const client = createTestClient({
+      runs: {
         runs: [
           {
             run_id: 'run-completed',
@@ -104,26 +108,86 @@ describe('App', () => {
             updated_at: '2026-11-10T00:02:00Z',
           },
         ],
-      })),
-      createRun: vi.fn(),
-      requestModel: vi.fn(),
-      recordAssistantMessage: vi.fn(),
-      completeRun: vi.fn(),
-      failRun: vi.fn(),
-      requestToolCall: vi.fn(async () => ({
-        run_id: 'run-123',
-        tool_call_id: 'tool-123',
-        approval: 'auto_approved' as const,
-      })),
-      approveToolCall: vi.fn(async () => ({ run_id: 'run-123', tool_call_id: 'tool-123' })),
-      denyToolCall: vi.fn(async () => ({ run_id: 'run-123', tool_call_id: 'tool-123' })),
-      recordToolResult: vi.fn(async () => ({ run_id: 'run-123', tool_call_id: 'tool-123' })),
-      recordToolFailure: vi.fn(async () => ({ run_id: 'run-123', tool_call_id: 'tool-123' })),
-    };
+      },
+    });
 
     render(<App client={client} />);
 
     expect(await screen.findByText('总结完成')).toBeInTheDocument();
     expect(await screen.findByText('模型不可用')).toBeInTheDocument();
+  });
+
+  it('shows tool activity from the operation ledger', async () => {
+    const client = createTestClient({
+      events: {
+        events: [
+          {
+            id: 'event-1',
+            run_id: 'run-123',
+            occurred_at: '2026-11-10T00:00:00Z',
+            kind: {
+              type: 'tool_call_requested',
+              tool_call_id: 'tool-123',
+              tool_name: 'read_file',
+              effect: 'read_only',
+              input_json: { path: 'README.md' },
+            },
+          },
+          {
+            id: 'event-2',
+            run_id: 'run-123',
+            occurred_at: '2026-11-10T00:00:01Z',
+            kind: {
+              type: 'tool_call_approved',
+              tool_call_id: 'tool-123',
+              approved_by: 'mneme-policy',
+            },
+          },
+          {
+            id: 'event-3',
+            run_id: 'run-123',
+            occurred_at: '2026-11-10T00:00:02Z',
+            kind: {
+              type: 'tool_call_completed',
+              tool_call_id: 'tool-123',
+              output_json: { content: 'hello' },
+            },
+          },
+          {
+            id: 'event-4',
+            run_id: 'run-123',
+            occurred_at: '2026-11-10T00:00:03Z',
+            kind: {
+              type: 'tool_call_failed',
+              tool_call_id: 'tool-456',
+              reason: '工具执行失败',
+            },
+          },
+          {
+            id: 'event-5',
+            run_id: 'run-123',
+            occurred_at: '2026-11-10T00:00:04Z',
+            kind: {
+              type: 'tool_call_denied',
+              tool_call_id: 'tool-789',
+              reason: '用户拒绝执行',
+            },
+          },
+        ],
+      },
+    });
+
+    render(<App client={client} />);
+
+    expect(await screen.findByText('Tool Activity')).toBeInTheDocument();
+    expect(await screen.findByText('read_file')).toBeInTheDocument();
+    expect(await screen.findByText('read_only')).toBeInTheDocument();
+    expect(await screen.findByText('mneme-policy')).toBeInTheDocument();
+    expect(await screen.findByText('completed')).toBeInTheDocument();
+    expect(await screen.findByText('result recorded')).toBeInTheDocument();
+    expect(await screen.findByText('tool_call_failed')).toBeInTheDocument();
+    expect(await screen.findByText('工具执行失败')).toBeInTheDocument();
+    expect(await screen.findByText('tool_call_denied')).toBeInTheDocument();
+    expect(await screen.findByText('用户拒绝执行')).toBeInTheDocument();
   });
 });

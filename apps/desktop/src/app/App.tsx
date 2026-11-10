@@ -5,11 +5,78 @@ interface AppProps {
   client: MnemeApiClient;
 }
 
+interface ToolActivityItem {
+  eventId: string;
+  runId: string;
+  occurredAt: string;
+  toolCallId: string;
+  label: string;
+  detail: string;
+  effect?: string;
+}
+
+function toolActivityFromEvents(events: EventsResponse): ToolActivityItem[] {
+  return events.events.flatMap((event) => {
+    const kind = event.kind as Record<string, unknown>;
+    if (kind.type === 'tool_call_requested') {
+      return [
+        {
+          eventId: event.id,
+          runId: event.run_id,
+          occurredAt: event.occurred_at,
+          toolCallId: String(kind.tool_call_id),
+          label: String(kind.tool_name),
+          detail: 'requested',
+          effect: String(kind.effect),
+        },
+      ];
+    }
+    if (kind.type === 'tool_call_approved') {
+      return [
+        {
+          eventId: event.id,
+          runId: event.run_id,
+          occurredAt: event.occurred_at,
+          toolCallId: String(kind.tool_call_id),
+          label: 'approved',
+          detail: String(kind.approved_by),
+        },
+      ];
+    }
+    if (kind.type === 'tool_call_denied' || kind.type === 'tool_call_failed') {
+      return [
+        {
+          eventId: event.id,
+          runId: event.run_id,
+          occurredAt: event.occurred_at,
+          toolCallId: String(kind.tool_call_id),
+          label: String(kind.type),
+          detail: String(kind.reason),
+        },
+      ];
+    }
+    if (kind.type === 'tool_call_completed') {
+      return [
+        {
+          eventId: event.id,
+          runId: event.run_id,
+          occurredAt: event.occurred_at,
+          toolCallId: String(kind.tool_call_id),
+          label: 'completed',
+          detail: 'result recorded',
+        },
+      ];
+    }
+    return [];
+  });
+}
+
 export function App({ client }: AppProps) {
   const [health, setHealth] = useState<KernelHealth | null>(null);
   const [events, setEvents] = useState<EventsResponse>({ events: [] });
   const [runs, setRuns] = useState<RunsResponse>({ runs: [] });
   const [error, setError] = useState<string | null>(null);
+  const toolActivity = toolActivityFromEvents(events);
 
   useEffect(() => {
     let cancelled = false;
@@ -83,6 +150,24 @@ export function App({ client }: AppProps) {
                     错误：<span>{run.error}</span>
                   </p>
                 ) : null}
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      <section className="panel">
+        <h2>Tool Activity</h2>
+        {toolActivity.length === 0 ? (
+          <p className="muted">还没有工具请求。Milestone 4 只展示工具意图和审批记录，不执行真实工具。</p>
+        ) : (
+          <ul className="tool-activity-list">
+            {toolActivity.map((activity) => (
+              <li key={activity.eventId} className="tool-activity-card">
+                <span className="tool-activity-kind">{activity.label}</span>
+                {activity.effect ? <span className="tool-effect">{activity.effect}</span> : null}
+                <strong>{activity.detail}</strong>
+                <small>{activity.occurredAt}</small>
               </li>
             ))}
           </ul>
