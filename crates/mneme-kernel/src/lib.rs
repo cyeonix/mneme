@@ -18,5 +18,7 @@ pub use runs::{
 pub use service::{
     ComposedRunService, CreateRunOutcome, RunService, RunServiceError, SharedRunService,
 };
-pub use storage::sqlite::SqliteRunProjectionStore;
-pub use storage::{SqliteOperationLedger, SqliteStore, SqliteStoreError};
+pub use storage::{
+    SqliteOperationLedger, SqliteRunProjectionStore, SqliteRunService, SqliteStore,
+    SqliteStoreError,
+};

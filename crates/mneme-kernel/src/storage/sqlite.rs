@@ -1,7 +1,7 @@
 use crate::{
-    EventId, LedgerError, OperationEvent, OperationEventKind, OperationLedger, RunId,
-    RunProjection, RunProjectionError, RunProjectionStore, RunProjector, RunStatus,
-    SharedOperationLedger, SharedRunProjectionStore,
+    CreateRunOutcome, EventId, LedgerError, OperationEvent, OperationEventKind, OperationLedger,
+    RunId, RunProjection, RunProjectionError, RunProjectionStore, RunProjector, RunService,
+    RunServiceError, RunStatus, SharedOperationLedger, SharedRunProjectionStore, SharedRunService,
 };
 use async_trait::async_trait;
 use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
@@ -119,6 +119,97 @@ impl SqliteRunProjectionStore {
 
     pub fn shared(self) -> SharedRunProjectionStore {
         Arc::new(self)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SqliteRunService {
+    store: SqliteStore,
+}
+
+impl SqliteRunService {
+    pub fn new(store: SqliteStore) -> Self {
+        Self { store }
+    }
+
+    pub fn shared(self) -> SharedRunService {
+        Arc::new(self)
+    }
+}
+
+#[async_trait]
+impl RunService for SqliteRunService {
+    async fn create_run(&self, instruction: String) -> Result<CreateRunOutcome, RunServiceError> {
+        let instruction = instruction.trim().to_string();
+        if instruction.is_empty() {
+            return Err(RunServiceError::InvalidInstruction);
+        }
+
+        let run_id = RunId::new();
+        let event = OperationEvent::new_run_started(run_id, instruction.clone());
+        let occurred_at = event
+            .occurred_at
+            .format(&Rfc3339)
+            .map_err(|error| RunServiceError::Ledger(error.to_string()))?;
+        let payload_json = serde_json::to_string(&event.kind)
+            .map_err(|error| RunServiceError::Ledger(error.to_string()))?;
+
+        let mut tx = self
+            .store
+            .pool()
+            .begin()
+            .await
+            .map_err(|error| RunServiceError::Ledger(error.to_string()))?;
+
+        sqlx::query(
+            "insert into operation_events (event_id, run_id, occurred_at, kind_type, payload_json) values (?1, ?2, ?3, 'run_started', ?4)",
+        )
+        .bind(event.id.to_string())
+        .bind(run_id.to_string())
+        .bind(&occurred_at)
+        .bind(payload_json)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| RunServiceError::Ledger(error.to_string()))?;
+
+        sqlx::query(
+            "insert into runs (run_id, status, instruction, started_at, completed_at, failed_at, summary, error, updated_at) values (?1, 'running', ?2, ?3, null, null, null, null, ?3) on conflict(run_id) do update set status = excluded.status, instruction = excluded.instruction, started_at = excluded.started_at, completed_at = excluded.completed_at, failed_at = excluded.failed_at, summary = excluded.summary, error = excluded.error, updated_at = excluded.updated_at",
+        )
+        .bind(run_id.to_string())
+        .bind(instruction)
+        .bind(&occurred_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| RunServiceError::Projection(error.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|error| RunServiceError::Ledger(error.to_string()))?;
+
+        Ok(CreateRunOutcome { run_id })
+    }
+
+    async fn list_events(&self) -> Result<Vec<OperationEvent>, RunServiceError> {
+        SqliteOperationLedger::new(self.store.clone())
+            .list()
+            .await
+            .map_err(|error| RunServiceError::Ledger(error.to_string()))
+    }
+
+    async fn list_runs(&self) -> Result<Vec<RunProjection>, RunServiceError> {
+        SqliteRunProjectionStore::new(self.store.clone())
+            .list_runs()
+            .await
+            .map_err(|error| RunServiceError::Projection(error.to_string()))
+    }
+
+    async fn rebuild_run_projections(&self) -> Result<Vec<RunProjection>, RunServiceError> {
+        let events = self.list_events().await?;
+        SqliteRunProjectionStore::new(self.store.clone())
+            .rebuild(&events)
+            .await
+            .map_err(|error| RunServiceError::Projection(error.to_string()))?;
+        self.list_runs().await
     }
 }
 
@@ -386,6 +477,67 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].run_id, run_id);
         assert_eq!(listed[0].instruction, "SQLite run 投影");
+    }
+
+    #[tokio::test]
+    async fn sqlite_run_service_creates_event_and_projection_in_one_service_call() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let service = SqliteRunService::new(store.clone());
+
+        let outcome = service
+            .create_run("事务创建 run".to_string())
+            .await
+            .unwrap();
+
+        let events = SqliteOperationLedger::new(store.clone())
+            .list()
+            .await
+            .unwrap();
+        let runs = SqliteRunProjectionStore::new(store)
+            .list_runs()
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(events[0].run_id, outcome.run_id);
+        assert_eq!(runs[0].run_id, outcome.run_id);
+    }
+
+    #[tokio::test]
+    async fn sqlite_run_service_rejects_blank_instruction() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let service = SqliteRunService::new(store.clone());
+
+        let error = service.create_run("   ".to_string()).await.unwrap_err();
+
+        assert_eq!(error, RunServiceError::InvalidInstruction);
+        assert!(SqliteOperationLedger::new(store.clone())
+            .list()
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(SqliteRunProjectionStore::new(store)
+            .list_runs()
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn sqlite_run_service_rebuild_repairs_missing_projection() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let ledger = SqliteOperationLedger::new(store.clone());
+        let run_store = SqliteRunProjectionStore::new(store.clone());
+        let service = SqliteRunService::new(store);
+        let run_id = RunId::new();
+        let event = OperationEvent::new_run_started(run_id, "只写入事实源");
+        ledger.append(event).await.unwrap();
+        assert!(run_store.list_runs().await.unwrap().is_empty());
+
+        let rebuilt = service.rebuild_run_projections().await.unwrap();
+
+        assert_eq!(rebuilt.len(), 1);
+        assert_eq!(rebuilt[0].run_id, run_id);
     }
 
     #[tokio::test]
