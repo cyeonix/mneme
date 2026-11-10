@@ -23,6 +23,22 @@ pub struct ArtifactId(Uuid);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ContextBundleId(Uuid);
 
+/// 知识来源的唯一 ID。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct KnowledgeSourceId(Uuid);
+
+/// 可检索文本块的唯一 ID。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DocumentChunkId(Uuid);
+
+/// 可解释记忆的唯一 ID。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MemoryId(Uuid);
+
+/// 一次检索审计记录的唯一 ID。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RetrievalTraceId(Uuid);
+
 impl EventId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
@@ -153,6 +169,110 @@ impl FromStr for ContextBundleId {
     }
 }
 
+impl KnowledgeSourceId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for KnowledgeSourceId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for KnowledgeSourceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl FromStr for KnowledgeSourceId {
+    type Err = uuid::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self(Uuid::parse_str(value)?))
+    }
+}
+
+impl DocumentChunkId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for DocumentChunkId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for DocumentChunkId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl FromStr for DocumentChunkId {
+    type Err = uuid::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self(Uuid::parse_str(value)?))
+    }
+}
+
+impl MemoryId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for MemoryId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for MemoryId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl FromStr for MemoryId {
+    type Err = uuid::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self(Uuid::parse_str(value)?))
+    }
+}
+
+impl RetrievalTraceId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for RetrievalTraceId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for RetrievalTraceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl FromStr for RetrievalTraceId {
+    type Err = uuid::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self(Uuid::parse_str(value)?))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,5 +310,43 @@ mod tests {
         assert!(artifact_id.contains('-'));
         assert_eq!(context_bundle_id.len(), 36);
         assert!(context_bundle_id.contains('-'));
+    }
+
+    #[test]
+    fn generated_knowledge_memory_and_retrieval_ids_are_displayable() {
+        let source_id = KnowledgeSourceId::new().to_string();
+        let chunk_id = DocumentChunkId::new().to_string();
+        let memory_id = MemoryId::new().to_string();
+        let trace_id = RetrievalTraceId::new().to_string();
+
+        for id in [source_id, chunk_id, memory_id, trace_id] {
+            assert_eq!(id.len(), 36);
+            assert!(id.contains('-'));
+        }
+    }
+
+    #[test]
+    fn knowledge_memory_and_retrieval_ids_parse_from_display() {
+        let source_id = KnowledgeSourceId::new();
+        let chunk_id = DocumentChunkId::new();
+        let memory_id = MemoryId::new();
+        let trace_id = RetrievalTraceId::new();
+
+        assert_eq!(
+            source_id.to_string().parse::<KnowledgeSourceId>().unwrap(),
+            source_id
+        );
+        assert_eq!(
+            chunk_id.to_string().parse::<DocumentChunkId>().unwrap(),
+            chunk_id
+        );
+        assert_eq!(
+            memory_id.to_string().parse::<MemoryId>().unwrap(),
+            memory_id
+        );
+        assert_eq!(
+            trace_id.to_string().parse::<RetrievalTraceId>().unwrap(),
+            trace_id
+        );
     }
 }

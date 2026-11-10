@@ -814,7 +814,11 @@ impl SqliteRunService {
             | OperationEventKind::ToolCallCompleted { .. }
             | OperationEventKind::ToolCallFailed { .. }
             | OperationEventKind::ArtifactCreated { .. }
-            | OperationEventKind::ContextBundleCreated { .. } => {
+            | OperationEventKind::ContextBundleCreated { .. }
+            | OperationEventKind::KnowledgeSourceCreated { .. }
+            | OperationEventKind::DocumentChunkCreated { .. }
+            | OperationEventKind::MemoryRecorded { .. }
+            | OperationEventKind::RetrievalTraceRecorded { .. } => {
                 sqlx::query(
                     "update runs set updated_at = ?2 where run_id = ?1 and status = 'running'",
                 )
@@ -1123,7 +1127,11 @@ impl RunProjectionStore for SqliteRunProjectionStore {
             | OperationEventKind::ToolCallCompleted { .. }
             | OperationEventKind::ToolCallFailed { .. }
             | OperationEventKind::ArtifactCreated { .. }
-            | OperationEventKind::ContextBundleCreated { .. } => {
+            | OperationEventKind::ContextBundleCreated { .. }
+            | OperationEventKind::KnowledgeSourceCreated { .. }
+            | OperationEventKind::DocumentChunkCreated { .. }
+            | OperationEventKind::MemoryRecorded { .. }
+            | OperationEventKind::RetrievalTraceRecorded { .. } => {
                 sqlx::query(
                     "update runs set updated_at = ?2 where run_id = ?1 and status = 'running'",
                 )
@@ -1349,6 +1357,10 @@ fn kind_type_for_event(kind: &OperationEventKind) -> &'static str {
         OperationEventKind::ToolCallFailed { .. } => "tool_call_failed",
         OperationEventKind::ArtifactCreated { .. } => "artifact_created",
         OperationEventKind::ContextBundleCreated { .. } => "context_bundle_created",
+        OperationEventKind::KnowledgeSourceCreated { .. } => "knowledge_source_created",
+        OperationEventKind::DocumentChunkCreated { .. } => "document_chunk_created",
+        OperationEventKind::MemoryRecorded { .. } => "memory_recorded",
+        OperationEventKind::RetrievalTraceRecorded { .. } => "retrieval_trace_recorded",
     }
 }
 
@@ -1461,10 +1473,11 @@ pub enum SqliteStoreError {
 mod tests {
     use super::*;
     use crate::{
-        ArtifactId, ArtifactKind, ArtifactProjectionStore, ContextBundleId,
-        InMemoryArtifactContentStore, LocalArtifactContentStore, OperationEvent, OperationLedger,
-        RunId, RunProjectionStore, RunProjector, ToolCallId, ToolCallStatus, ToolEffect,
-        ToolProjector,
+        ArtifactId, ArtifactKind, ArtifactProjectionStore, ContextBundleId, DocumentChunkId,
+        InMemoryArtifactContentStore, KnowledgeSourceId, KnowledgeSourceKind,
+        LocalArtifactContentStore, MemoryId, MemoryKind, OperationEvent, OperationLedger,
+        RetrievalTraceId, RunId, RunProjectionStore, RunProjector, ToolCallId, ToolCallStatus,
+        ToolEffect, ToolProjector,
     };
 
     #[tokio::test]
@@ -1656,6 +1669,84 @@ mod tests {
             } if actual_context_bundle_id == &context_bundle_id
                 && artifact_ids == &vec![artifact_id]
                 && event_ids == &vec![event_id]
+        ));
+    }
+
+    #[tokio::test]
+    async fn sqlite_ledger_roundtrips_knowledge_memory_retrieval_events() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let ledger = SqliteOperationLedger::new(store);
+        let run_id = RunId::new();
+        let source_id = KnowledgeSourceId::new();
+        let chunk_id = DocumentChunkId::new();
+        let memory_id = MemoryId::new();
+        let trace_id = RetrievalTraceId::new();
+
+        ledger
+            .append(OperationEvent::new_knowledge_source_created(
+                run_id,
+                source_id,
+                KnowledgeSourceKind::Manual,
+                None,
+                None,
+                "Manual source",
+                "Source summary",
+            ))
+            .await
+            .unwrap();
+        ledger
+            .append(OperationEvent::new_document_chunk_created(
+                run_id,
+                chunk_id,
+                source_id,
+                0,
+                "searchable text",
+                0,
+                15,
+            ))
+            .await
+            .unwrap();
+        ledger
+            .append(OperationEvent::new_memory_recorded(
+                run_id,
+                memory_id,
+                Some(source_id),
+                MemoryKind::Fact,
+                "Fact title",
+                "Fact body",
+                0.9,
+            ))
+            .await
+            .unwrap();
+        ledger
+            .append(OperationEvent::new_retrieval_trace_recorded(
+                run_id,
+                trace_id,
+                "searchable",
+                vec![chunk_id],
+                vec![memory_id],
+                "deterministic keyword retrieval matched searchable text",
+            ))
+            .await
+            .unwrap();
+
+        let events = ledger.list().await.unwrap();
+        assert_eq!(events.len(), 4);
+        assert!(matches!(
+            events[0].kind,
+            OperationEventKind::KnowledgeSourceCreated { .. }
+        ));
+        assert!(matches!(
+            events[1].kind,
+            OperationEventKind::DocumentChunkCreated { .. }
+        ));
+        assert!(matches!(
+            events[2].kind,
+            OperationEventKind::MemoryRecorded { .. }
+        ));
+        assert!(matches!(
+            events[3].kind,
+            OperationEventKind::RetrievalTraceRecorded { .. }
         ));
     }
 

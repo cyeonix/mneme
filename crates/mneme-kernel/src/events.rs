@@ -1,12 +1,15 @@
-use crate::ids::{ArtifactId, ContextBundleId, EventId, RunId, ToolCallId};
-use crate::{ArtifactKind, ToolEffect};
+use crate::ids::{
+    ArtifactId, ContextBundleId, DocumentChunkId, EventId, KnowledgeSourceId, MemoryId,
+    RetrievalTraceId, RunId, ToolCallId,
+};
+use crate::{ArtifactKind, KnowledgeSourceKind, MemoryKind, ToolEffect};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;
 
 /// 第一版事件类型。
 /// 先覆盖 run 生命周期，后续再扩展 tool、artifact、context、memory 等事件。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OperationEventKind {
     RunStarted {
@@ -61,11 +64,42 @@ pub enum OperationEventKind {
         artifact_ids: Vec<ArtifactId>,
         event_ids: Vec<EventId>,
     },
+    KnowledgeSourceCreated {
+        knowledge_source_id: KnowledgeSourceId,
+        source_kind: KnowledgeSourceKind,
+        artifact_id: Option<ArtifactId>,
+        context_bundle_id: Option<ContextBundleId>,
+        title: String,
+        summary: String,
+    },
+    DocumentChunkCreated {
+        document_chunk_id: DocumentChunkId,
+        knowledge_source_id: KnowledgeSourceId,
+        sequence: i64,
+        text: String,
+        char_start: i64,
+        char_end: i64,
+    },
+    MemoryRecorded {
+        memory_id: MemoryId,
+        knowledge_source_id: Option<KnowledgeSourceId>,
+        kind: MemoryKind,
+        title: String,
+        body: String,
+        confidence: f32,
+    },
+    RetrievalTraceRecorded {
+        retrieval_trace_id: RetrievalTraceId,
+        query: String,
+        result_chunk_ids: Vec<DocumentChunkId>,
+        result_memory_ids: Vec<MemoryId>,
+        explanation: String,
+    },
 }
 
 /// Operation Ledger 的最小事件结构。
 /// 事件一旦写入就不应该原地修改，后续状态通过追加新事件表达。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OperationEvent {
     pub id: EventId,
     pub run_id: RunId,
@@ -258,12 +292,109 @@ impl OperationEvent {
             },
         }
     }
+
+    pub fn new_knowledge_source_created(
+        run_id: RunId,
+        knowledge_source_id: KnowledgeSourceId,
+        source_kind: KnowledgeSourceKind,
+        artifact_id: Option<ArtifactId>,
+        context_bundle_id: Option<ContextBundleId>,
+        title: impl Into<String>,
+        summary: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: EventId::new(),
+            run_id,
+            occurred_at: OffsetDateTime::now_utc(),
+            kind: OperationEventKind::KnowledgeSourceCreated {
+                knowledge_source_id,
+                source_kind,
+                artifact_id,
+                context_bundle_id,
+                title: title.into(),
+                summary: summary.into(),
+            },
+        }
+    }
+
+    pub fn new_document_chunk_created(
+        run_id: RunId,
+        document_chunk_id: DocumentChunkId,
+        knowledge_source_id: KnowledgeSourceId,
+        sequence: i64,
+        text: impl Into<String>,
+        char_start: i64,
+        char_end: i64,
+    ) -> Self {
+        Self {
+            id: EventId::new(),
+            run_id,
+            occurred_at: OffsetDateTime::now_utc(),
+            kind: OperationEventKind::DocumentChunkCreated {
+                document_chunk_id,
+                knowledge_source_id,
+                sequence,
+                text: text.into(),
+                char_start,
+                char_end,
+            },
+        }
+    }
+
+    pub fn new_memory_recorded(
+        run_id: RunId,
+        memory_id: MemoryId,
+        knowledge_source_id: Option<KnowledgeSourceId>,
+        kind: MemoryKind,
+        title: impl Into<String>,
+        body: impl Into<String>,
+        confidence: f32,
+    ) -> Self {
+        Self {
+            id: EventId::new(),
+            run_id,
+            occurred_at: OffsetDateTime::now_utc(),
+            kind: OperationEventKind::MemoryRecorded {
+                memory_id,
+                knowledge_source_id,
+                kind,
+                title: title.into(),
+                body: body.into(),
+                confidence,
+            },
+        }
+    }
+
+    pub fn new_retrieval_trace_recorded(
+        run_id: RunId,
+        retrieval_trace_id: RetrievalTraceId,
+        query: impl Into<String>,
+        result_chunk_ids: Vec<DocumentChunkId>,
+        result_memory_ids: Vec<MemoryId>,
+        explanation: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: EventId::new(),
+            run_id,
+            occurred_at: OffsetDateTime::now_utc(),
+            kind: OperationEventKind::RetrievalTraceRecorded {
+                retrieval_trace_id,
+                query: query.into(),
+                result_chunk_ids,
+                result_memory_ids,
+                explanation: explanation.into(),
+            },
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ArtifactId, ArtifactKind, ContextBundleId, ToolCallId, ToolEffect};
+    use crate::{
+        ArtifactId, ArtifactKind, ContextBundleId, DocumentChunkId, KnowledgeSourceId,
+        KnowledgeSourceKind, MemoryId, RetrievalTraceId, ToolCallId, ToolEffect,
+    };
 
     #[test]
     fn run_started_event_captures_instruction_and_run_id() {
@@ -352,6 +483,49 @@ mod tests {
             OperationEventKind::ContextBundleCreated { context_bundle_id: id, artifact_ids, event_ids, .. }
                 if id == context_bundle_id && artifact_ids == vec![artifact_id] && event_ids == vec![event_id]
         ));
+    }
+
+    #[test]
+    fn knowledge_source_event_records_source_metadata() {
+        let run_id = RunId::new();
+        let source_id = KnowledgeSourceId::new();
+        let artifact_id = ArtifactId::new();
+
+        let event = OperationEvent::new_knowledge_source_created(
+            run_id,
+            source_id,
+            KnowledgeSourceKind::Artifact,
+            Some(artifact_id),
+            None,
+            "Run summary",
+            "Source summary",
+        );
+
+        assert_eq!(event.run_id, run_id);
+        assert!(
+            matches!(event.kind, OperationEventKind::KnowledgeSourceCreated { knowledge_source_id, source_kind: KnowledgeSourceKind::Artifact, artifact_id: Some(id), .. } if knowledge_source_id == source_id && id == artifact_id)
+        );
+    }
+
+    #[test]
+    fn retrieval_trace_event_records_result_ids() {
+        let run_id = RunId::new();
+        let trace_id = RetrievalTraceId::new();
+        let chunk_id = DocumentChunkId::new();
+        let memory_id = MemoryId::new();
+
+        let event = OperationEvent::new_retrieval_trace_recorded(
+            run_id,
+            trace_id,
+            "sqlite search",
+            vec![chunk_id],
+            vec![memory_id],
+            "deterministic keyword retrieval matched one chunk",
+        );
+
+        assert!(
+            matches!(event.kind, OperationEventKind::RetrievalTraceRecorded { retrieval_trace_id, result_chunk_ids, result_memory_ids, .. } if retrieval_trace_id == trace_id && result_chunk_ids == vec![chunk_id] && result_memory_ids == vec![memory_id])
+        );
     }
 
     #[test]

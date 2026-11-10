@@ -64,7 +64,11 @@ impl RunProjector {
                 | OperationEventKind::ToolCallCompleted { .. }
                 | OperationEventKind::ToolCallFailed { .. }
                 | OperationEventKind::ArtifactCreated { .. }
-                | OperationEventKind::ContextBundleCreated { .. } => {
+                | OperationEventKind::ContextBundleCreated { .. }
+                | OperationEventKind::KnowledgeSourceCreated { .. }
+                | OperationEventKind::DocumentChunkCreated { .. }
+                | OperationEventKind::MemoryRecorded { .. }
+                | OperationEventKind::RetrievalTraceRecorded { .. } => {
                     if let Some(run) = runs
                         .iter_mut()
                         .find(|run| run.run_id == event.run_id && run.status == RunStatus::Running)

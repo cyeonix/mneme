@@ -2,6 +2,7 @@ pub mod artifacts;
 pub mod events;
 pub mod health;
 pub mod ids;
+pub mod knowledge;
 pub mod ledger;
 pub mod projections;
 pub mod runs;
@@ -19,7 +20,14 @@ pub use artifacts::{
 };
 pub use events::{OperationEvent, OperationEventKind};
 pub use health::{kernel_health, KernelHealth};
-pub use ids::{ArtifactId, ContextBundleId, EventId, RunId, ToolCallId};
+pub use ids::{
+    ArtifactId, ContextBundleId, DocumentChunkId, EventId, KnowledgeSourceId, MemoryId,
+    RetrievalTraceId, RunId, ToolCallId,
+};
+pub use knowledge::{
+    DocumentChunkRecord, KnowledgeSourceKind, KnowledgeSourceRecord, MemoryKind, MemoryRecord,
+    RetrievalTraceRecord,
+};
 pub use ledger::{InMemoryOperationLedger, LedgerError, OperationLedger, SharedOperationLedger};
 pub use projections::{RunProjection, RunProjector, RunStatus};
 pub use runs::{
