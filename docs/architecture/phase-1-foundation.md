@@ -29,6 +29,8 @@ Milestone 6 增加 SQLite-first knowledge sources、document chunks、memory met
 
 Milestone 7 增加 real OpenAI-compatible provider worker MVP、worker job ledger/projection、worker API/client/UI。Worker runtime 通过 `RunService` 推进 run lifecycle；测试默认使用 mock provider，不需要真实网络或 provider key；`MNEME_OPENAI_API_KEY` never written to ledger/projection。Worker-driven retrieval/recall defaults to `run_id` scope，Workbench 不提供 streaming token UI 或 tool execution。M8 owns Tauri desktop packaging/provider config UI/process management。
 
+Milestone 8 packages the existing Workbench and daemon into a Tauri desktop shell. The desktop backend supervises the local daemon sidecar lifecycle boundary, injects API base URL into the frontend, manages provider config through Stronghold-ready storage, and enables explicit non-streaming worker completion from the UI without streaming token UI or tool execution. Provider API keys are write-only: they are never displayed after save, logged, kept in frontend storage, written to Operation Ledger, or projected into SQLite read models. M8 does not claim final cross-platform sidecar release packaging while `externalBin`/binary copy is deferred; M9 owns self-hosted server, sync, backup/restore, and remote Web console.
+
 ## Phase 1 之后的数据面演进
 
 Milestone 1 在不改变外部 API 基本形状的前提下，把内存 ledger 替换为 SQLite ledger，并加入 runs 投影。Phase 1 的 API route、daemon、TypeScript client 和 Workbench 会继续存在，只是数据来源从内存对象变成可持久化 Kernel 数据面。

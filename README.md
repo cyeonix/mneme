@@ -177,6 +177,29 @@ curl -s -X POST http://127.0.0.1:3766/api/v1/runs/<run-id>/worker-model-completi
 curl -s http://127.0.0.1:3766/api/v1/worker-jobs
 ```
 
+### Desktop shell (Milestone 8)
+
+Mneme includes a Tauri desktop shell for the existing Workbench. In desktop mode, the Tauri backend supervises the local `mneme-daemon` sidecar boundary, injects the API base URL into the React app, and stores provider config through a Stronghold-ready desktop secure-storage boundary.
+
+Provider API keys are write-only from the Workbench perspective. The UI shows whether a key exists but never displays the saved key, and the key must not be logged, stored in frontend storage, written to Operation Ledger, or projected into SQLite read models.
+
+M8 also adds an explicit user-triggered non-streaming worker completion control for an existing run. It does not add streaming token UI, tool execution, automatic recall, remote console, cloud sync, or a full Agent Runtime.
+
+Development commands:
+
+```bash
+pnpm --dir apps/desktop tauri:dev
+pnpm --dir apps/desktop tauri:build
+```
+
+If full desktop bundling is not available on the current platform, or until the release flow declares/copies the platform-specific `mneme-daemon` sidecar binary into Tauri `externalBin`, use:
+
+```bash
+pnpm check
+```
+
+as the automated verification gate.
+
 ## 启动基础阶段 Web shell
 
 ```bash
