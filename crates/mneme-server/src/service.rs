@@ -17,6 +17,8 @@ pub enum SyncServerError {
     InvalidInput,
     #[error("unknown device")]
     UnknownDevice,
+    #[error("unauthorized")]
+    Unauthorized,
     #[error("storage error: {0}")]
     Storage(String),
 }
@@ -28,26 +30,26 @@ pub struct DeviceRegistrationOutcome {
     pub device_token: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct PushEventsOutcome {
     pub accepted: usize,
     pub duplicates: usize,
     pub latest_server_sequence: i64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct PullEventsOutcome {
     pub events: Vec<SyncedEventRecord>,
     pub latest_server_sequence: i64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct PushObjectsOutcome {
     pub accepted: usize,
     pub kept_existing: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct PullObjectsOutcome {
     pub objects: Vec<SyncedObjectRecord>,
 }
@@ -60,13 +62,13 @@ pub struct BackupPayload {
     pub objects: Vec<SyncedObjectRecord>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct BackupExportOutcome {
     pub backup: BackupRecord,
     pub payload_json: serde_json::Value,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct ServerOverviewResponse {
     pub devices: usize,
     pub synced_events: usize,
@@ -141,6 +143,19 @@ impl SyncServerService {
             cursor,
             device_token,
         })
+    }
+
+    pub async fn verify_device_token(
+        &self,
+        device_id: DeviceId,
+        device_token: &str,
+    ) -> Result<(), SyncServerError> {
+        let expected_token = format!("mneme-dev-token-{}", device_id);
+        if device_token == expected_token {
+            Ok(())
+        } else {
+            Err(SyncServerError::Unauthorized)
+        }
     }
 
     pub async fn list_devices(&self) -> Result<Vec<DeviceRecord>, SyncServerError> {
