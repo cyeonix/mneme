@@ -1,3 +1,6 @@
+use crate::provider_config::{
+    DesktopProviderConfigSummary, SharedProviderSecretStore, StrongholdReadyProviderSecretStore,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 
@@ -19,14 +22,6 @@ pub struct DesktopDaemonStatus {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DesktopProviderConfigSummary {
-    pub base_url: String,
-    pub model: String,
-    pub timeout_secs: u64,
-    pub has_api_key: bool,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DesktopRuntimeStatus {
     pub daemon: DesktopDaemonStatus,
     pub provider: DesktopProviderConfigSummary,
@@ -36,7 +31,7 @@ pub struct DesktopRuntimeStatus {
 pub struct AppState {
     pub api_base_url: String,
     pub daemon: Mutex<DesktopDaemonStatus>,
-    pub provider: Mutex<DesktopProviderConfigSummary>,
+    pub provider_store: SharedProviderSecretStore,
 }
 
 impl AppState {
@@ -49,12 +44,7 @@ impl AppState {
                 api_base_url: Some(api_base_url),
                 last_error: None,
             }),
-            provider: Mutex::new(DesktopProviderConfigSummary {
-                base_url: "https://api.openai.com/v1".to_string(),
-                model: "gpt-4o-mini".to_string(),
-                timeout_secs: 30,
-                has_api_key: false,
-            }),
+            provider_store: StrongholdReadyProviderSecretStore::new().shared(),
         }
     }
 }
