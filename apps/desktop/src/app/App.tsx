@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { type FormEvent, useEffect, useState } from 'react';
 import type {
   ArtifactDetail,
   ArtifactRecord,
@@ -13,6 +13,8 @@ import type {
   RunsResponse,
   WorkerJobsResponse,
 } from '../api/client';
+import { clearProviderConfig, ensureDaemonStarted, getDesktopRuntimeStatus, saveProviderConfig } from '../tauri/bridge';
+import type { DesktopRuntimeStatus } from '../tauri/types';
 
 interface AppProps {
   client: MnemeApiClient;
@@ -114,6 +116,11 @@ export function App({ client }: AppProps) {
   const [memories, setMemories] = useState<MemoriesResponse>({ memories: [] });
   const [retrievalTraces, setRetrievalTraces] = useState<RetrievalTracesResponse>({ retrieval_traces: [] });
   const [workerJobs, setWorkerJobs] = useState<WorkerJobsResponse>({ worker_jobs: [] });
+  const [desktopRuntime, setDesktopRuntime] = useState<DesktopRuntimeStatus | null>(null);
+  const [providerBaseUrl, setProviderBaseUrl] = useState('');
+  const [providerModel, setProviderModel] = useState('');
+  const [providerApiKey, setProviderApiKey] = useState('');
+  const [providerTimeoutSecs, setProviderTimeoutSecs] = useState(30);
   const [error, setError] = useState<string | null>(null);
   const toolActivity = toolActivityFromEvents(events);
 
@@ -134,6 +141,7 @@ export function App({ client }: AppProps) {
           nextMemories,
           nextRetrievalTraces,
           nextWorkerJobs,
+          nextDesktopRuntime,
         ] = await Promise.all([
           client.getHealth(),
           client.listEvents(),
@@ -145,6 +153,7 @@ export function App({ client }: AppProps) {
           client.listMemories(),
           client.listRetrievalTraces(),
           client.listWorkerJobs(),
+          getDesktopRuntimeStatus(),
         ]);
         const nextArtifactPreviews = await Promise.all(
           nextArtifacts.artifacts.map(async (record) => {
@@ -166,6 +175,10 @@ export function App({ client }: AppProps) {
           setMemories(nextMemories);
           setRetrievalTraces(nextRetrievalTraces);
           setWorkerJobs(nextWorkerJobs);
+          setDesktopRuntime(nextDesktopRuntime);
+          setProviderBaseUrl(nextDesktopRuntime.provider.base_url);
+          setProviderModel(nextDesktopRuntime.provider.model);
+          setProviderTimeoutSecs(nextDesktopRuntime.provider.timeout_secs);
         }
       } catch (unknownError) {
         if (!cancelled) {
@@ -180,6 +193,52 @@ export function App({ client }: AppProps) {
       cancelled = true;
     };
   }, [client]);
+
+  async function handleStartDaemon() {
+    try {
+      setDesktopRuntime(await ensureDaemonStarted());
+    } catch (unknownError) {
+      setError(unknownError instanceof Error ? unknownError.message : 'Unknown desktop daemon error');
+    }
+  }
+
+  async function handleSaveProviderConfig(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    try {
+      const provider = await saveProviderConfig({
+        base_url: providerBaseUrl,
+        api_key: providerApiKey,
+        model: providerModel,
+        timeout_secs: providerTimeoutSecs,
+      });
+      setDesktopRuntime((current) => ({
+        daemon: current?.daemon ?? { state: 'not_started' },
+        provider,
+      }));
+      setProviderBaseUrl(provider.base_url);
+      setProviderModel(provider.model);
+      setProviderTimeoutSecs(provider.timeout_secs);
+      setProviderApiKey('');
+    } catch (unknownError) {
+      setError(unknownError instanceof Error ? unknownError.message : 'Unknown provider config error');
+    }
+  }
+
+  async function handleClearProviderConfig() {
+    try {
+      const provider = await clearProviderConfig();
+      setDesktopRuntime((current) => ({
+        daemon: current?.daemon ?? { state: 'not_started' },
+        provider,
+      }));
+      setProviderBaseUrl(provider.base_url);
+      setProviderModel(provider.model);
+      setProviderTimeoutSecs(provider.timeout_secs);
+      setProviderApiKey('');
+    } catch (unknownError) {
+      setError(unknownError instanceof Error ? unknownError.message : 'Unknown provider config error');
+    }
+  }
 
   return (
     <main className="mneme-shell">
@@ -200,6 +259,52 @@ export function App({ client }: AppProps) {
           <strong>{events.events.length} events</strong>
           <span className="meta">Append-only event stream foundation</span>
         </article>
+      </section>
+
+      <section className="desktop-runtime-panel panel">
+        <h2>Desktop Runtime</h2>
+        <p className="muted">Provider keys are stored by the desktop shell. The saved key is never displayed.</p>
+        <div className="desktop-runtime-status">
+          <span>Daemon: {desktopRuntime?.daemon.state ?? 'not_started'}</span>
+          <span>Provider key saved: {desktopRuntime?.provider.has_api_key ? 'yes' : 'no'}</span>
+        </div>
+        <form className="desktop-runtime-form" onSubmit={handleSaveProviderConfig}>
+          <label>
+            Provider base URL
+            <input value={providerBaseUrl} onChange={(event) => setProviderBaseUrl(event.target.value)} />
+          </label>
+          <label>
+            Provider model
+            <input value={providerModel} onChange={(event) => setProviderModel(event.target.value)} />
+          </label>
+          <label>
+            Provider API key
+            <input
+              type="password"
+              value={providerApiKey}
+              onChange={(event) => setProviderApiKey(event.target.value)}
+              autoComplete="off"
+            />
+          </label>
+          <label>
+            Provider timeout seconds
+            <input
+              type="number"
+              min="1"
+              value={providerTimeoutSecs}
+              onChange={(event) => setProviderTimeoutSecs(Number(event.target.value))}
+            />
+          </label>
+          <div className="desktop-runtime-actions">
+            <button type="button" onClick={handleStartDaemon}>
+              Start daemon
+            </button>
+            <button type="submit">Save provider config</button>
+            <button type="button" onClick={handleClearProviderConfig}>
+              Clear provider config
+            </button>
+          </div>
+        </form>
       </section>
 
       <section className="panel">

@@ -109,6 +109,61 @@ h1 {
   margin: 0;
 }
 
+.desktop-runtime-panel {
+  border: 1px solid var(--mneme-color-border);
+  border-radius: var(--mneme-radius-lg);
+  padding: var(--mneme-space-6);
+  background: rgba(17, 24, 39, 0.78);
+}
+
+.desktop-runtime-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--mneme-space-3);
+  margin: var(--mneme-space-4) 0;
+  color: var(--mneme-color-accent-strong);
+  font-family: var(--mneme-font-mono);
+  font-size: 0.85rem;
+  font-weight: 700;
+}
+
+.desktop-runtime-form {
+  display: grid;
+  gap: 0.75rem;
+  max-width: 42rem;
+}
+
+.desktop-runtime-form label {
+  display: grid;
+  gap: var(--mneme-space-2);
+  color: var(--mneme-color-muted);
+  font-size: 0.9rem;
+}
+
+.desktop-runtime-form input {
+  width: 100%;
+  padding: 0.7rem 0.85rem;
+  border: 1px solid var(--mneme-color-border);
+  border-radius: var(--mneme-radius-md);
+  color: var(--mneme-color-text);
+  background: rgba(15, 23, 42, 0.72);
+}
+
+.desktop-runtime-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+.desktop-runtime-actions button {
+  padding: 0.65rem 0.9rem;
+  border: 1px solid rgba(34, 211, 238, 0.42);
+  border-radius: var(--mneme-radius-md);
+  color: var(--mneme-color-text);
+  background: rgba(34, 211, 238, 0.12);
+  cursor: pointer;
+}
+
 .run-list {
   display: grid;
   gap: var(--mneme-space-3);

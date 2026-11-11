@@ -1,6 +1,6 @@
 import '@testing-library/jest-dom/vitest';
-import { render, screen, waitFor } from '@testing-library/react';
-import { describe, expect, it, vi } from 'vitest';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type {
   ArtifactDetail,
   ArtifactsResponse,
@@ -16,6 +16,40 @@ import type {
   WorkerJobsResponse,
 } from '../api/client';
 import { App } from './App';
+import { ensureDaemonStarted, getDesktopRuntimeStatus, saveProviderConfig } from '../tauri/bridge';
+
+vi.mock('../tauri/bridge', () => ({
+  getDesktopRuntimeStatus: vi.fn(async () => ({
+    daemon: { state: 'ready', api_base_url: 'http://127.0.0.1:3766' },
+    provider: {
+      base_url: 'https://api.openai.com/v1',
+      model: 'gpt-4o-mini',
+      timeout_secs: 30,
+      has_api_key: false,
+    },
+  })),
+  ensureDaemonStarted: vi.fn(async () => ({
+    daemon: { state: 'ready', api_base_url: 'http://127.0.0.1:3766' },
+    provider: {
+      base_url: 'https://api.openai.com/v1',
+      model: 'gpt-4o-mini',
+      timeout_secs: 30,
+      has_api_key: false,
+    },
+  })),
+  saveProviderConfig: vi.fn(async (input: { base_url: string; model: string; timeout_secs: number; api_key: string }) => ({
+    base_url: input.base_url,
+    model: input.model,
+    timeout_secs: input.timeout_secs,
+    has_api_key: input.api_key.length > 0,
+  })),
+  clearProviderConfig: vi.fn(async () => ({
+    base_url: 'https://api.openai.com/v1',
+    model: 'gpt-4o-mini',
+    timeout_secs: 30,
+    has_api_key: false,
+  })),
+}));
 
 interface TestClientState {
   health?: KernelHealth;
@@ -142,6 +176,59 @@ function createTestClient(state: TestClientState = {}): MnemeApiClient {
 }
 
 describe('App', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(getDesktopRuntimeStatus).mockResolvedValue({
+      daemon: { state: 'ready', api_base_url: 'http://127.0.0.1:3766' },
+      provider: {
+        base_url: 'https://api.openai.com/v1',
+        model: 'gpt-4o-mini',
+        timeout_secs: 30,
+        has_api_key: false,
+      },
+    });
+    vi.mocked(ensureDaemonStarted).mockResolvedValue({
+      daemon: { state: 'ready', api_base_url: 'http://127.0.0.1:3766' },
+      provider: {
+        base_url: 'https://api.openai.com/v1',
+        model: 'gpt-4o-mini',
+        timeout_secs: 30,
+        has_api_key: false,
+      },
+    });
+    vi.mocked(saveProviderConfig).mockImplementation(async (input) => ({
+      base_url: input.base_url,
+      model: input.model,
+      timeout_secs: input.timeout_secs,
+      has_api_key: input.api_key.trim().length > 0,
+    }));
+  });
+
+  it('shows desktop runtime and saves provider config without rendering the api key', async () => {
+    render(<App client={createTestClient()} />);
+
+    expect(await screen.findByText('Desktop Runtime')).toBeInTheDocument();
+    expect(screen.getByText('Daemon: ready')).toBeInTheDocument();
+    expect(screen.getByText('Provider key saved: no')).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText('Provider base URL'), { target: { value: 'https://provider.example/v1' } });
+    fireEvent.change(screen.getByLabelText('Provider model'), { target: { value: 'gpt-test' } });
+    fireEvent.change(screen.getByLabelText('Provider API key'), { target: { value: 'secret-key' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save provider config' }));
+
+    expect(await screen.findByText('Provider key saved: yes')).toBeInTheDocument();
+    expect(screen.queryByText('secret-key')).not.toBeInTheDocument();
+  });
+
+  it('starts daemon only when user clicks the desktop action', async () => {
+    render(<App client={createTestClient()} />);
+
+    expect(ensureDaemonStarted).not.toHaveBeenCalled();
+    fireEvent.click(await screen.findByRole('button', { name: 'Start daemon' }));
+    await waitFor(() => {
+      expect(ensureDaemonStarted).toHaveBeenCalledTimes(1);
+    });
+  });
   it('渲染 Mneme Workbench 和 Kernel 健康状态', async () => {
     render(<App client={createTestClient()} />);
 
