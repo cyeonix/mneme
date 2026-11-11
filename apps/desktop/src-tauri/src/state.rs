@@ -1,8 +1,8 @@
+use crate::daemon::{SharedDaemonSupervisor, SidecarDaemonSupervisor};
 use crate::provider_config::{
     DesktopProviderConfigSummary, SharedProviderSecretStore, StrongholdReadyProviderSecretStore,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -30,21 +30,19 @@ pub struct DesktopRuntimeStatus {
 #[derive(Debug)]
 pub struct AppState {
     pub api_base_url: String,
-    pub daemon: Mutex<DesktopDaemonStatus>,
+    pub daemon_supervisor: SharedDaemonSupervisor,
     pub provider_store: SharedProviderSecretStore,
 }
 
 impl AppState {
     pub fn new() -> Self {
         let api_base_url = "http://127.0.0.1:3766".to_string();
+        let provider_store = StrongholdReadyProviderSecretStore::new().shared();
+        let daemon_supervisor = SidecarDaemonSupervisor::new(provider_store.clone()).shared();
         Self {
             api_base_url: api_base_url.clone(),
-            daemon: Mutex::new(DesktopDaemonStatus {
-                state: DaemonProcessState::NotStarted,
-                api_base_url: Some(api_base_url),
-                last_error: None,
-            }),
-            provider_store: StrongholdReadyProviderSecretStore::new().shared(),
+            daemon_supervisor,
+            provider_store,
         }
     }
 }

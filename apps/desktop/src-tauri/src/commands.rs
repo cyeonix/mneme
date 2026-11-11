@@ -12,10 +12,37 @@ pub async fn get_desktop_runtime_status(
     state: State<'_, AppState>,
 ) -> Result<DesktopRuntimeStatus, String> {
     let daemon = state
-        .daemon
-        .lock()
-        .map_err(|_| "desktop daemon state lock poisoned".to_string())?
-        .clone();
+        .daemon_supervisor
+        .status()
+        .map_err(|error| error.to_string())?;
+    let provider = state
+        .provider_store
+        .load_provider_config_summary()
+        .map_err(|error| error.to_string())?;
+    Ok(DesktopRuntimeStatus { daemon, provider })
+}
+
+#[tauri::command]
+pub async fn ensure_daemon_started(
+    state: State<'_, AppState>,
+) -> Result<DesktopRuntimeStatus, String> {
+    let daemon = state
+        .daemon_supervisor
+        .ensure_started()
+        .map_err(|error| error.to_string())?;
+    let provider = state
+        .provider_store
+        .load_provider_config_summary()
+        .map_err(|error| error.to_string())?;
+    Ok(DesktopRuntimeStatus { daemon, provider })
+}
+
+#[tauri::command]
+pub async fn restart_daemon(state: State<'_, AppState>) -> Result<DesktopRuntimeStatus, String> {
+    let daemon = state
+        .daemon_supervisor
+        .restart()
+        .map_err(|error| error.to_string())?;
     let provider = state
         .provider_store
         .load_provider_config_summary()

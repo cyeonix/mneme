@@ -1,10 +1,11 @@
 mod commands;
+mod daemon;
 mod provider_config;
 mod state;
 
 use commands::{
-    clear_provider_config, get_api_base_url, get_desktop_runtime_status,
-    get_provider_config_summary, save_provider_config,
+    clear_provider_config, ensure_daemon_started, get_api_base_url, get_desktop_runtime_status,
+    get_provider_config_summary, restart_daemon, save_provider_config,
 };
 use state::AppState;
 
@@ -14,6 +15,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_api_base_url,
             get_desktop_runtime_status,
+            ensure_daemon_started,
+            restart_daemon,
             save_provider_config,
             get_provider_config_summary,
             clear_provider_config
