@@ -62,4 +62,9 @@ pub use tools::{
     ToolApprovalDecision, ToolApprovalPolicy, ToolCallProjection, ToolCallStatus, ToolEffect,
     ToolProjector,
 };
-pub use workers::{WorkerJobKind, WorkerJobRecord, WorkerJobStatus};
+pub use workers::{
+    MockProviderWorker, ModelCompletionRequest, ModelCompletionResponse, ModelUsage,
+    OpenAiCompatibleProviderWorker, OpenAiHttpClient, OpenAiHttpRequest, OpenAiHttpResponse,
+    OpenAiProviderConfig, ProviderWorker, ProviderWorkerError, ReqwestOpenAiHttpClient,
+    SharedOpenAiHttpClient, SharedProviderWorker, WorkerJobKind, WorkerJobRecord, WorkerJobStatus,
+};
