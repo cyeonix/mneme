@@ -1,3 +1,5 @@
+use mneme_kernel::SyncObjectKind;
+
 pub trait SyncServerStore: Clone + Send + Sync + 'static {
     fn pool(&self) -> &sqlx::SqlitePool;
 }
@@ -32,6 +34,35 @@ impl SqliteSyncServerStore {
             .fetch_one(&self.pool)
             .await
             .map(|value| value.unwrap_or(0))
+    }
+
+    pub fn object_kind_to_text(object_kind: SyncObjectKind) -> &'static str {
+        match object_kind {
+            SyncObjectKind::Run => "run",
+            SyncObjectKind::ToolCall => "tool_call",
+            SyncObjectKind::Artifact => "artifact",
+            SyncObjectKind::ContextBundle => "context_bundle",
+            SyncObjectKind::KnowledgeSource => "knowledge_source",
+            SyncObjectKind::DocumentChunk => "document_chunk",
+            SyncObjectKind::Memory => "memory",
+            SyncObjectKind::RetrievalTrace => "retrieval_trace",
+            SyncObjectKind::WorkerJob => "worker_job",
+        }
+    }
+
+    pub fn parse_object_kind(value: &str) -> Option<SyncObjectKind> {
+        match value {
+            "run" => Some(SyncObjectKind::Run),
+            "tool_call" => Some(SyncObjectKind::ToolCall),
+            "artifact" => Some(SyncObjectKind::Artifact),
+            "context_bundle" => Some(SyncObjectKind::ContextBundle),
+            "knowledge_source" => Some(SyncObjectKind::KnowledgeSource),
+            "document_chunk" => Some(SyncObjectKind::DocumentChunk),
+            "memory" => Some(SyncObjectKind::Memory),
+            "retrieval_trace" => Some(SyncObjectKind::RetrievalTrace),
+            "worker_job" => Some(SyncObjectKind::WorkerJob),
+            _ => None,
+        }
     }
 }
 

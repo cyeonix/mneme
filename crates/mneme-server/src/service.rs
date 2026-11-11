@@ -1,7 +1,14 @@
 use crate::storage::SqliteSyncServerStore;
-use mneme_kernel::{DeviceId, DeviceRecord, EventId, RunId, SyncCursorRecord, SyncedEventRecord};
+use mneme_kernel::{
+    DeviceId, DeviceRecord, EventId, RunId, SyncCursorRecord, SyncObjectKind, SyncedEventRecord,
+    SyncedObjectRecord,
+};
 use std::str::FromStr;
-use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use time::{
+    format_description::{well_known::Rfc3339, FormatItem},
+    macros::format_description,
+    OffsetDateTime, UtcOffset,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SyncServerError {
@@ -31,6 +38,17 @@ pub struct PushEventsOutcome {
 pub struct PullEventsOutcome {
     pub events: Vec<SyncedEventRecord>,
     pub latest_server_sequence: i64,
+}
+
+#[derive(Debug)]
+pub struct PushObjectsOutcome {
+    pub accepted: usize,
+    pub kept_existing: usize,
+}
+
+#[derive(Debug)]
+pub struct PullObjectsOutcome {
+    pub objects: Vec<SyncedObjectRecord>,
 }
 
 #[derive(Clone)]
@@ -208,6 +226,69 @@ impl SyncServerService {
         })
     }
 
+    pub async fn push_objects(
+        &self,
+        device_id: DeviceId,
+        objects: Vec<SyncedObjectRecord>,
+    ) -> Result<PushObjectsOutcome, SyncServerError> {
+        self.ensure_known_device(device_id).await?;
+
+        let mut accepted = 0;
+        let mut kept_existing = 0;
+
+        for incoming in objects {
+            if incoming.origin_device_id != device_id {
+                return Err(SyncServerError::InvalidInput);
+            }
+
+            if self.upsert_object(&incoming).await? {
+                accepted += 1;
+            } else {
+                kept_existing += 1;
+            }
+        }
+
+        Ok(PushObjectsOutcome {
+            accepted,
+            kept_existing,
+        })
+    }
+
+    pub async fn pull_objects(
+        &self,
+        device_id: DeviceId,
+        object_kind: Option<SyncObjectKind>,
+        limit: usize,
+    ) -> Result<PullObjectsOutcome, SyncServerError> {
+        self.ensure_known_device(device_id).await?;
+
+        let limit = limit.clamp(1, 500) as i64;
+        let rows = if let Some(object_kind) = object_kind {
+            sqlx::query_as::<_, StoredSyncedObject>(
+                "select object_kind, object_id, origin_device_id, run_id, updated_at, payload_json, received_at from synced_objects where object_kind = ?1 order by updated_at desc, object_id asc limit ?2",
+            )
+            .bind(SqliteSyncServerStore::object_kind_to_text(object_kind))
+            .bind(limit)
+            .fetch_all(self.store.pool())
+            .await
+            .map_err(storage_error)?
+        } else {
+            sqlx::query_as::<_, StoredSyncedObject>(
+                "select object_kind, object_id, origin_device_id, run_id, updated_at, payload_json, received_at from synced_objects order by updated_at desc, object_id asc limit ?1",
+            )
+            .bind(limit)
+            .fetch_all(self.store.pool())
+            .await
+            .map_err(storage_error)?
+        };
+        let objects = rows
+            .into_iter()
+            .map(SyncedObjectRecord::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(PullObjectsOutcome { objects })
+    }
+
     pub async fn ack_events(
         &self,
         device_id: DeviceId,
@@ -257,6 +338,24 @@ impl SyncServerService {
             last_server_sequence: acknowledged_sequence,
             updated_at: now,
         })
+    }
+
+    async fn upsert_object(&self, object: &SyncedObjectRecord) -> Result<bool, SyncServerError> {
+        let updated_at = format_datetime(object.updated_at)?;
+        let result = sqlx::query(
+            "insert into synced_objects (object_kind, object_id, origin_device_id, run_id, updated_at, payload_json, received_at) values (?1, ?2, ?3, ?4, ?5, ?6, ?7) on conflict(object_kind, object_id) do update set origin_device_id = excluded.origin_device_id, run_id = excluded.run_id, updated_at = excluded.updated_at, payload_json = excluded.payload_json, received_at = excluded.received_at where excluded.updated_at > synced_objects.updated_at or (excluded.updated_at = synced_objects.updated_at and excluded.origin_device_id > synced_objects.origin_device_id)",
+        )
+        .bind(SqliteSyncServerStore::object_kind_to_text(object.object_kind))
+        .bind(&object.object_id)
+        .bind(object.origin_device_id.to_string())
+        .bind(object.run_id.to_string())
+        .bind(&updated_at)
+        .bind(object.payload_json.to_string())
+        .bind(format_datetime(OffsetDateTime::now_utc())?)
+        .execute(self.store.pool())
+        .await
+        .map_err(storage_error)?;
+        Ok(result.rows_affected() > 0)
     }
 
     async fn ensure_known_device(&self, device_id: DeviceId) -> Result<(), SyncServerError> {
@@ -324,6 +423,17 @@ struct StoredSyncedEvent {
     received_at: String,
 }
 
+#[derive(sqlx::FromRow)]
+struct StoredSyncedObject {
+    object_kind: String,
+    object_id: String,
+    origin_device_id: String,
+    run_id: String,
+    updated_at: String,
+    payload_json: String,
+    received_at: String,
+}
+
 impl TryFrom<StoredSyncedEvent> for SyncedEventRecord {
     type Error = SyncServerError;
 
@@ -341,6 +451,23 @@ impl TryFrom<StoredSyncedEvent> for SyncedEventRecord {
     }
 }
 
+impl TryFrom<StoredSyncedObject> for SyncedObjectRecord {
+    type Error = SyncServerError;
+
+    fn try_from(row: StoredSyncedObject) -> Result<Self, Self::Error> {
+        Ok(Self {
+            object_id: row.object_id,
+            object_kind: SqliteSyncServerStore::parse_object_kind(&row.object_kind)
+                .ok_or(SyncServerError::InvalidInput)?,
+            origin_device_id: DeviceId::from_str(&row.origin_device_id).map_err(storage_error)?,
+            run_id: RunId::from_str(&row.run_id).map_err(storage_error)?,
+            updated_at: parse_datetime(&row.updated_at)?,
+            payload_json: serde_json::from_str(&row.payload_json).map_err(storage_error)?,
+            received_at: parse_datetime(&row.received_at)?,
+        })
+    }
+}
+
 fn non_blank(value: String) -> Result<String, SyncServerError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -349,8 +476,14 @@ fn non_blank(value: String) -> Result<String, SyncServerError> {
     Ok(trimmed.to_string())
 }
 
+static SQLITE_DATETIME_FORMAT: &[FormatItem<'_>] =
+    format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:9]Z");
+
 fn format_datetime(value: OffsetDateTime) -> Result<String, SyncServerError> {
-    value.format(&Rfc3339).map_err(storage_error)
+    value
+        .to_offset(UtcOffset::UTC)
+        .format(SQLITE_DATETIME_FORMAT)
+        .map_err(storage_error)
 }
 
 fn parse_datetime(value: &str) -> Result<OffsetDateTime, SyncServerError> {
@@ -365,7 +498,7 @@ fn storage_error(error: impl std::fmt::Display) -> SyncServerError {
 mod tests {
     use super::*;
     use crate::storage::SqliteSyncServerStore;
-    use mneme_kernel::{EventId, RunId, SyncedEventRecord};
+    use mneme_kernel::{EventId, RunId, SyncObjectKind, SyncedEventRecord, SyncedObjectRecord};
 
     fn sample_synced_event(origin_device_id: DeviceId, kind_type: &str) -> SyncedEventRecord {
         SyncedEventRecord {
@@ -378,6 +511,356 @@ mod tests {
             payload_json: serde_json::json!({ "sample": true }),
             received_at: time::OffsetDateTime::now_utc(),
         }
+    }
+
+    fn sample_synced_object(
+        origin_device_id: DeviceId,
+        run_id: RunId,
+        object_id: &str,
+        title: &str,
+        day: u8,
+    ) -> SyncedObjectRecord {
+        SyncedObjectRecord {
+            object_id: object_id.to_string(),
+            object_kind: SyncObjectKind::Artifact,
+            origin_device_id,
+            run_id,
+            updated_at: time::OffsetDateTime::from_unix_timestamp(1_700_000_000 + i64::from(day))
+                .unwrap(),
+            payload_json: serde_json::json!({ "title": title }),
+            received_at: time::OffsetDateTime::now_utc(),
+        }
+    }
+
+    #[tokio::test]
+    async fn object_push_uses_lww_conflict_rule() {
+        let store = SqliteSyncServerStore::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let service = SyncServerService::new(store);
+        let device_a = service
+            .register_device("A".to_string(), None)
+            .await
+            .unwrap()
+            .device
+            .device_id;
+        let device_b = service
+            .register_device("B".to_string(), None)
+            .await
+            .unwrap()
+            .device
+            .device_id;
+        let run_id = RunId::new();
+
+        let older = sample_synced_object(device_a, run_id, "artifact-1", "older", 1);
+        let newer = sample_synced_object(device_b, run_id, "artifact-1", "newer", 2);
+
+        service.push_objects(device_a, vec![older]).await.unwrap();
+        service.push_objects(device_b, vec![newer]).await.unwrap();
+
+        let pulled = service.pull_objects(device_a, None, 50).await.unwrap();
+        assert_eq!(pulled.objects.len(), 1);
+        assert_eq!(pulled.objects[0].payload_json["title"], "newer");
+    }
+
+    #[tokio::test]
+    async fn object_push_treats_subsecond_timestamp_as_newer_than_whole_second() {
+        let store = SqliteSyncServerStore::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let service = SyncServerService::new(store);
+        let device_a = service
+            .register_device("A".to_string(), None)
+            .await
+            .unwrap()
+            .device
+            .device_id;
+        let device_b = service
+            .register_device("B".to_string(), None)
+            .await
+            .unwrap()
+            .device
+            .device_id;
+        let run_id = RunId::new();
+        let base_time = time::OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let older_whole_second = SyncedObjectRecord {
+            updated_at: base_time,
+            ..sample_synced_object(device_a, run_id, "artifact-1", "whole-second", 1)
+        };
+        let newer_subsecond = SyncedObjectRecord {
+            updated_at: base_time + time::Duration::milliseconds(100),
+            ..sample_synced_object(device_b, run_id, "artifact-1", "subsecond-newer", 1)
+        };
+
+        let first = service
+            .push_objects(device_a, vec![older_whole_second])
+            .await
+            .unwrap();
+        let second = service
+            .push_objects(device_b, vec![newer_subsecond])
+            .await
+            .unwrap();
+
+        assert_eq!(first.accepted, 1);
+        assert_eq!(second.accepted, 1);
+        assert_eq!(second.kept_existing, 0);
+        let pulled = service.pull_objects(device_a, None, 50).await.unwrap();
+        assert_eq!(pulled.objects.len(), 1);
+        assert_eq!(pulled.objects[0].payload_json["title"], "subsecond-newer");
+    }
+
+    #[tokio::test]
+    async fn object_push_uses_origin_device_id_as_same_timestamp_tiebreaker() {
+        let store = SqliteSyncServerStore::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let service = SyncServerService::new(store);
+        let lower_device = service
+            .register_device("00000000-0000-4000-8000-000000000001".to_string(), None)
+            .await
+            .unwrap()
+            .device
+            .device_id;
+        let higher_device = service
+            .register_device("zzzzzzzz-zzzz-4zzz-8zzz-zzzzzzzzzzzz".to_string(), None)
+            .await
+            .unwrap()
+            .device
+            .device_id;
+        let (lower_device, higher_device) = if lower_device.to_string() < higher_device.to_string()
+        {
+            (lower_device, higher_device)
+        } else {
+            (higher_device, lower_device)
+        };
+        let run_id = RunId::new();
+        let lower = sample_synced_object(lower_device, run_id, "artifact-1", "lower", 1);
+        let higher = sample_synced_object(higher_device, run_id, "artifact-1", "higher", 1);
+
+        let first = service
+            .push_objects(lower_device, vec![lower])
+            .await
+            .unwrap();
+        let second = service
+            .push_objects(higher_device, vec![higher])
+            .await
+            .unwrap();
+
+        assert_eq!(first.accepted, 1);
+        assert_eq!(second.accepted, 1);
+        let pulled = service.pull_objects(lower_device, None, 50).await.unwrap();
+        assert_eq!(pulled.objects.len(), 1);
+        assert_eq!(pulled.objects[0].origin_device_id, higher_device);
+        assert_eq!(pulled.objects[0].payload_json["title"], "higher");
+    }
+
+    #[tokio::test]
+    async fn object_push_same_timestamp_keeps_higher_origin_device_id_winner() {
+        let store = SqliteSyncServerStore::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let service = SyncServerService::new(store);
+        let first_device = service
+            .register_device("first".to_string(), None)
+            .await
+            .unwrap()
+            .device
+            .device_id;
+        let second_device = service
+            .register_device("second".to_string(), None)
+            .await
+            .unwrap()
+            .device
+            .device_id;
+        let (lower_device, higher_device) = if first_device.to_string() < second_device.to_string()
+        {
+            (first_device, second_device)
+        } else {
+            (second_device, first_device)
+        };
+        let run_id = RunId::new();
+        let higher = sample_synced_object(higher_device, run_id, "artifact-1", "higher", 1);
+        let lower = sample_synced_object(lower_device, run_id, "artifact-1", "lower", 1);
+
+        service
+            .push_objects(higher_device, vec![higher])
+            .await
+            .unwrap();
+        let stale = service
+            .push_objects(lower_device, vec![lower])
+            .await
+            .unwrap();
+
+        assert_eq!(stale.accepted, 0);
+        assert_eq!(stale.kept_existing, 1);
+        let pulled = service.pull_objects(higher_device, None, 50).await.unwrap();
+        assert_eq!(pulled.objects.len(), 1);
+        assert_eq!(pulled.objects[0].origin_device_id, higher_device);
+        assert_eq!(pulled.objects[0].payload_json["title"], "higher");
+    }
+
+    #[tokio::test]
+    async fn object_upsert_rejects_stale_writer_after_newer_winner_exists() {
+        let store = SqliteSyncServerStore::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let service = SyncServerService::new(store);
+        let device_a = service
+            .register_device("A".to_string(), None)
+            .await
+            .unwrap()
+            .device
+            .device_id;
+        let device_b = service
+            .register_device("B".to_string(), None)
+            .await
+            .unwrap()
+            .device
+            .device_id;
+        let run_id = RunId::new();
+        let older = sample_synced_object(device_a, run_id, "artifact-1", "older", 1);
+        let newer = sample_synced_object(device_b, run_id, "artifact-1", "newer", 2);
+
+        assert!(service.upsert_object(&newer).await.unwrap());
+        assert!(!service.upsert_object(&older).await.unwrap());
+
+        let pulled = service.pull_objects(device_a, None, 50).await.unwrap();
+        assert_eq!(pulled.objects.len(), 1);
+        assert_eq!(pulled.objects[0].payload_json["title"], "newer");
+    }
+
+    #[tokio::test]
+    async fn pull_objects_rejects_unknown_device() {
+        let store = SqliteSyncServerStore::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let service = SyncServerService::new(store);
+
+        assert!(matches!(
+            service
+                .pull_objects(DeviceId::new(), None, 50)
+                .await
+                .unwrap_err(),
+            SyncServerError::UnknownDevice
+        ));
+    }
+
+    #[tokio::test]
+    async fn pull_objects_clamps_limit_to_one_and_five_hundred() {
+        let store = SqliteSyncServerStore::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let service = SyncServerService::new(store);
+        let device = service
+            .register_device("A".to_string(), None)
+            .await
+            .unwrap()
+            .device
+            .device_id;
+        let run_id = RunId::new();
+        let mut objects = Vec::new();
+        for index in 0..501 {
+            objects.push(sample_synced_object(
+                device,
+                run_id,
+                &format!("artifact-{index:03}"),
+                &format!("object-{index:03}"),
+                1,
+            ));
+        }
+        service.push_objects(device, objects).await.unwrap();
+
+        let clamped_min = service.pull_objects(device, None, 0).await.unwrap();
+        let clamped_max = service.pull_objects(device, None, 501).await.unwrap();
+
+        assert_eq!(clamped_min.objects.len(), 1);
+        assert_eq!(clamped_min.objects[0].object_id, "artifact-000");
+        assert_eq!(clamped_max.objects.len(), 500);
+        assert_eq!(clamped_max.objects[0].object_id, "artifact-000");
+        assert_eq!(clamped_max.objects[499].object_id, "artifact-499");
+    }
+
+    #[tokio::test]
+    async fn pull_objects_filters_kind_and_orders_by_latest_update() {
+        let store = SqliteSyncServerStore::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let service = SyncServerService::new(store);
+        let device = service
+            .register_device("A".to_string(), None)
+            .await
+            .unwrap()
+            .device
+            .device_id;
+        let run_id = RunId::new();
+
+        let artifact_older = sample_synced_object(device, run_id, "artifact-1", "older", 1);
+        let artifact_newer = sample_synced_object(device, run_id, "artifact-2", "newer", 3);
+        let run_object = SyncedObjectRecord {
+            object_id: "run-1".to_string(),
+            object_kind: SyncObjectKind::Run,
+            origin_device_id: device,
+            run_id,
+            updated_at: time::OffsetDateTime::from_unix_timestamp(1_700_000_002).unwrap(),
+            payload_json: serde_json::json!({ "title": "run" }),
+            received_at: time::OffsetDateTime::now_utc(),
+        };
+
+        service
+            .push_objects(device, vec![artifact_older, run_object, artifact_newer])
+            .await
+            .unwrap();
+
+        let pulled = service
+            .pull_objects(device, Some(SyncObjectKind::Artifact), 50)
+            .await
+            .unwrap();
+        assert_eq!(pulled.objects.len(), 2);
+        assert_eq!(pulled.objects[0].object_id, "artifact-2");
+        assert_eq!(pulled.objects[1].object_id, "artifact-1");
+    }
+
+    #[tokio::test]
+    async fn object_push_rejects_unknown_device_and_origin_mismatch() {
+        let store = SqliteSyncServerStore::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let service = SyncServerService::new(store);
+        let device = service
+            .register_device("A".to_string(), None)
+            .await
+            .unwrap()
+            .device
+            .device_id;
+        let run_id = RunId::new();
+
+        assert!(matches!(
+            service
+                .push_objects(
+                    DeviceId::new(),
+                    vec![sample_synced_object(device, run_id, "artifact-1", "bad", 1)]
+                )
+                .await
+                .unwrap_err(),
+            SyncServerError::UnknownDevice
+        ));
+
+        assert!(matches!(
+            service
+                .push_objects(
+                    device,
+                    vec![sample_synced_object(
+                        DeviceId::new(),
+                        run_id,
+                        "artifact-1",
+                        "bad",
+                        1
+                    )]
+                )
+                .await
+                .unwrap_err(),
+            SyncServerError::InvalidInput
+        ));
     }
 
     #[tokio::test]
