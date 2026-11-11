@@ -364,6 +364,14 @@ mod tests {
             }),
         )
         .await;
+        assert_eq!(
+            registered.device.public_key_fingerprint.as_deref(),
+            Some("fp")
+        );
+        let devices: Vec<DeviceRecord> = get_json(&app, "/api/v1/devices").await;
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].device_id, registered.device.device_id);
+        assert_eq!(devices[0].public_key_fingerprint.as_deref(), Some("fp"));
 
         let push: serde_json::Value = post_json(
             &app,

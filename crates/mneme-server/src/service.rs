@@ -107,7 +107,7 @@ impl SyncServerService {
         )
         .bind(device_id.to_string())
         .bind(&display_name)
-        .bind(public_key_fingerprint)
+        .bind(&public_key_fingerprint)
         .bind(&now_text)
         .bind(&now_text)
         .execute(&mut *tx)
@@ -128,6 +128,7 @@ impl SyncServerService {
         let device = DeviceRecord {
             device_id,
             display_name,
+            public_key_fingerprint,
             registered_at: now,
             last_seen_at: now,
         };
@@ -160,7 +161,7 @@ impl SyncServerService {
 
     pub async fn list_devices(&self) -> Result<Vec<DeviceRecord>, SyncServerError> {
         let rows = sqlx::query_as::<_, StoredDevice>(
-            "select device_id, display_name, registered_at, last_seen_at from devices order by registered_at asc",
+            "select device_id, display_name, public_key_fingerprint, registered_at, last_seen_at from devices order by registered_at asc",
         )
         .fetch_all(self.store.pool())
         .await
@@ -403,10 +404,11 @@ impl SyncServerService {
         let mut tx = self.store.pool().begin().await.map_err(storage_error)?;
         for device in &payload.devices {
             sqlx::query(
-                "insert into devices (device_id, display_name, registered_at, last_seen_at) values (?1, ?2, ?3, ?4) on conflict(device_id) do update set display_name = excluded.display_name, registered_at = excluded.registered_at, last_seen_at = excluded.last_seen_at",
+                "insert into devices (device_id, display_name, public_key_fingerprint, registered_at, last_seen_at) values (?1, ?2, ?3, ?4, ?5) on conflict(device_id) do update set display_name = excluded.display_name, public_key_fingerprint = excluded.public_key_fingerprint, registered_at = excluded.registered_at, last_seen_at = excluded.last_seen_at",
             )
             .bind(device.device_id.to_string())
             .bind(&device.display_name)
+            .bind(&device.public_key_fingerprint)
             .bind(format_datetime(device.registered_at)?)
             .bind(format_datetime(device.last_seen_at)?)
             .execute(&mut *tx)
@@ -626,6 +628,7 @@ impl SyncServerService {
 struct StoredDevice {
     device_id: String,
     display_name: String,
+    public_key_fingerprint: Option<String>,
     registered_at: String,
     last_seen_at: String,
 }
@@ -637,6 +640,7 @@ impl TryFrom<StoredDevice> for DeviceRecord {
         Ok(Self {
             device_id: DeviceId::from_str(&row.device_id).map_err(storage_error)?,
             display_name: row.display_name,
+            public_key_fingerprint: row.public_key_fingerprint,
             registered_at: parse_datetime(&row.registered_at)?,
             last_seen_at: parse_datetime(&row.last_seen_at)?,
         })
@@ -806,6 +810,71 @@ mod tests {
             payload_json: serde_json::json!({ "title": title }),
             received_at: time::OffsetDateTime::now_utc(),
         }
+    }
+
+    #[tokio::test]
+    async fn registration_and_list_preserve_public_key_fingerprint() {
+        let service = SyncServerService::new(
+            SqliteSyncServerStore::connect("sqlite::memory:")
+                .await
+                .unwrap(),
+        );
+
+        let registered = service
+            .register_device(
+                "Laptop".to_string(),
+                Some("sha256:device-public-key".to_string()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            registered.device.public_key_fingerprint.as_deref(),
+            Some("sha256:device-public-key")
+        );
+        let listed = service.list_devices().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].device_id, registered.device.device_id);
+        assert_eq!(
+            listed[0].public_key_fingerprint.as_deref(),
+            Some("sha256:device-public-key")
+        );
+    }
+
+    #[tokio::test]
+    async fn backup_export_import_restores_public_key_fingerprint() {
+        let source = SyncServerService::new(
+            SqliteSyncServerStore::connect("sqlite::memory:")
+                .await
+                .unwrap(),
+        );
+        let registered = source
+            .register_device("A".to_string(), Some("sha256:backup-key".to_string()))
+            .await
+            .unwrap();
+
+        let backup = source.export_backup().await.unwrap();
+        let payload: BackupPayload = serde_json::from_value(backup.payload_json.clone()).unwrap();
+        assert_eq!(payload.devices.len(), 1);
+        assert_eq!(
+            payload.devices[0].public_key_fingerprint.as_deref(),
+            Some("sha256:backup-key")
+        );
+
+        let target = SyncServerService::new(
+            SqliteSyncServerStore::connect("sqlite::memory:")
+                .await
+                .unwrap(),
+        );
+        target.import_backup(backup.payload_json).await.unwrap();
+
+        let restored = target.list_devices().await.unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].device_id, registered.device.device_id);
+        assert_eq!(
+            restored[0].public_key_fingerprint.as_deref(),
+            Some("sha256:backup-key")
+        );
     }
 
     #[tokio::test]

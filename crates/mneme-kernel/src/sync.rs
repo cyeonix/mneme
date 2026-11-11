@@ -7,6 +7,7 @@ use time::OffsetDateTime;
 pub struct DeviceRecord {
     pub device_id: DeviceId,
     pub display_name: String,
+    pub public_key_fingerprint: Option<String>,
     pub registered_at: OffsetDateTime,
     pub last_seen_at: OffsetDateTime,
 }
@@ -67,6 +68,7 @@ pub struct BackupRecord {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RegisterDeviceRequest {
     pub display_name: String,
+    pub public_key_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
