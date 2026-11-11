@@ -161,6 +161,22 @@ curl -s http://127.0.0.1:3000/api/v1/retrieval-traces
 
 补充 endpoints：`POST /api/v1/artifacts/:artifact_id/knowledge-source`、`POST /api/v1/context-bundles/:context_bundle_id/knowledge-source`、`POST /api/v1/knowledge-sources/:knowledge_source_id/chunks`、`GET /api/v1/document-chunks`、`GET /api/v1/memories`、`POST /api/v1/memories`。
 
+### Milestone 7：Worker Runtime Provider
+
+Milestone 7 提供 worker runtime provider MVP：当 daemon 配置 `MNEME_OPENAI_API_KEY` 等 provider 环境变量时，worker runtime 使用 real OpenAI-compatible non-streaming chat completion；测试默认使用 mock provider，不需要外部网络或真实 API key。`MNEME_OPENAI_API_KEY` 不会写入 Operation Ledger 或任何 projection。
+
+Worker runtime 通过 `RunService` 推进 run lifecycle，并把 worker job started/completed/failed 事件投影到 `worker_jobs`。Workbench 只读展示 worker jobs，不提供 streaming token UI 或 tool execution。Worker-driven retrieval/recall defaults to `run_id` scope；global recall must be explicit in a future milestone。M8 owns desktop-native provider config and process management。
+
+启动 daemon 后可用以下请求手动触发 worker model completion 并查看 worker job 投影。示例中的 `<run-id>` 是文档占位字面值；实际调用时替换为已有 run id。不要在 README 示例中写入真实 provider key。
+
+```bash
+curl -s -X POST http://127.0.0.1:3766/api/v1/runs/<run-id>/worker-model-completion \
+  -H 'content-type: application/json' \
+  -d '{"prompt":"Summarize this run"}'
+
+curl -s http://127.0.0.1:3766/api/v1/worker-jobs
+```
+
 ## 启动基础阶段 Web shell
 
 ```bash
