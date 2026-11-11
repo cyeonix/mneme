@@ -3,15 +3,19 @@ use mneme_api::routes::{
     SharedContextService, SharedKnowledgeService, SharedMemoryService, SharedRetrievalService,
 };
 use mneme_kernel::{
-    ChunkTextSplitter, InMemoryArtifactContentStore, RunService, SqliteArtifactService,
+    ChunkTextSplitter, InMemoryArtifactContentStore, OpenAiCompatibleProviderWorker,
+    OpenAiProviderConfig, ReqwestOpenAiHttpClient, RunService, SqliteArtifactService,
     SqliteChunkService, SqliteContextService, SqliteKnowledgeService, SqliteMemoryService,
-    SqliteRetrievalService, SqliteRunService, SqliteStore,
+    SqliteRetrievalService, SqliteRunService, SqliteStore, SqliteWorkerRuntimeService, WorkerId,
 };
-use std::{fs, net::SocketAddr, path::Path};
+use std::{fs, net::SocketAddr, path::Path, sync::Arc};
 use tokio::net::TcpListener;
 use tracing::info;
 
 const DEFAULT_DATABASE_URL: &str = "sqlite://.mneme/mneme.db?mode=rwc";
+const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+const DEFAULT_OPENAI_MODEL: &str = "gpt-4o-mini";
+const DEFAULT_OPENAI_TIMEOUT_SECS: u64 = 30;
 
 fn database_url_from_env() -> String {
     database_url_from_env_value(std::env::var("MNEME_DB_URL").ok())
@@ -27,6 +31,49 @@ fn rebuild_runs_on_start() -> bool {
 
 fn rebuild_runs_on_start_value(value: Option<String>) -> bool {
     matches!(value.as_deref(), Some("1") | Some("true") | Some("yes"))
+}
+
+fn openai_provider_config_from_env() -> OpenAiProviderConfig {
+    openai_provider_config_from_env_values(
+        std::env::var("MNEME_OPENAI_BASE_URL").ok(),
+        std::env::var("MNEME_OPENAI_API_KEY").ok(),
+        std::env::var("MNEME_OPENAI_MODEL").ok(),
+        std::env::var("MNEME_OPENAI_TIMEOUT_SECS").ok(),
+    )
+}
+
+fn openai_provider_config_from_env_values(
+    base_url: Option<String>,
+    api_key: Option<String>,
+    model: Option<String>,
+    timeout_secs: Option<String>,
+) -> OpenAiProviderConfig {
+    OpenAiProviderConfig {
+        base_url: trimmed_or_default(base_url, DEFAULT_OPENAI_BASE_URL),
+        api_key: api_key.and_then(|key| {
+            let trimmed = key.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        }),
+        model: trimmed_or_default(model, DEFAULT_OPENAI_MODEL),
+        timeout_secs: timeout_secs
+            .as_deref()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_OPENAI_TIMEOUT_SECS),
+    }
+}
+
+fn trimmed_or_default(value: Option<String>, default: &str) -> String {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(default)
+        .to_string()
 }
 
 fn ensure_sqlite_parent_directory(database_url: &str) -> std::io::Result<()> {
@@ -73,7 +120,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let knowledge_service = SqliteKnowledgeService::new(store.clone());
     let chunk_service = SqliteChunkService::new(store.clone(), ChunkTextSplitter::new(4096, 256));
     let memory_service = SqliteMemoryService::new(store.clone());
-    let retrieval_service = SqliteRetrievalService::new(store);
+    let retrieval_service = SqliteRetrievalService::new(store.clone());
+    let openai_provider_config = openai_provider_config_from_env();
+    let openai_model = openai_provider_config.model.clone();
+    let provider = Arc::new(OpenAiCompatibleProviderWorker::new(
+        WorkerId::new(),
+        openai_provider_config,
+        ReqwestOpenAiHttpClient::new().shared(),
+    ));
+    let worker_runtime_service =
+        SqliteWorkerRuntimeService::new(store, provider, openai_model).shared();
     if rebuild_runs_on_start() {
         let rebuilt = service.rebuild_run_projections().await?;
         info!(
@@ -89,6 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         SharedChunkService::Sqlite(chunk_service),
         SharedMemoryService::Sqlite(memory_service),
         SharedRetrievalService::Sqlite(retrieval_service),
+        worker_runtime_service,
     );
     let listener = TcpListener::bind(addr).await?;
 
@@ -118,6 +175,15 @@ mod tests {
     fn rebuild_runs_on_start_rejects_other_values() {
         assert!(!rebuild_runs_on_start_value(Some("0".to_string())));
         assert!(!rebuild_runs_on_start_value(Some("false".to_string())));
+    }
+
+    #[test]
+    fn openai_provider_config_uses_defaults_without_api_key() {
+        let config = openai_provider_config_from_env_values(None, None, None, None);
+        assert_eq!(config.base_url, "https://api.openai.com/v1");
+        assert_eq!(config.model, "gpt-4o-mini");
+        assert_eq!(config.timeout_secs, 30);
+        assert!(config.api_key.is_none());
     }
 
     #[test]

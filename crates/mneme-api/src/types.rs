@@ -2,6 +2,7 @@ use mneme_kernel::{
     ArtifactDetail, ArtifactKind, ArtifactRecord, ContextBundleRecord, DocumentChunkRecord,
     KernelHealth, KnowledgeSourceRecord, MemoryKind, MemoryRecord, OperationEvent,
     RetrievalTraceRecord, RunProjection, SearchResult, ToolApprovalDecision, ToolEffect,
+    WorkerJobRecord,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -42,6 +43,22 @@ pub struct LifecycleTextRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunLifecycleResponse {
     pub run_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunWorkerModelRequest {
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunWorkerModelResponse {
+    pub run_id: String,
+    pub worker_job_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerJobsResponse {
+    pub worker_jobs: Vec<WorkerJobRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

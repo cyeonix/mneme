@@ -5,9 +5,9 @@ use crate::types::{
     CreateManualKnowledgeSourceRequest, CreateRunRequest, CreateRunResponse,
     DocumentChunksResponse, EventsResponse, HealthResponse, KnowledgeSourcesResponse,
     LifecycleTextRequest, MemoriesResponse, RecordMemoryRequest, RecordMemoryResponse,
-    RetrievalTracesResponse, RunLifecycleResponse, RunsResponse, SearchRequest, SearchResponseDto,
-    ToolCallRequest, ToolCallResponse, ToolLifecycleRequest, ToolLifecycleResponse,
-    ToolResultRequest,
+    RetrievalTracesResponse, RunLifecycleResponse, RunWorkerModelRequest, RunWorkerModelResponse,
+    RunsResponse, SearchRequest, SearchResponseDto, ToolCallRequest, ToolCallResponse,
+    ToolLifecycleRequest, ToolLifecycleResponse, ToolResultRequest, WorkerJobsResponse,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -23,12 +23,13 @@ use mneme_kernel::{
     InMemoryContextBundleProjectionStore, InMemoryDocumentChunkProjectionStore,
     InMemoryKnowledgeSourceProjectionStore, InMemoryMemoryProjectionStore, InMemoryOperationLedger,
     InMemoryRetrievalTraceProjectionStore, InMemoryRunProjectionStore, InMemorySearchIndex,
-    KnowledgeServiceError, KnowledgeSourceId, MemoryServiceError, RetrievalServiceError, RunId,
-    RunServiceError, SharedDocumentChunkProjectionStore, SharedKnowledgeSourceProjectionStore,
+    InMemoryWorkerJobProjectionStore, KnowledgeServiceError, KnowledgeSourceId, MemoryServiceError,
+    MockProviderWorker, RetrievalServiceError, RunId, RunServiceError,
+    SharedDocumentChunkProjectionStore, SharedKnowledgeSourceProjectionStore,
     SharedMemoryProjectionStore, SharedOperationLedger, SharedRetrievalTraceProjectionStore,
-    SharedRunProjectionStore, SharedRunService, SharedSearchIndex, SqliteArtifactService,
-    SqliteChunkService, SqliteContextService, SqliteKnowledgeService, SqliteMemoryService,
-    SqliteRetrievalService, ToolCallId,
+    SharedRunProjectionStore, SharedRunService, SharedSearchIndex, SharedWorkerRuntimeService,
+    SqliteArtifactService, SqliteChunkService, SqliteContextService, SqliteKnowledgeService,
+    SqliteMemoryService, SqliteRetrievalService, ToolCallId, WorkerId, WorkerRuntimeServiceError,
 };
 
 #[derive(Clone)]
@@ -76,6 +77,7 @@ pub struct ApiState {
     pub chunk_service: SharedChunkService,
     pub memory_service: SharedMemoryService,
     pub retrieval_service: SharedRetrievalService,
+    pub worker_runtime_service: SharedWorkerRuntimeService,
 }
 
 /// 创建第一版本地 API 路由。
@@ -123,14 +125,25 @@ pub fn build_router_with_state(
             trace_projection,
             search_index,
         );
+    let run_service = ComposedRunService::new(ledger.clone(), run_store.clone()).shared();
+    let worker_runtime_service = mneme_kernel::ComposedWorkerRuntimeService::new(
+        WorkerId::new(),
+        "mock worker completion".to_string(),
+        ledger,
+        run_service.clone(),
+        InMemoryWorkerJobProjectionStore::new().shared(),
+        MockProviderWorker::new("mock worker completion").shared(),
+    )
+    .shared();
     build_router_with_all_services(
-        ComposedRunService::new(ledger, run_store).shared(),
+        run_service,
         SharedArtifactService::Composed(artifact_service),
         SharedContextService::Composed(context_service),
         knowledge_service,
         chunk_service,
         memory_service,
         retrieval_service,
+        worker_runtime_service,
     )
 }
 
@@ -158,7 +171,7 @@ pub fn build_router_with_service(run_service: SharedRunService) -> Router {
     );
     let (knowledge_service, chunk_service, memory_service, retrieval_service) =
         composed_m6_services(
-            ledger,
+            ledger.clone(),
             run_store,
             artifact_projection,
             context_projection,
@@ -168,6 +181,15 @@ pub fn build_router_with_service(run_service: SharedRunService) -> Router {
             trace_projection,
             search_index,
         );
+    let worker_runtime_service = mneme_kernel::ComposedWorkerRuntimeService::new(
+        WorkerId::new(),
+        "mock worker completion".to_string(),
+        ledger.clone(),
+        run_service.clone(),
+        InMemoryWorkerJobProjectionStore::new().shared(),
+        MockProviderWorker::new("mock worker completion").shared(),
+    )
+    .shared();
     build_router_with_all_services(
         run_service,
         SharedArtifactService::Composed(artifact_service),
@@ -176,6 +198,7 @@ pub fn build_router_with_service(run_service: SharedRunService) -> Router {
         chunk_service,
         memory_service,
         retrieval_service,
+        worker_runtime_service,
     )
 }
 
@@ -241,6 +264,7 @@ pub fn build_router_with_all_services(
     chunk_service: SharedChunkService,
     memory_service: SharedMemoryService,
     retrieval_service: SharedRetrievalService,
+    worker_runtime_service: SharedWorkerRuntimeService,
 ) -> Router {
     Router::new()
         .route("/api/v1/health", get(get_health))
@@ -282,6 +306,11 @@ pub fn build_router_with_all_services(
         .route("/api/v1/memories", get(list_memories).post(record_memory))
         .route("/api/v1/search", axum::routing::post(search))
         .route("/api/v1/retrieval-traces", get(list_retrieval_traces))
+        .route("/api/v1/worker-jobs", get(list_worker_jobs))
+        .route(
+            "/api/v1/runs/:run_id/worker-model-completion",
+            axum::routing::post(run_worker_model_completion),
+        )
         .route(
             "/api/v1/runs/:run_id/tool-calls",
             axum::routing::post(request_tool_call),
@@ -323,6 +352,7 @@ pub fn build_router_with_all_services(
             chunk_service,
             memory_service,
             retrieval_service,
+            worker_runtime_service,
         })
 }
 
@@ -762,6 +792,34 @@ async fn list_retrieval_traces(
     Ok(Json(RetrievalTracesResponse { retrieval_traces }))
 }
 
+async fn list_worker_jobs(
+    State(state): State<ApiState>,
+) -> Result<Json<WorkerJobsResponse>, StatusCode> {
+    let worker_jobs = state
+        .worker_runtime_service
+        .list_worker_jobs()
+        .await
+        .map_err(worker_runtime_error_to_status)?;
+    Ok(Json(WorkerJobsResponse { worker_jobs }))
+}
+
+async fn run_worker_model_completion(
+    State(state): State<ApiState>,
+    Path(run_id): Path<String>,
+    Json(request): Json<RunWorkerModelRequest>,
+) -> Result<Json<RunWorkerModelResponse>, StatusCode> {
+    let run_id = parse_run_id(&run_id)?;
+    let outcome = state
+        .worker_runtime_service
+        .run_model_completion(run_id, request.prompt)
+        .await
+        .map_err(worker_runtime_error_to_status)?;
+    Ok(Json(RunWorkerModelResponse {
+        run_id: outcome.run_id.to_string(),
+        worker_job_id: outcome.worker_job_id.to_string(),
+    }))
+}
+
 async fn request_tool_call(
     State(state): State<ApiState>,
     Path(run_id): Path<String>,
@@ -974,6 +1032,21 @@ fn retrieval_error_to_status(error: RetrievalServiceError) -> StatusCode {
     }
 }
 
+fn worker_runtime_error_to_status(error: WorkerRuntimeServiceError) -> StatusCode {
+    match error {
+        WorkerRuntimeServiceError::InvalidInput | WorkerRuntimeServiceError::RunAlreadyTerminal => {
+            StatusCode::BAD_REQUEST
+        }
+        WorkerRuntimeServiceError::UnknownRun => StatusCode::NOT_FOUND,
+        WorkerRuntimeServiceError::ProviderMissingConfiguration => StatusCode::SERVICE_UNAVAILABLE,
+        WorkerRuntimeServiceError::ProviderTimeout => StatusCode::GATEWAY_TIMEOUT,
+        WorkerRuntimeServiceError::ProviderBadGateway(_) => StatusCode::BAD_GATEWAY,
+        WorkerRuntimeServiceError::Ledger(_)
+        | WorkerRuntimeServiceError::Projection(_)
+        | WorkerRuntimeServiceError::RunService(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -982,7 +1055,9 @@ mod tests {
         http::{header, Method, Request},
     };
     use http_body_util::BodyExt;
-    use mneme_kernel::{ComposedRunService, OperationLedger, SqliteRunService, SqliteStore};
+    use mneme_kernel::{
+        ComposedRunService, OperationLedger, ProviderWorkerError, SqliteRunService, SqliteStore,
+    };
     use serde_json::json;
     use tower::ServiceExt;
 
@@ -990,6 +1065,64 @@ mod tests {
         build_router_with_state(
             InMemoryOperationLedger::new().shared(),
             InMemoryRunProjectionStore::new().shared(),
+        )
+    }
+
+    fn build_router_with_in_memory_worker_provider(
+        provider: mneme_kernel::SharedProviderWorker,
+    ) -> Router {
+        let ledger = InMemoryOperationLedger::new().shared();
+        let run_store = InMemoryRunProjectionStore::new().shared();
+        let run_service = ComposedRunService::new(ledger.clone(), run_store.clone()).shared();
+        let worker_runtime_service = mneme_kernel::ComposedWorkerRuntimeService::new(
+            WorkerId::new(),
+            "mock-worker-model".to_string(),
+            ledger.clone(),
+            run_service.clone(),
+            InMemoryWorkerJobProjectionStore::new().shared(),
+            provider,
+        )
+        .shared();
+        let artifact_projection = InMemoryArtifactProjectionStore::new().shared();
+        let context_projection = InMemoryContextBundleProjectionStore::new().shared();
+        let source_projection = InMemoryKnowledgeSourceProjectionStore::new().shared();
+        let chunk_projection = InMemoryDocumentChunkProjectionStore::new().shared();
+        let memory_projection = InMemoryMemoryProjectionStore::new().shared();
+        let trace_projection = InMemoryRetrievalTraceProjectionStore::new().shared();
+        let search_index = InMemorySearchIndex::new().shared();
+        let artifact_service = ComposedArtifactService::new(
+            ledger.clone(),
+            run_store.clone(),
+            artifact_projection.clone(),
+            InMemoryArtifactContentStore::new().shared(),
+        );
+        let context_service = ComposedContextService::new(
+            ledger.clone(),
+            run_store.clone(),
+            artifact_projection.clone(),
+            context_projection.clone(),
+        );
+        let (knowledge_service, chunk_service, memory_service, retrieval_service) =
+            composed_m6_services(
+                ledger,
+                run_store,
+                artifact_projection,
+                context_projection,
+                source_projection,
+                chunk_projection,
+                memory_projection,
+                trace_projection,
+                search_index,
+            );
+        build_router_with_all_services(
+            run_service,
+            SharedArtifactService::Composed(artifact_service),
+            SharedContextService::Composed(context_service),
+            knowledge_service,
+            chunk_service,
+            memory_service,
+            retrieval_service,
+            worker_runtime_service,
         )
     }
 
@@ -1035,6 +1168,74 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body: serde_json::Value = response_json(response).await;
         body["run_id"].as_str().expect("run_id").to_string()
+    }
+
+    #[tokio::test]
+    async fn api_runs_worker_model_completion_with_mock_provider() {
+        let app = build_router_with_in_memory_worker_provider(
+            MockProviderWorker::new("api reply").shared(),
+        );
+        let run_id = create_run_for_test(&app, "worker run").await;
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/api/v1/runs/{run_id}/worker-model-completion"),
+                serde_json::json!({ "prompt": "hello" }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: RunWorkerModelResponse = response_json(response).await;
+        assert_eq!(body.run_id, run_id);
+
+        let jobs = app
+            .oneshot(empty_request("GET", "/api/v1/worker-jobs"))
+            .await
+            .unwrap();
+        assert_eq!(jobs.status(), StatusCode::OK);
+        let body: WorkerJobsResponse = response_json(jobs).await;
+        assert_eq!(body.worker_jobs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn api_rejects_blank_worker_prompt() {
+        let app = build_router_with_in_memory_worker_provider(
+            MockProviderWorker::new("api reply").shared(),
+        );
+        let run_id = create_run_for_test(&app, "worker run").await;
+
+        let response = app
+            .oneshot(json_request(
+                "POST",
+                &format!("/api/v1/runs/{run_id}/worker-model-completion"),
+                serde_json::json!({ "prompt": "   " }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn api_maps_missing_provider_config_to_service_unavailable() {
+        let app = build_router_with_in_memory_worker_provider(
+            MockProviderWorker::failing(ProviderWorkerError::MissingConfiguration).shared(),
+        );
+        let run_id = create_run_for_test(&app, "worker run").await;
+
+        let response = app
+            .oneshot(json_request(
+                "POST",
+                &format!("/api/v1/runs/{run_id}/worker-model-completion"),
+                serde_json::json!({ "prompt": "hello" }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
