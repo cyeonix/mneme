@@ -13,6 +13,7 @@ import type {
   MnemeApiClient,
   RetrievalTracesResponse,
   RunsResponse,
+  WorkerJobsResponse,
 } from '../api/client';
 import { App } from './App';
 
@@ -27,6 +28,7 @@ interface TestClientState {
   documentChunks?: DocumentChunksResponse['document_chunks'];
   memories?: MemoriesResponse['memories'];
   retrievalTraces?: RetrievalTracesResponse['retrieval_traces'];
+  workerJobs?: WorkerJobsResponse;
 }
 
 function createTestClient(state: TestClientState = {}): MnemeApiClient {
@@ -135,7 +137,7 @@ function createTestClient(state: TestClientState = {}): MnemeApiClient {
     search: vi.fn(async () => ({ query: 'sqlite', hits: [], retrieval_trace_id: 'trace-1' })),
     listRetrievalTraces: vi.fn(async () => ({ retrieval_traces: state.retrievalTraces ?? [] })),
     runWorkerModelCompletion: vi.fn(async () => ({ run_id: 'run-123', worker_job_id: 'job-123' })),
-    listWorkerJobs: vi.fn(async () => ({ worker_jobs: [] })),
+    listWorkerJobs: vi.fn(async () => state.workerJobs ?? { worker_jobs: [] }),
   };
 }
 
@@ -309,6 +311,51 @@ describe('App', () => {
       screen.getByText('Milestone 6 search uses deterministic keyword retrieval, not semantic embeddings.'),
     ).toBeInTheDocument();
     expect(client.search).not.toHaveBeenCalled();
+  });
+
+  it('shows worker runtime jobs without claiming streaming or tool execution', async () => {
+    const client = createTestClient({
+      workerJobs: {
+        worker_jobs: [
+          {
+            worker_job_id: 'job-1',
+            worker_id: 'worker-1',
+            run_id: 'run-1',
+            kind: 'model_completion',
+            status: 'completed',
+            model: 'gpt-test',
+            error: null,
+            started_at: '2026-01-01T00:00:00Z',
+            completed_at: '2026-01-01T00:00:01Z',
+          },
+          {
+            worker_job_id: 'job-2',
+            worker_id: 'worker-1',
+            run_id: 'run-2',
+            kind: 'model_completion',
+            status: 'failed',
+            model: 'gpt-test',
+            error: 'provider returned 500',
+            started_at: '2026-01-01T00:00:02Z',
+            completed_at: '2026-01-01T00:00:03Z',
+          },
+        ],
+      },
+    });
+
+    render(<App client={client} />);
+
+    expect(await screen.findByText('Worker Runtime')).toBeInTheDocument();
+    expect(screen.getAllByText('model_completion')).toHaveLength(2);
+    expect(screen.getByText('completed')).toBeInTheDocument();
+    expect(screen.getByText('failed')).toBeInTheDocument();
+    expect(screen.getByText('provider returned 500')).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        'Provider keys are configured outside the Workbench. No streaming token UI or tool execution is available in Milestone 7.',
+      ),
+    ).toBeInTheDocument();
+    expect(client.runWorkerModelCompletion).not.toHaveBeenCalled();
   });
 
   it('shows tool activity from the operation ledger', async () => {

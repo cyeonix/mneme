@@ -11,6 +11,7 @@ import type {
   MnemeApiClient,
   RetrievalTracesResponse,
   RunsResponse,
+  WorkerJobsResponse,
 } from '../api/client';
 
 interface AppProps {
@@ -112,6 +113,7 @@ export function App({ client }: AppProps) {
   const [documentChunks, setDocumentChunks] = useState<DocumentChunksResponse>({ document_chunks: [] });
   const [memories, setMemories] = useState<MemoriesResponse>({ memories: [] });
   const [retrievalTraces, setRetrievalTraces] = useState<RetrievalTracesResponse>({ retrieval_traces: [] });
+  const [workerJobs, setWorkerJobs] = useState<WorkerJobsResponse>({ worker_jobs: [] });
   const [error, setError] = useState<string | null>(null);
   const toolActivity = toolActivityFromEvents(events);
 
@@ -131,6 +133,7 @@ export function App({ client }: AppProps) {
           nextDocumentChunks,
           nextMemories,
           nextRetrievalTraces,
+          nextWorkerJobs,
         ] = await Promise.all([
           client.getHealth(),
           client.listEvents(),
@@ -141,6 +144,7 @@ export function App({ client }: AppProps) {
           client.listDocumentChunks(),
           client.listMemories(),
           client.listRetrievalTraces(),
+          client.listWorkerJobs(),
         ]);
         const nextArtifactPreviews = await Promise.all(
           nextArtifacts.artifacts.map(async (record) => {
@@ -161,6 +165,7 @@ export function App({ client }: AppProps) {
           setDocumentChunks(nextDocumentChunks);
           setMemories(nextMemories);
           setRetrievalTraces(nextRetrievalTraces);
+          setWorkerJobs(nextWorkerJobs);
         }
       } catch (unknownError) {
         if (!cancelled) {
@@ -369,6 +374,35 @@ export function App({ client }: AppProps) {
                 </div>
                 <p>{trace.explanation}</p>
                 <small>{trace.created_at}</small>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      <section className="panel">
+        <h2>Worker Runtime</h2>
+        <p className="muted">
+          Provider keys are configured outside the Workbench. No streaming token UI or tool execution is available in
+          Milestone 7.
+        </p>
+        {workerJobs.worker_jobs.length === 0 ? (
+          <p className="muted">No worker jobs have been recorded yet.</p>
+        ) : (
+          <ul className="worker-job-list">
+            {workerJobs.worker_jobs.map((job) => (
+              <li key={job.worker_job_id} className="worker-job-card">
+                <div className="artifact-card-header">
+                  <strong>{job.kind}</strong>
+                  <span className="artifact-kind">{job.status}</span>
+                </div>
+                <p>run {job.run_id}</p>
+                {job.model ? <p>model {job.model}</p> : null}
+                {job.error ? <p className="run-error">{job.error}</p> : null}
+                <small>
+                  {job.started_at}
+                  {job.completed_at ? ` → ${job.completed_at}` : ''}
+                </small>
               </li>
             ))}
           </ul>
