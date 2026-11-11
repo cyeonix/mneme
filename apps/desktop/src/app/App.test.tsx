@@ -73,12 +73,12 @@ function createTestClient(state: TestClientState = {}): MnemeApiClient {
     async listEvents() {
       return state.events ?? { events: [] };
     },
-    async listRuns() {
+    listRuns: vi.fn(async () => {
       return state.runs ?? {
         runs: [
           {
             run_id: 'run-1',
-            status: 'running',
+            status: 'running' as const,
             instruction: '展示 runs 投影',
             started_at: '2026-11-09T00:00:00Z',
             completed_at: null,
@@ -89,7 +89,7 @@ function createTestClient(state: TestClientState = {}): MnemeApiClient {
           },
         ],
       };
-    },
+    }),
     async createRun() {
       return { run_id: 'run-123' };
     },
@@ -398,6 +398,85 @@ describe('App', () => {
       screen.getByText('Milestone 6 search uses deterministic keyword retrieval, not semantic embeddings.'),
     ).toBeInTheDocument();
     expect(client.search).not.toHaveBeenCalled();
+  });
+
+  it('runs provider completion only after explicit user action', async () => {
+    const client = createTestClient({
+      runs: {
+        runs: [
+          {
+            run_id: 'run-123',
+            status: 'running',
+            instruction: 'Summarizable run',
+            started_at: '2026-11-09T00:00:00Z',
+            completed_at: null,
+            failed_at: null,
+            summary: null,
+            error: null,
+            updated_at: '2026-11-09T00:00:00Z',
+          },
+        ],
+      },
+    });
+
+    render(<App client={client} />);
+
+    expect(client.runWorkerModelCompletion).not.toHaveBeenCalled();
+
+    fireEvent.change(await screen.findByLabelText('Worker run'), { target: { value: 'run-123' } });
+    fireEvent.change(screen.getByLabelText('Worker prompt'), { target: { value: 'Summarize this run' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Run provider completion' }));
+
+    await waitFor(() => {
+      expect(client.runWorkerModelCompletion).toHaveBeenCalledWith('run-123', {
+        prompt: 'Summarize this run',
+      });
+    });
+    await waitFor(() => {
+      expect(client.listWorkerJobs).toHaveBeenCalledTimes(2);
+      expect(client.listRuns).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  it('does not run provider completion for blank prompt or missing run selection', async () => {
+    const client = createTestClient({
+      runs: {
+        runs: [
+          {
+            run_id: 'run-123',
+            status: 'running',
+            instruction: 'Summarizable run',
+            started_at: '2026-11-09T00:00:00Z',
+            completed_at: null,
+            failed_at: null,
+            summary: null,
+            error: null,
+            updated_at: '2026-11-09T00:00:00Z',
+          },
+        ],
+      },
+    });
+
+    render(<App client={client} />);
+
+    fireEvent.change(await screen.findByLabelText('Worker prompt'), { target: { value: 'Summarize this run' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Run provider completion' }));
+    expect(client.runWorkerModelCompletion).not.toHaveBeenCalled();
+
+    fireEvent.change(screen.getByLabelText('Worker run'), { target: { value: 'run-123' } });
+    fireEvent.change(screen.getByLabelText('Worker prompt'), { target: { value: '   ' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Run provider completion' }));
+    expect(client.runWorkerModelCompletion).not.toHaveBeenCalled();
+  });
+
+  it('describes worker completion as non-streaming and not tool execution', async () => {
+    render(<App client={createTestClient()} />);
+
+    expect(
+      await screen.findByText(
+        'Runs a non-streaming provider completion through the local daemon. This does not execute tools.',
+      ),
+    ).toBeInTheDocument();
   });
 
   it('shows worker runtime jobs without claiming streaming or tool execution', async () => {

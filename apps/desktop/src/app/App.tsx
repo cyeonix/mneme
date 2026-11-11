@@ -121,6 +121,9 @@ export function App({ client }: AppProps) {
   const [providerModel, setProviderModel] = useState('');
   const [providerApiKey, setProviderApiKey] = useState('');
   const [providerTimeoutSecs, setProviderTimeoutSecs] = useState(30);
+  const [selectedWorkerRunId, setSelectedWorkerRunId] = useState('');
+  const [workerPrompt, setWorkerPrompt] = useState('');
+  const [workerCompletionMessage, setWorkerCompletionMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const toolActivity = toolActivityFromEvents(events);
 
@@ -237,6 +240,24 @@ export function App({ client }: AppProps) {
       setProviderApiKey('');
     } catch (unknownError) {
       setError(unknownError instanceof Error ? unknownError.message : 'Unknown provider config error');
+    }
+  }
+
+  async function handleRunWorkerCompletion(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const prompt = workerPrompt.trim();
+    if (!selectedWorkerRunId || !prompt) {
+      return;
+    }
+
+    try {
+      const completion = await client.runWorkerModelCompletion(selectedWorkerRunId, { prompt });
+      const [nextWorkerJobs, nextRuns] = await Promise.all([client.listWorkerJobs(), client.listRuns()]);
+      setWorkerJobs(nextWorkerJobs);
+      setRuns(nextRuns);
+      setWorkerCompletionMessage(`Queued worker job ${completion.worker_job_id}`);
+    } catch (unknownError) {
+      setError(unknownError instanceof Error ? unknownError.message : 'Unknown worker completion error');
     }
   }
 
@@ -491,6 +512,28 @@ export function App({ client }: AppProps) {
           Provider keys are configured outside the Workbench. No streaming token UI or tool execution is available in
           Milestone 7.
         </p>
+        <p className="muted">
+          Runs a non-streaming provider completion through the local daemon. This does not execute tools.
+        </p>
+        <form className="worker-completion-form" onSubmit={handleRunWorkerCompletion}>
+          <label>
+            Worker run
+            <select value={selectedWorkerRunId} onChange={(event) => setSelectedWorkerRunId(event.target.value)}>
+              <option value="">Select a run</option>
+              {runs.runs.map((run) => (
+                <option key={run.run_id} value={run.run_id}>
+                  {run.instruction ? `${run.run_id} — ${run.instruction}` : run.run_id}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            Worker prompt
+            <textarea value={workerPrompt} onChange={(event) => setWorkerPrompt(event.target.value)} rows={3} />
+          </label>
+          <button type="submit">Run provider completion</button>
+          {workerCompletionMessage ? <p className="muted">{workerCompletionMessage}</p> : null}
+        </form>
         {workerJobs.worker_jobs.length === 0 ? (
           <p className="muted">No worker jobs have been recorded yet.</p>
         ) : (
