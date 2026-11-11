@@ -53,7 +53,7 @@ pub use storage::sqlite::{
     SqliteContextBundleProjectionStore, SqliteContextService, SqliteDocumentChunkProjectionStore,
     SqliteKnowledgeService, SqliteKnowledgeSourceProjectionStore, SqliteMemoryProjectionStore,
     SqliteMemoryService, SqliteRetrievalService, SqliteRetrievalTraceProjectionStore,
-    SqliteWorkerJobProjectionStore,
+    SqliteWorkerJobProjectionStore, SqliteWorkerRuntimeService,
 };
 pub use storage::{
     SqliteOperationLedger, SqliteRunProjectionStore, SqliteRunService, SqliteStore,
@@ -64,10 +64,11 @@ pub use tools::{
     ToolProjector,
 };
 pub use workers::{
-    InMemoryWorkerJobProjectionStore, MockProviderWorker, ModelCompletionRequest,
-    ModelCompletionResponse, ModelUsage, OpenAiCompatibleProviderWorker, OpenAiHttpClient,
-    OpenAiHttpRequest, OpenAiHttpResponse, OpenAiProviderConfig, ProviderWorker,
-    ProviderWorkerError, ReqwestOpenAiHttpClient, SharedOpenAiHttpClient, SharedProviderWorker,
-    SharedWorkerJobProjectionStore, WorkerJobKind, WorkerJobProjectionStore, WorkerJobRecord,
-    WorkerJobStatus, WorkerRuntimeError,
+    ComposedWorkerRuntimeService, InMemoryWorkerJobProjectionStore, MockProviderWorker,
+    ModelCompletionRequest, ModelCompletionResponse, ModelUsage, OpenAiCompatibleProviderWorker,
+    OpenAiHttpClient, OpenAiHttpRequest, OpenAiHttpResponse, OpenAiProviderConfig, ProviderWorker,
+    ProviderWorkerError, ReqwestOpenAiHttpClient, RunModelWithWorkerOutcome,
+    SharedOpenAiHttpClient, SharedProviderWorker, SharedWorkerJobProjectionStore,
+    SharedWorkerRuntimeService, WorkerJobKind, WorkerJobProjectionStore, WorkerJobRecord,
+    WorkerJobStatus, WorkerRuntimeError, WorkerRuntimeService, WorkerRuntimeServiceError,
 };

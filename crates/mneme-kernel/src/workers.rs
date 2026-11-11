@@ -6,7 +6,10 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use tokio::sync::RwLock;
 
-use crate::{OperationEvent, OperationEventKind, RunId, WorkerId, WorkerJobId};
+use crate::{
+    OperationEvent, OperationEventKind, RunId, RunServiceError, SharedOperationLedger,
+    SharedRunService, WorkerId, WorkerJobId,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -52,9 +55,227 @@ pub trait WorkerJobProjectionStore: Send + Sync {
 
 pub type SharedWorkerJobProjectionStore = Arc<dyn WorkerJobProjectionStore>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunModelWithWorkerOutcome {
+    pub run_id: RunId,
+    pub worker_job_id: WorkerJobId,
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum WorkerRuntimeServiceError {
+    #[error("worker runtime input is invalid")]
+    InvalidInput,
+    #[error("run is unknown")]
+    UnknownRun,
+    #[error("run is already terminal")]
+    RunAlreadyTerminal,
+    #[error("provider worker is missing required configuration")]
+    ProviderMissingConfiguration,
+    #[error("provider gateway failed: {0}")]
+    ProviderBadGateway(String),
+    #[error("provider request timed out")]
+    ProviderTimeout,
+    #[error("worker runtime ledger failed: {0}")]
+    Ledger(String),
+    #[error("worker runtime projection failed: {0}")]
+    Projection(String),
+    #[error("run service failed: {0}")]
+    RunService(String),
+}
+
+#[async_trait]
+pub trait WorkerRuntimeService: Send + Sync {
+    async fn run_model_completion(
+        &self,
+        run_id: RunId,
+        prompt: String,
+    ) -> Result<RunModelWithWorkerOutcome, WorkerRuntimeServiceError>;
+
+    async fn list_worker_jobs(&self) -> Result<Vec<WorkerJobRecord>, WorkerRuntimeServiceError>;
+}
+
+pub type SharedWorkerRuntimeService = Arc<dyn WorkerRuntimeService>;
+
+#[derive(Clone)]
+pub struct ComposedWorkerRuntimeService {
+    worker_id: WorkerId,
+    model: String,
+    ledger: SharedOperationLedger,
+    run_service: SharedRunService,
+    worker_jobs: SharedWorkerJobProjectionStore,
+    provider: SharedProviderWorker,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryWorkerJobProjectionStore {
     jobs: Arc<RwLock<Vec<WorkerJobRecord>>>,
+}
+
+impl ComposedWorkerRuntimeService {
+    pub fn new(
+        worker_id: WorkerId,
+        model: String,
+        ledger: SharedOperationLedger,
+        run_service: SharedRunService,
+        worker_jobs: SharedWorkerJobProjectionStore,
+        provider: SharedProviderWorker,
+    ) -> Self {
+        Self {
+            worker_id,
+            model,
+            ledger,
+            run_service,
+            worker_jobs,
+            provider,
+        }
+    }
+
+    pub fn shared(self) -> SharedWorkerRuntimeService {
+        Arc::new(self)
+    }
+
+    async fn append_and_apply_worker_event(
+        &self,
+        event: OperationEvent,
+    ) -> Result<(), WorkerRuntimeServiceError> {
+        self.ledger
+            .append(event.clone())
+            .await
+            .map_err(|error| WorkerRuntimeServiceError::Ledger(error.to_string()))?;
+        self.worker_jobs
+            .apply(&event)
+            .await
+            .map_err(|error| WorkerRuntimeServiceError::Projection(error.to_string()))
+    }
+}
+
+#[async_trait]
+impl WorkerRuntimeService for ComposedWorkerRuntimeService {
+    async fn run_model_completion(
+        &self,
+        run_id: RunId,
+        prompt: String,
+    ) -> Result<RunModelWithWorkerOutcome, WorkerRuntimeServiceError> {
+        let prompt = prompt.trim().to_string();
+        if prompt.is_empty() {
+            return Err(WorkerRuntimeServiceError::InvalidInput);
+        }
+
+        let worker_job_id = WorkerJobId::new();
+        let worker_id = self.worker_id;
+        let kind = WorkerJobKind::ModelCompletion;
+        let started = OperationEvent::new_worker_job_started(
+            run_id,
+            worker_job_id,
+            worker_id,
+            kind,
+            Some(self.model.clone()),
+        );
+        self.append_and_apply_worker_event(started).await?;
+
+        self.run_service
+            .request_model(run_id, prompt.clone())
+            .await
+            .map_err(map_run_service_error)?;
+
+        let response = match self
+            .provider
+            .complete(ModelCompletionRequest {
+                run_id,
+                prompt,
+                model: self.model.clone(),
+            })
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let runtime_error = map_provider_worker_error(error);
+                let reason = provider_failure_reason(&runtime_error);
+                let failed = OperationEvent::new_worker_job_failed(
+                    run_id,
+                    worker_job_id,
+                    worker_id,
+                    kind,
+                    reason.clone(),
+                );
+                self.append_and_apply_worker_event(failed).await?;
+                self.run_service
+                    .fail_run(run_id, reason)
+                    .await
+                    .map_err(map_run_service_error)?;
+                return Err(runtime_error);
+            }
+        };
+
+        let completed =
+            OperationEvent::new_worker_job_completed(run_id, worker_job_id, worker_id, kind);
+        self.append_and_apply_worker_event(completed).await?;
+        self.run_service
+            .record_assistant_message(run_id, response.content.clone())
+            .await
+            .map_err(map_run_service_error)?;
+        self.run_service
+            .complete_run(run_id, response.content)
+            .await
+            .map_err(map_run_service_error)?;
+
+        Ok(RunModelWithWorkerOutcome {
+            run_id,
+            worker_job_id,
+        })
+    }
+
+    async fn list_worker_jobs(&self) -> Result<Vec<WorkerJobRecord>, WorkerRuntimeServiceError> {
+        self.worker_jobs
+            .list_worker_jobs()
+            .await
+            .map_err(|error| WorkerRuntimeServiceError::Projection(error.to_string()))
+    }
+}
+
+fn map_run_service_error(error: RunServiceError) -> WorkerRuntimeServiceError {
+    match error {
+        RunServiceError::InvalidLifecycleInput => WorkerRuntimeServiceError::InvalidInput,
+        RunServiceError::InvalidRunId => WorkerRuntimeServiceError::UnknownRun,
+        RunServiceError::RunAlreadyTerminal => WorkerRuntimeServiceError::RunAlreadyTerminal,
+        RunServiceError::Ledger(message) => WorkerRuntimeServiceError::Ledger(message),
+        RunServiceError::Projection(message) => WorkerRuntimeServiceError::Projection(message),
+        other => WorkerRuntimeServiceError::RunService(other.to_string()),
+    }
+}
+
+fn map_provider_worker_error(error: ProviderWorkerError) -> WorkerRuntimeServiceError {
+    match error {
+        ProviderWorkerError::MissingConfiguration => {
+            WorkerRuntimeServiceError::ProviderMissingConfiguration
+        }
+        ProviderWorkerError::Timeout => WorkerRuntimeServiceError::ProviderTimeout,
+        ProviderWorkerError::ProviderStatus { status, .. } => {
+            WorkerRuntimeServiceError::ProviderBadGateway(format!(
+                "provider returned status {status}"
+            ))
+        }
+        ProviderWorkerError::InvalidRequest => WorkerRuntimeServiceError::ProviderBadGateway(
+            "provider request was rejected".to_string(),
+        ),
+        ProviderWorkerError::Http(_) => WorkerRuntimeServiceError::ProviderBadGateway(
+            "provider HTTP request failed".to_string(),
+        ),
+        ProviderWorkerError::MalformedResponse(_) => WorkerRuntimeServiceError::ProviderBadGateway(
+            "provider returned malformed response".to_string(),
+        ),
+    }
+}
+
+fn provider_failure_reason(error: &WorkerRuntimeServiceError) -> String {
+    match error {
+        WorkerRuntimeServiceError::ProviderMissingConfiguration => {
+            "provider worker is missing required configuration".to_string()
+        }
+        WorkerRuntimeServiceError::ProviderTimeout => "provider request timed out".to_string(),
+        WorkerRuntimeServiceError::ProviderBadGateway(message) => message.clone(),
+        _ => "provider worker failed".to_string(),
+    }
 }
 
 impl InMemoryWorkerJobProjectionStore {
@@ -216,7 +437,7 @@ pub struct ModelUsage {
     pub total_tokens: Option<u64>,
 }
 
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ProviderWorkerError {
     #[error("provider worker is missing required configuration")]
     MissingConfiguration,
@@ -247,14 +468,24 @@ pub type SharedProviderWorker = Arc<dyn ProviderWorker>;
 #[derive(Debug, Clone)]
 pub struct MockProviderWorker {
     worker_id: WorkerId,
-    content: String,
+    response: Result<ModelCompletionResponse, ProviderWorkerError>,
 }
 
 impl MockProviderWorker {
     pub fn new(content: impl Into<String>) -> Self {
         Self {
             worker_id: WorkerId::new(),
-            content: content.into(),
+            response: Ok(ModelCompletionResponse {
+                content: content.into(),
+                usage: None,
+            }),
+        }
+    }
+
+    pub fn failing(error: ProviderWorkerError) -> Self {
+        Self {
+            worker_id: WorkerId::new(),
+            response: Err(error),
         }
     }
 
@@ -273,10 +504,7 @@ impl ProviderWorker for MockProviderWorker {
         &self,
         _request: ModelCompletionRequest,
     ) -> Result<ModelCompletionResponse, ProviderWorkerError> {
-        Ok(ModelCompletionResponse {
-            content: self.content.clone(),
-            usage: None,
-        })
+        self.response.clone()
     }
 }
 
@@ -464,7 +692,10 @@ fn parse_openai_response(body: &str) -> Result<ModelCompletionResponse, Provider
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{OperationEvent, RunId, WorkerId, WorkerJobId};
+    use crate::{
+        ComposedRunService, InMemoryOperationLedger, InMemoryRunProjectionStore, OperationEvent,
+        OperationLedger, RunId, RunService, RunStatus, WorkerId, WorkerJobId,
+    };
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -542,6 +773,98 @@ mod tests {
         assert_eq!(failed_job.status, WorkerJobStatus::Failed);
         assert_eq!(failed_job.error.as_deref(), Some("provider returned 500"));
         assert!(failed_job.completed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn composed_worker_runtime_success_drives_run_lifecycle() {
+        let ledger = InMemoryOperationLedger::new();
+        let run_store = InMemoryRunProjectionStore::new();
+        let run_service =
+            ComposedRunService::new(ledger.clone().shared(), run_store.clone().shared());
+        let worker_jobs = InMemoryWorkerJobProjectionStore::new();
+        let provider = MockProviderWorker::new("assistant reply").shared();
+        let runtime = ComposedWorkerRuntimeService::new(
+            WorkerId::new(),
+            "mock-model".to_string(),
+            ledger.clone().shared(),
+            run_service.clone().shared(),
+            worker_jobs.clone().shared(),
+            provider,
+        );
+        let created = ComposedRunService::new(ledger.clone().shared(), run_store.shared())
+            .create_run("write reply".to_string())
+            .await
+            .unwrap();
+
+        let outcome = runtime
+            .run_model_completion(created.run_id, "hello model".to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.run_id, created.run_id);
+        let jobs = runtime.list_worker_jobs().await.unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].worker_job_id, outcome.worker_job_id);
+        assert_eq!(jobs[0].status, WorkerJobStatus::Completed);
+        assert_eq!(jobs[0].model.as_deref(), Some("mock-model"));
+        assert!(jobs[0].completed_at.is_some());
+        let runs = run_service.list_runs().await.unwrap();
+        assert_eq!(runs[0].status, RunStatus::Completed);
+        assert_eq!(runs[0].summary.as_deref(), Some("assistant reply"));
+        let events = ledger.list().await.unwrap();
+        assert_eq!(events.len(), 6);
+    }
+
+    #[tokio::test]
+    async fn composed_worker_runtime_provider_failure_fails_run() {
+        let ledger = InMemoryOperationLedger::new();
+        let run_store = InMemoryRunProjectionStore::new();
+        let run_service =
+            ComposedRunService::new(ledger.clone().shared(), run_store.clone().shared());
+        let worker_jobs = InMemoryWorkerJobProjectionStore::new();
+        let provider = MockProviderWorker::failing(ProviderWorkerError::ProviderStatus {
+            status: 500,
+            body: "provider failed".to_string(),
+        })
+        .shared();
+        let runtime = ComposedWorkerRuntimeService::new(
+            WorkerId::new(),
+            "mock-model".to_string(),
+            ledger.clone().shared(),
+            run_service.clone().shared(),
+            worker_jobs.clone().shared(),
+            provider,
+        );
+        let created = ComposedRunService::new(ledger.clone().shared(), run_store.shared())
+            .create_run("write reply".to_string())
+            .await
+            .unwrap();
+
+        let error = runtime
+            .run_model_completion(created.run_id, "hello model".to_string())
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            WorkerRuntimeServiceError::ProviderBadGateway(
+                "provider returned status 500".to_string()
+            )
+        );
+        let jobs = runtime.list_worker_jobs().await.unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].status, WorkerJobStatus::Failed);
+        assert_eq!(
+            jobs[0].error.as_deref(),
+            Some("provider returned status 500")
+        );
+        let runs = run_service.list_runs().await.unwrap();
+        assert_eq!(runs[0].status, RunStatus::Failed);
+        assert_eq!(
+            runs[0].error.as_deref(),
+            Some("provider returned status 500")
+        );
+        assert!(!format!("{error}").contains("provider failed"));
     }
 
     #[tokio::test]

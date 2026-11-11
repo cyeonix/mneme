@@ -1,18 +1,19 @@
 use crate::{
     ArtifactId, ArtifactKind, ArtifactProjectionStore, ArtifactRecord, ArtifactServiceError,
-    ChunkTextSplitter, ContextBundleId, ContextBundleProjectionStore, ContextBundleRecord,
-    ContextServiceError, CreateArtifactOutcome, CreateContextBundleOutcome,
+    ChunkTextSplitter, ComposedWorkerRuntimeService, ContextBundleId, ContextBundleProjectionStore,
+    ContextBundleRecord, ContextServiceError, CreateArtifactOutcome, CreateContextBundleOutcome,
     CreateKnowledgeSourceOutcome, CreateRunOutcome, DocumentChunkProjectionStore,
     DocumentChunkRecord, EventId, KnowledgeServiceError, KnowledgeSourceId, KnowledgeSourceKind,
     KnowledgeSourceProjectionStore, KnowledgeSourceRecord, LedgerError, MemoryId, MemoryKind,
     MemoryProjectionStore, MemoryRecord, MemoryServiceError, OperationEvent, OperationEventKind,
     OperationLedger, RecordMemoryOutcome, RetrievalServiceError, RetrievalTraceProjectionStore,
-    RetrievalTraceRecord, RunId, RunLifecycleOutcome, RunProjection, RunProjectionError,
-    RunProjectionStore, RunProjector, RunService, RunServiceError, RunStatus, SearchResponse,
-    SearchResult, SharedArtifactContentStore, SharedOperationLedger, SharedRunProjectionStore,
-    SharedRunService, ToolApprovalDecision, ToolApprovalPolicy, ToolCallId, ToolCallOutcome,
-    ToolEffect, ToolLifecycleOutcome, WorkerJobKind, WorkerJobProjectionStore, WorkerJobRecord,
-    WorkerJobStatus, WorkerRuntimeError,
+    RetrievalTraceRecord, RunId, RunLifecycleOutcome, RunModelWithWorkerOutcome, RunProjection,
+    RunProjectionError, RunProjectionStore, RunProjector, RunService, RunServiceError, RunStatus,
+    SearchResponse, SearchResult, SharedArtifactContentStore, SharedOperationLedger,
+    SharedProviderWorker, SharedRunProjectionStore, SharedRunService, SharedWorkerRuntimeService,
+    ToolApprovalDecision, ToolApprovalPolicy, ToolCallId, ToolCallOutcome, ToolEffect,
+    ToolLifecycleOutcome, WorkerJobKind, WorkerJobProjectionStore, WorkerJobRecord,
+    WorkerJobStatus, WorkerRuntimeError, WorkerRuntimeService, WorkerRuntimeServiceError,
 };
 use async_trait::async_trait;
 use serde_json::Value;
@@ -685,6 +686,10 @@ impl SqliteWorkerJobProjectionStore {
         Self { store }
     }
 
+    pub fn shared(self) -> crate::SharedWorkerJobProjectionStore {
+        Arc::new(self)
+    }
+
     pub async fn rebuild(&self, events: &[OperationEvent]) -> Result<(), WorkerRuntimeError> {
         let mut tx = self
             .store
@@ -739,6 +744,48 @@ impl WorkerJobProjectionStore for SqliteWorkerJobProjectionStore {
 
     async fn rebuild(&self, events: &[OperationEvent]) -> Result<(), WorkerRuntimeError> {
         SqliteWorkerJobProjectionStore::rebuild(self, events).await
+    }
+}
+
+#[derive(Clone)]
+pub struct SqliteWorkerRuntimeService {
+    runtime: ComposedWorkerRuntimeService,
+}
+
+impl SqliteWorkerRuntimeService {
+    pub fn new(store: SqliteStore, provider: SharedProviderWorker, model: String) -> Self {
+        let ledger = SqliteOperationLedger::new(store.clone()).shared();
+        let run_service = SqliteRunService::new(store.clone()).shared();
+        let worker_jobs = SqliteWorkerJobProjectionStore::new(store).shared();
+        Self {
+            runtime: ComposedWorkerRuntimeService::new(
+                provider.worker_id(),
+                model,
+                ledger,
+                run_service,
+                worker_jobs,
+                provider,
+            ),
+        }
+    }
+
+    pub fn shared(self) -> SharedWorkerRuntimeService {
+        Arc::new(self)
+    }
+}
+
+#[async_trait]
+impl WorkerRuntimeService for SqliteWorkerRuntimeService {
+    async fn run_model_completion(
+        &self,
+        run_id: RunId,
+        prompt: String,
+    ) -> Result<RunModelWithWorkerOutcome, WorkerRuntimeServiceError> {
+        self.runtime.run_model_completion(run_id, prompt).await
+    }
+
+    async fn list_worker_jobs(&self) -> Result<Vec<WorkerJobRecord>, WorkerRuntimeServiceError> {
+        self.runtime.list_worker_jobs().await
     }
 }
 
@@ -3166,10 +3213,10 @@ mod tests {
     use crate::{
         ArtifactId, ArtifactKind, ArtifactProjectionStore, ContextBundleId, DocumentChunkId,
         InMemoryArtifactContentStore, KnowledgeSourceId, KnowledgeSourceKind,
-        LocalArtifactContentStore, MemoryId, MemoryKind, OperationEvent, OperationLedger,
-        RetrievalTraceId, RunId, RunProjectionStore, RunProjector, ToolCallId, ToolCallStatus,
-        ToolEffect, ToolProjector, WorkerId, WorkerJobId, WorkerJobKind, WorkerJobProjectionStore,
-        WorkerJobStatus,
+        LocalArtifactContentStore, MemoryId, MemoryKind, MockProviderWorker, OperationEvent,
+        OperationLedger, RetrievalTraceId, RunId, RunProjectionStore, RunProjector, RunService,
+        ToolCallId, ToolCallStatus, ToolEffect, ToolProjector, WorkerId, WorkerJobId,
+        WorkerJobKind, WorkerJobProjectionStore, WorkerJobStatus, WorkerRuntimeService,
     };
 
     #[tokio::test]
@@ -4286,6 +4333,41 @@ mod tests {
         assert_eq!(runs[0].run_id, created.run_id);
         assert_eq!(runs[0].status, RunStatus::Completed);
         assert_eq!(runs[0].summary.as_deref(), Some("总结完成"));
+    }
+
+    #[tokio::test]
+    async fn sqlite_worker_runtime_success_records_job_and_run_lifecycle() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let run_service = SqliteRunService::new(store.clone());
+        let created = run_service
+            .create_run("write sqlite runtime reply".to_string())
+            .await
+            .unwrap();
+        let runtime = SqliteWorkerRuntimeService::new(
+            store.clone(),
+            MockProviderWorker::new("sqlite assistant reply").shared(),
+            "mock-model".to_string(),
+        );
+
+        let outcome = runtime
+            .run_model_completion(created.run_id, "hello sqlite runtime".to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.run_id, created.run_id);
+        let jobs = SqliteWorkerJobProjectionStore::new(store.clone())
+            .list_worker_jobs()
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].worker_job_id, outcome.worker_job_id);
+        assert_eq!(jobs[0].status, WorkerJobStatus::Completed);
+        assert_eq!(jobs[0].model.as_deref(), Some("mock-model"));
+        assert!(jobs[0].completed_at.is_some());
+        let runs = SqliteRunService::new(store).list_runs().await.unwrap();
+        assert_eq!(runs[0].run_id, created.run_id);
+        assert_eq!(runs[0].status, RunStatus::Completed);
+        assert_eq!(runs[0].summary.as_deref(), Some("sqlite assistant reply"));
     }
 
     #[tokio::test]
