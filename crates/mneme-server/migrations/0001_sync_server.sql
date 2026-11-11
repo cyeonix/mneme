@@ -46,5 +46,6 @@ create table if not exists backups (
   created_at text not null,
   event_count integer not null,
   object_count integer not null,
-  sha256 text not null
+  sha256 text not null,
+  payload_json text not null
 );

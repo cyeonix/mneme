@@ -1,5 +1,8 @@
 pub mod service;
 pub mod storage;
 
-pub use service::{DeviceRegistrationOutcome, SyncServerError, SyncServerService};
+pub use service::{
+    BackupExportOutcome, BackupPayload, DeviceRegistrationOutcome, ServerOverviewResponse,
+    SyncServerError, SyncServerService,
+};
 pub use storage::{SqliteSyncServerStore, SyncServerStore};

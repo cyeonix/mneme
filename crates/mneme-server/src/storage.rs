@@ -36,6 +36,41 @@ impl SqliteSyncServerStore {
             .map(|value| value.unwrap_or(0))
     }
 
+    pub async fn count_devices(&self) -> Result<usize, sqlx::Error> {
+        self.count_table("devices").await
+    }
+
+    pub async fn count_synced_events(&self) -> Result<usize, sqlx::Error> {
+        self.count_table("synced_events").await
+    }
+
+    pub async fn count_synced_objects(&self) -> Result<usize, sqlx::Error> {
+        self.count_table("synced_objects").await
+    }
+
+    pub async fn latest_event_received_at(&self) -> Result<Option<String>, sqlx::Error> {
+        sqlx::query_scalar::<_, String>(
+            "select received_at from synced_events order by received_at desc limit 1",
+        )
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    pub async fn latest_backup_created_at(&self) -> Result<Option<String>, sqlx::Error> {
+        sqlx::query_scalar::<_, String>(
+            "select created_at from backups order by created_at desc limit 1",
+        )
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    async fn count_table(&self, table_name: &'static str) -> Result<usize, sqlx::Error> {
+        let count = sqlx::query_scalar::<_, i64>(&format!("select count(1) from {table_name}"))
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count as usize)
+    }
+
     pub fn object_kind_to_text(object_kind: SyncObjectKind) -> &'static str {
         match object_kind {
             SyncObjectKind::Run => "run",

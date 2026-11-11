@@ -1,8 +1,9 @@
 use crate::storage::SqliteSyncServerStore;
 use mneme_kernel::{
-    DeviceId, DeviceRecord, EventId, RunId, SyncCursorRecord, SyncObjectKind, SyncedEventRecord,
-    SyncedObjectRecord,
+    BackupId, BackupRecord, DeviceId, DeviceRecord, EventId, RunId, SyncCursorRecord,
+    SyncObjectKind, SyncedEventRecord, SyncedObjectRecord,
 };
+use sha2::{Digest, Sha256};
 use std::str::FromStr;
 use time::{
     format_description::{well_known::Rfc3339, FormatItem},
@@ -49,6 +50,31 @@ pub struct PushObjectsOutcome {
 #[derive(Debug)]
 pub struct PullObjectsOutcome {
     pub objects: Vec<SyncedObjectRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BackupPayload {
+    pub devices: Vec<DeviceRecord>,
+    pub cursors: Vec<SyncCursorRecord>,
+    pub events: Vec<SyncedEventRecord>,
+    pub objects: Vec<SyncedObjectRecord>,
+}
+
+#[derive(Debug)]
+pub struct BackupExportOutcome {
+    pub backup: BackupRecord,
+    pub payload_json: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerOverviewResponse {
+    pub devices: usize,
+    pub synced_events: usize,
+    pub synced_objects: usize,
+    pub latest_server_sequence: i64,
+    pub latest_event_received_at: Option<String>,
+    pub latest_backup_created_at: Option<String>,
+    pub backups: Vec<BackupRecord>,
 }
 
 #[derive(Clone)]
@@ -289,6 +315,172 @@ impl SyncServerService {
         Ok(PullObjectsOutcome { objects })
     }
 
+    pub async fn export_backup(&self) -> Result<BackupExportOutcome, SyncServerError> {
+        let payload = BackupPayload {
+            devices: self.list_devices().await?,
+            cursors: self.list_cursors().await?,
+            events: self.list_events().await?,
+            objects: self.list_objects().await?,
+        };
+        let payload_json = serde_json::to_value(&payload).map_err(storage_error)?;
+        let payload_bytes = serde_json::to_vec(&payload_json).map_err(storage_error)?;
+        let sha256 = format!("{:x}", Sha256::digest(&payload_bytes));
+        let backup_id = BackupId::new();
+        let created_at = OffsetDateTime::now_utc();
+        let exporting_device = payload
+            .devices
+            .first()
+            .map(|device| device.device_id)
+            .unwrap_or_else(DeviceId::new);
+        let backup = BackupRecord {
+            backup_id,
+            device_id: exporting_device,
+            created_at,
+            event_count: payload.events.len() as u64,
+            object_count: payload.objects.len() as u64,
+            sha256,
+        };
+
+        sqlx::query(
+            "insert into backups (backup_id, device_id, created_at, event_count, object_count, sha256, payload_json) values (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )
+        .bind(backup.backup_id.to_string())
+        .bind(backup.device_id.to_string())
+        .bind(format_datetime(backup.created_at)?)
+        .bind(backup.event_count as i64)
+        .bind(backup.object_count as i64)
+        .bind(&backup.sha256)
+        .bind(payload_json.to_string())
+        .execute(self.store.pool())
+        .await
+        .map_err(storage_error)?;
+
+        Ok(BackupExportOutcome {
+            backup,
+            payload_json,
+        })
+    }
+
+    pub async fn import_backup(
+        &self,
+        payload_json: serde_json::Value,
+    ) -> Result<BackupRecord, SyncServerError> {
+        let payload: BackupPayload = serde_json::from_value(payload_json.clone())
+            .map_err(|_| SyncServerError::InvalidInput)?;
+        let payload_bytes = serde_json::to_vec(&payload_json).map_err(storage_error)?;
+        let sha256 = format!("{:x}", Sha256::digest(&payload_bytes));
+        let backup_id = BackupId::new();
+        let created_at = OffsetDateTime::now_utc();
+        let importing_device = payload
+            .devices
+            .first()
+            .map(|device| device.device_id)
+            .unwrap_or_else(DeviceId::new);
+        let backup = BackupRecord {
+            backup_id,
+            device_id: importing_device,
+            created_at,
+            event_count: payload.events.len() as u64,
+            object_count: payload.objects.len() as u64,
+            sha256,
+        };
+
+        let mut tx = self.store.pool().begin().await.map_err(storage_error)?;
+        for device in &payload.devices {
+            sqlx::query(
+                "insert into devices (device_id, display_name, registered_at, last_seen_at) values (?1, ?2, ?3, ?4) on conflict(device_id) do update set display_name = excluded.display_name, registered_at = excluded.registered_at, last_seen_at = excluded.last_seen_at",
+            )
+            .bind(device.device_id.to_string())
+            .bind(&device.display_name)
+            .bind(format_datetime(device.registered_at)?)
+            .bind(format_datetime(device.last_seen_at)?)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage_error)?;
+        }
+        for event in &payload.events {
+            if event.server_sequence <= 0 {
+                return Err(SyncServerError::InvalidInput);
+            }
+            sqlx::query(
+                "insert into synced_events (server_sequence, event_id, origin_device_id, run_id, occurred_at, kind_type, payload_json, received_at) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) on conflict(event_id) do nothing",
+            )
+            .bind(event.server_sequence)
+            .bind(event.event_id.to_string())
+            .bind(event.origin_device_id.to_string())
+            .bind(event.run_id.to_string())
+            .bind(format_datetime(event.occurred_at)?)
+            .bind(&event.kind_type)
+            .bind(event.payload_json.to_string())
+            .bind(format_datetime(event.received_at)?)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage_error)?;
+        }
+        for cursor in &payload.cursors {
+            sqlx::query(
+                "insert into sync_cursors (device_id, last_server_sequence, updated_at) values (?1, ?2, ?3) on conflict(device_id) do update set last_server_sequence = excluded.last_server_sequence, updated_at = excluded.updated_at",
+            )
+            .bind(cursor.device_id.to_string())
+            .bind(cursor.last_server_sequence)
+            .bind(format_datetime(cursor.updated_at)?)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage_error)?;
+        }
+        for object in &payload.objects {
+            Self::upsert_object_in_tx(&mut tx, object, object.received_at).await?;
+        }
+        sqlx::query(
+            "insert into backups (backup_id, device_id, created_at, event_count, object_count, sha256, payload_json) values (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )
+        .bind(backup.backup_id.to_string())
+        .bind(backup.device_id.to_string())
+        .bind(format_datetime(backup.created_at)?)
+        .bind(backup.event_count as i64)
+        .bind(backup.object_count as i64)
+        .bind(&backup.sha256)
+        .bind(payload_json.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(storage_error)?;
+        tx.commit().await.map_err(storage_error)?;
+
+        Ok(backup)
+    }
+
+    pub async fn server_overview(&self) -> Result<ServerOverviewResponse, SyncServerError> {
+        Ok(ServerOverviewResponse {
+            devices: self.store.count_devices().await.map_err(storage_error)?,
+            synced_events: self
+                .store
+                .count_synced_events()
+                .await
+                .map_err(storage_error)?,
+            synced_objects: self
+                .store
+                .count_synced_objects()
+                .await
+                .map_err(storage_error)?,
+            latest_server_sequence: self
+                .store
+                .latest_server_sequence()
+                .await
+                .map_err(storage_error)?,
+            latest_event_received_at: self
+                .store
+                .latest_event_received_at()
+                .await
+                .map_err(storage_error)?,
+            latest_backup_created_at: self
+                .store
+                .latest_backup_created_at()
+                .await
+                .map_err(storage_error)?,
+            backups: self.list_backups().await?,
+        })
+    }
+
     pub async fn ack_events(
         &self,
         device_id: DeviceId,
@@ -340,7 +532,51 @@ impl SyncServerService {
         })
     }
 
+    async fn list_events(&self) -> Result<Vec<SyncedEventRecord>, SyncServerError> {
+        let rows = sqlx::query_as::<_, StoredSyncedEvent>(
+            "select server_sequence, event_id, origin_device_id, run_id, occurred_at, kind_type, payload_json, received_at from synced_events order by server_sequence asc",
+        )
+        .fetch_all(self.store.pool())
+        .await
+        .map_err(storage_error)?;
+
+        rows.into_iter().map(SyncedEventRecord::try_from).collect()
+    }
+
+    async fn list_objects(&self) -> Result<Vec<SyncedObjectRecord>, SyncServerError> {
+        let rows = sqlx::query_as::<_, StoredSyncedObject>(
+            "select object_kind, object_id, origin_device_id, run_id, updated_at, payload_json, received_at from synced_objects order by object_kind asc, object_id asc",
+        )
+        .fetch_all(self.store.pool())
+        .await
+        .map_err(storage_error)?;
+
+        rows.into_iter().map(SyncedObjectRecord::try_from).collect()
+    }
+
+    pub async fn list_backups(&self) -> Result<Vec<BackupRecord>, SyncServerError> {
+        let rows = sqlx::query_as::<_, StoredBackup>(
+            "select backup_id, device_id, created_at, event_count, object_count, sha256 from backups order by created_at desc, backup_id asc",
+        )
+        .fetch_all(self.store.pool())
+        .await
+        .map_err(storage_error)?;
+
+        rows.into_iter().map(BackupRecord::try_from).collect()
+    }
+
     async fn upsert_object(&self, object: &SyncedObjectRecord) -> Result<bool, SyncServerError> {
+        let mut tx = self.store.pool().begin().await.map_err(storage_error)?;
+        let changed = Self::upsert_object_in_tx(&mut tx, object, OffsetDateTime::now_utc()).await?;
+        tx.commit().await.map_err(storage_error)?;
+        Ok(changed)
+    }
+
+    async fn upsert_object_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        object: &SyncedObjectRecord,
+        received_at: OffsetDateTime,
+    ) -> Result<bool, SyncServerError> {
         let updated_at = format_datetime(object.updated_at)?;
         let result = sqlx::query(
             "insert into synced_objects (object_kind, object_id, origin_device_id, run_id, updated_at, payload_json, received_at) values (?1, ?2, ?3, ?4, ?5, ?6, ?7) on conflict(object_kind, object_id) do update set origin_device_id = excluded.origin_device_id, run_id = excluded.run_id, updated_at = excluded.updated_at, payload_json = excluded.payload_json, received_at = excluded.received_at where excluded.updated_at > synced_objects.updated_at or (excluded.updated_at = synced_objects.updated_at and excluded.origin_device_id > synced_objects.origin_device_id)",
@@ -351,8 +587,8 @@ impl SyncServerService {
         .bind(object.run_id.to_string())
         .bind(&updated_at)
         .bind(object.payload_json.to_string())
-        .bind(format_datetime(OffsetDateTime::now_utc())?)
-        .execute(self.store.pool())
+        .bind(format_datetime(received_at)?)
+        .execute(&mut **tx)
         .await
         .map_err(storage_error)?;
         Ok(result.rows_affected() > 0)
@@ -434,6 +670,16 @@ struct StoredSyncedObject {
     received_at: String,
 }
 
+#[derive(sqlx::FromRow)]
+struct StoredBackup {
+    backup_id: String,
+    device_id: String,
+    created_at: String,
+    event_count: i64,
+    object_count: i64,
+    sha256: String,
+}
+
 impl TryFrom<StoredSyncedEvent> for SyncedEventRecord {
     type Error = SyncServerError;
 
@@ -464,6 +710,21 @@ impl TryFrom<StoredSyncedObject> for SyncedObjectRecord {
             updated_at: parse_datetime(&row.updated_at)?,
             payload_json: serde_json::from_str(&row.payload_json).map_err(storage_error)?,
             received_at: parse_datetime(&row.received_at)?,
+        })
+    }
+}
+
+impl TryFrom<StoredBackup> for BackupRecord {
+    type Error = SyncServerError;
+
+    fn try_from(row: StoredBackup) -> Result<Self, Self::Error> {
+        Ok(Self {
+            backup_id: BackupId::from_str(&row.backup_id).map_err(storage_error)?,
+            device_id: DeviceId::from_str(&row.device_id).map_err(storage_error)?,
+            created_at: parse_datetime(&row.created_at)?,
+            event_count: row.event_count as u64,
+            object_count: row.object_count as u64,
+            sha256: row.sha256,
         })
     }
 }
@@ -530,6 +791,384 @@ mod tests {
             payload_json: serde_json::json!({ "title": title }),
             received_at: time::OffsetDateTime::now_utc(),
         }
+    }
+
+    #[tokio::test]
+    async fn backup_export_import_roundtrips_sync_state() {
+        let source = SyncServerService::new(
+            SqliteSyncServerStore::connect("sqlite::memory:")
+                .await
+                .unwrap(),
+        );
+        let device = source
+            .register_device("A".to_string(), None)
+            .await
+            .unwrap()
+            .device
+            .device_id;
+        source
+            .push_events(device, vec![sample_synced_event(device, "run_started")])
+            .await
+            .unwrap();
+        source
+            .push_objects(
+                device,
+                vec![sample_synced_object(
+                    device,
+                    RunId::new(),
+                    "artifact-1",
+                    "A",
+                    1,
+                )],
+            )
+            .await
+            .unwrap();
+
+        let backup = source.export_backup().await.unwrap();
+
+        let target = SyncServerService::new(
+            SqliteSyncServerStore::connect("sqlite::memory:")
+                .await
+                .unwrap(),
+        );
+        target
+            .import_backup(backup.payload_json.clone())
+            .await
+            .unwrap();
+
+        let overview = target.server_overview().await.unwrap();
+        assert_eq!(overview.devices, 1);
+        assert_eq!(overview.synced_events, 1);
+        assert_eq!(overview.synced_objects, 1);
+    }
+
+    #[tokio::test]
+    async fn backup_import_is_idempotent_and_applies_object_lww() {
+        let source = SyncServerService::new(
+            SqliteSyncServerStore::connect("sqlite::memory:")
+                .await
+                .unwrap(),
+        );
+        let lower_device = source
+            .register_device("lower".to_string(), None)
+            .await
+            .unwrap()
+            .device
+            .device_id;
+        let higher_device = source
+            .register_device("higher".to_string(), None)
+            .await
+            .unwrap()
+            .device
+            .device_id;
+        let (lower_device, higher_device) = if lower_device.to_string() < higher_device.to_string()
+        {
+            (lower_device, higher_device)
+        } else {
+            (higher_device, lower_device)
+        };
+        let run_id = RunId::new();
+        let event = sample_synced_event(lower_device, "run_started");
+        source
+            .push_events(lower_device, vec![event.clone()])
+            .await
+            .unwrap();
+        source
+            .push_objects(
+                lower_device,
+                vec![sample_synced_object(
+                    lower_device,
+                    run_id,
+                    "artifact-1",
+                    "lower",
+                    1,
+                )],
+            )
+            .await
+            .unwrap();
+        let backup = source.export_backup().await.unwrap();
+
+        let target = SyncServerService::new(
+            SqliteSyncServerStore::connect("sqlite::memory:")
+                .await
+                .unwrap(),
+        );
+        target
+            .import_backup(backup.payload_json.clone())
+            .await
+            .unwrap();
+        target
+            .push_objects(
+                higher_device,
+                vec![sample_synced_object(
+                    higher_device,
+                    run_id,
+                    "artifact-1",
+                    "higher",
+                    1,
+                )],
+            )
+            .await
+            .unwrap();
+        target.import_backup(backup.payload_json).await.unwrap();
+
+        let overview = target.server_overview().await.unwrap();
+        assert_eq!(overview.synced_events, 1);
+        assert_eq!(overview.synced_objects, 1);
+        let pulled = target.pull_objects(lower_device, None, 50).await.unwrap();
+        assert_eq!(pulled.objects[0].origin_device_id, higher_device);
+        assert_eq!(pulled.objects[0].payload_json["title"], "higher");
+    }
+
+    #[tokio::test]
+    async fn server_overview_counts_state_and_lists_latest_backup() {
+        let service = SyncServerService::new(
+            SqliteSyncServerStore::connect("sqlite::memory:")
+                .await
+                .unwrap(),
+        );
+        let device = service
+            .register_device("A".to_string(), None)
+            .await
+            .unwrap()
+            .device
+            .device_id;
+        service
+            .push_events(device, vec![sample_synced_event(device, "run_started")])
+            .await
+            .unwrap();
+        let backup = service.export_backup().await.unwrap().backup;
+
+        let overview = service.server_overview().await.unwrap();
+
+        assert_eq!(overview.devices, 1);
+        assert_eq!(overview.synced_events, 1);
+        assert_eq!(overview.synced_objects, 0);
+        assert_eq!(overview.latest_server_sequence, 1);
+        assert_eq!(overview.latest_event_received_at.is_some(), true);
+        assert_eq!(overview.latest_backup_created_at.is_some(), true);
+        assert_eq!(overview.backups, vec![backup]);
+    }
+
+    #[tokio::test]
+    async fn import_backup_rejects_invalid_payload_shape() {
+        let service = SyncServerService::new(
+            SqliteSyncServerStore::connect("sqlite::memory:")
+                .await
+                .unwrap(),
+        );
+
+        assert!(matches!(
+            service
+                .import_backup(serde_json::json!({ "devices": [] }))
+                .await
+                .unwrap_err(),
+            SyncServerError::InvalidInput
+        ));
+    }
+
+    #[tokio::test]
+    async fn backup_import_preserves_backed_up_object_received_at() {
+        let source = SyncServerService::new(
+            SqliteSyncServerStore::connect("sqlite::memory:")
+                .await
+                .unwrap(),
+        );
+        let device = source
+            .register_device("A".to_string(), None)
+            .await
+            .unwrap()
+            .device
+            .device_id;
+        source
+            .push_objects(
+                device,
+                vec![sample_synced_object(
+                    device,
+                    RunId::new(),
+                    "artifact-1",
+                    "A",
+                    1,
+                )],
+            )
+            .await
+            .unwrap();
+        let backup = source.export_backup().await.unwrap();
+        let backed_payload: BackupPayload =
+            serde_json::from_value(backup.payload_json.clone()).unwrap();
+
+        let target = SyncServerService::new(
+            SqliteSyncServerStore::connect("sqlite::memory:")
+                .await
+                .unwrap(),
+        );
+        target.import_backup(backup.payload_json).await.unwrap();
+
+        let pulled = target.pull_objects(device, None, 50).await.unwrap();
+        assert_eq!(pulled.objects, backed_payload.objects);
+    }
+
+    #[tokio::test]
+    async fn backup_import_preserves_event_server_sequence_and_cursor_consistency() {
+        let source = SyncServerService::new(
+            SqliteSyncServerStore::connect("sqlite::memory:")
+                .await
+                .unwrap(),
+        );
+        let device = source
+            .register_device("A".to_string(), None)
+            .await
+            .unwrap()
+            .device
+            .device_id;
+        source
+            .push_events(device, vec![sample_synced_event(device, "run_started")])
+            .await
+            .unwrap();
+        source.ack_events(device, 42).await.unwrap();
+        let mut backup = source.export_backup().await.unwrap().payload_json;
+        backup["events"][0]["server_sequence"] = serde_json::json!(42);
+        backup["cursors"][0]["last_server_sequence"] = serde_json::json!(42);
+
+        let target = SyncServerService::new(
+            SqliteSyncServerStore::connect("sqlite::memory:")
+                .await
+                .unwrap(),
+        );
+        target.import_backup(backup).await.unwrap();
+
+        let events = target.list_events().await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].server_sequence, 42);
+        let overview = target.server_overview().await.unwrap();
+        assert_eq!(overview.latest_server_sequence, 42);
+        let cursors = target.list_cursors().await.unwrap();
+        assert_eq!(cursors[0].last_server_sequence, 42);
+    }
+
+    #[tokio::test]
+    async fn backup_import_rolls_back_all_rows_when_object_import_fails() {
+        let source = SyncServerService::new(
+            SqliteSyncServerStore::connect("sqlite::memory:")
+                .await
+                .unwrap(),
+        );
+        let device = source
+            .register_device("A".to_string(), None)
+            .await
+            .unwrap()
+            .device
+            .device_id;
+        source
+            .push_events(device, vec![sample_synced_event(device, "run_started")])
+            .await
+            .unwrap();
+        source
+            .push_objects(
+                device,
+                vec![sample_synced_object(
+                    device,
+                    RunId::new(),
+                    "artifact-1",
+                    "A",
+                    1,
+                )],
+            )
+            .await
+            .unwrap();
+        let mut backup = source.export_backup().await.unwrap().payload_json;
+        backup["objects"][0]["origin_device_id"] = serde_json::json!(DeviceId::new().to_string());
+
+        let target = SyncServerService::new(
+            SqliteSyncServerStore::connect("sqlite::memory:")
+                .await
+                .unwrap(),
+        );
+        assert!(target.import_backup(backup).await.is_err());
+
+        let overview = target.server_overview().await.unwrap();
+        assert_eq!(overview.devices, 0);
+        assert_eq!(overview.synced_events, 0);
+        assert_eq!(overview.synced_objects, 0);
+        assert_eq!(overview.backups.len(), 0);
+        assert_eq!(overview.latest_backup_created_at, None);
+    }
+
+    #[tokio::test]
+    async fn backup_import_rejects_server_sequence_collision_and_rolls_back() {
+        let source = SyncServerService::new(
+            SqliteSyncServerStore::connect("sqlite::memory:")
+                .await
+                .unwrap(),
+        );
+        let source_device = source
+            .register_device("source".to_string(), None)
+            .await
+            .unwrap()
+            .device
+            .device_id;
+        source
+            .push_events(
+                source_device,
+                vec![sample_synced_event(source_device, "source_event")],
+            )
+            .await
+            .unwrap();
+        source.ack_events(source_device, 1).await.unwrap();
+        source
+            .push_objects(
+                source_device,
+                vec![sample_synced_object(
+                    source_device,
+                    RunId::new(),
+                    "artifact-from-backup",
+                    "backup object",
+                    1,
+                )],
+            )
+            .await
+            .unwrap();
+        let backup = source.export_backup().await.unwrap().payload_json;
+        let payload: BackupPayload = serde_json::from_value(backup.clone()).unwrap();
+        let imported_event_id = payload.events[0].event_id;
+
+        let target = SyncServerService::new(
+            SqliteSyncServerStore::connect("sqlite::memory:")
+                .await
+                .unwrap(),
+        );
+        let target_device = target
+            .register_device("target".to_string(), None)
+            .await
+            .unwrap()
+            .device
+            .device_id;
+        target
+            .push_events(
+                target_device,
+                vec![sample_synced_event(target_device, "existing_event")],
+            )
+            .await
+            .unwrap();
+        target.ack_events(target_device, 0).await.unwrap();
+
+        assert_ne!(
+            imported_event_id,
+            target.list_events().await.unwrap()[0].event_id
+        );
+        assert!(target.import_backup(backup).await.is_err());
+
+        let overview = target.server_overview().await.unwrap();
+        assert_eq!(overview.devices, 1);
+        assert_eq!(overview.synced_events, 1);
+        assert_eq!(overview.synced_objects, 0);
+        assert_eq!(overview.backups.len(), 0);
+        assert_eq!(overview.latest_server_sequence, 1);
+        assert_eq!(overview.latest_backup_created_at, None);
+        let cursors = target.list_cursors().await.unwrap();
+        assert_eq!(cursors.len(), 1);
+        assert_eq!(cursors[0].device_id, target_device);
+        assert_eq!(cursors[0].last_server_sequence, 0);
     }
 
     #[tokio::test]
