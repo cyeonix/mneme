@@ -4,6 +4,7 @@ members = [
   "crates/mneme-api",
   "crates/mneme-daemon",
   "crates/mneme-server",
+  "crates/mneme-sync",
   "apps/desktop/src-tauri",
 ]
 resolver = "2"
