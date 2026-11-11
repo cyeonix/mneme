@@ -509,8 +509,8 @@ export function App({ client }: AppProps) {
       <section className="panel">
         <h2>Worker Runtime</h2>
         <p className="muted">
-          Provider keys are configured outside the Workbench. No streaming token UI or tool execution is available in
-          Milestone 7.
+          Provider keys are configured in Desktop Runtime. No streaming token UI or tool execution is available in
+          Milestone 8.
         </p>
         <p className="muted">
           Runs a non-streaming provider completion through the local daemon. This does not execute tools.

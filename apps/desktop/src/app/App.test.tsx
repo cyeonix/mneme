@@ -518,7 +518,7 @@ describe('App', () => {
     expect(screen.getByText('provider returned 500')).toBeInTheDocument();
     expect(
       screen.getByText(
-        'Provider keys are configured outside the Workbench. No streaming token UI or tool execution is available in Milestone 7.',
+        'Provider keys are configured in Desktop Runtime. No streaming token UI or tool execution is available in Milestone 8.',
       ),
     ).toBeInTheDocument();
     expect(client.runWorkerModelCompletion).not.toHaveBeenCalled();

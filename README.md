@@ -13,6 +13,7 @@ Phase 1 构建基础切片：
 - TypeScript API client
 - 最小 React Workbench
 - Artifact Workspace、Context Inspector 与 Search / Memory / Knowledge inspector 的只读基础面板
+- Tauri desktop shell and self-hosted sync server foundations
 
 ## 环境要求
 
@@ -199,6 +200,18 @@ pnpm check
 ```
 
 as the automated verification gate.
+
+### Milestone 9：Self-hosted sync server
+
+Milestone 9 adds the self-hosted `mneme-server` and reusable `mneme-sync` HTTP client for device registration, append-only event sync, LWW object metadata projection sync, backup/restore, and remote server overview. Device token examples must use literal sample values such as `<device-id>` and `<device-token>`; do not write real device tokens or secrets into docs.
+
+Focused M9 verification commands:
+
+```bash
+. "$HOME/.cargo/env" && cargo test -p mneme-server
+. "$HOME/.cargo/env" && cargo test -p mneme-sync
+. "$HOME/.cargo/env" && pnpm check
+```
 
 ## 启动基础阶段 Web shell
 

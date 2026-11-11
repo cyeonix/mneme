@@ -1,6 +1,6 @@
 # Phase 1 Foundation Architecture
 
-Phase 1 验证 Mneme 的第一条纵向切片：本地 Kernel、Operation Ledger、SQLite 读模型、HTTP API、typed client 与最小 Workbench。到 Milestone 7，它包含 worker runtime provider MVP 与 real OpenAI-compatible non-streaming chat completion when configured；M8 继续负责 desktop-native provider config/process management。
+Phase 1 验证 Mneme 的第一条纵向切片：本地 Kernel、Operation Ledger、SQLite 读模型、HTTP API、typed client 与最小 Workbench。Phase 1 now spans local Kernel, daemon/API, Workbench, Tauri desktop shell, and self-hosted sync server. 到 Milestone 7，它包含 worker runtime provider MVP 与 real OpenAI-compatible non-streaming chat completion when configured；M8 继续负责 desktop-native provider config/process management；M9 增加 self-hosted server、device registration、event/object sync、backup/restore 和 remote overview。
 
 ## 边界
 
@@ -29,7 +29,9 @@ Milestone 6 增加 SQLite-first knowledge sources、document chunks、memory met
 
 Milestone 7 增加 real OpenAI-compatible provider worker MVP、worker job ledger/projection、worker API/client/UI。Worker runtime 通过 `RunService` 推进 run lifecycle；测试默认使用 mock provider，不需要真实网络或 provider key；`MNEME_OPENAI_API_KEY` never written to ledger/projection。Worker-driven retrieval/recall defaults to `run_id` scope，Workbench 不提供 streaming token UI 或 tool execution。M8 owns Tauri desktop packaging/provider config UI/process management。
 
-Milestone 8 packages the existing Workbench and daemon into a Tauri desktop shell. The desktop backend supervises the local daemon sidecar lifecycle boundary, injects API base URL into the frontend, manages provider config through Stronghold-ready storage, and enables explicit non-streaming worker completion from the UI without streaming token UI or tool execution. Provider API keys are write-only: they are never displayed after save, logged, kept in frontend storage, written to Operation Ledger, or projected into SQLite read models. M8 does not claim final cross-platform sidecar release packaging while `externalBin`/binary copy is deferred; M9 owns self-hosted server, sync, backup/restore, and remote Web console.
+Milestone 8 packages the existing Workbench and daemon into a Tauri desktop shell. The desktop backend supervises the local daemon sidecar lifecycle boundary, injects API base URL into the frontend, manages provider config through Stronghold-ready storage, and enables explicit non-streaming worker completion from the UI without streaming token UI or tool execution. Provider API keys are write-only: they are never displayed after save, logged, kept in frontend storage, written to Operation Ledger, or projected into SQLite read models. M8 does not claim final cross-platform sidecar release packaging while `externalBin`/binary copy is deferred.
+
+Milestone 9 adds the self-hosted `mneme-server`, sync domain records, and reusable `mneme-sync` HTTP client. It covers device registration, authenticated event push/pull/ack, append-only Operation Ledger sync, LWW object metadata projection sync, backup export/import, backup listing, and server overview. M9 does not implement CRDTs, OAuth, mobile apps, official cloud hosting, end-to-end encrypted sync, or a remote Web console.
 
 ## Phase 1 之后的数据面演进
 
@@ -48,5 +50,7 @@ Milestone 7 在 Phase 1 中落地 worker runtime provider MVP：daemon 可在配
 ## 验证
 
 ```bash
-pnpm check
+. "$HOME/.cargo/env" && cargo test -p mneme-server
+. "$HOME/.cargo/env" && cargo test -p mneme-sync
+. "$HOME/.cargo/env" && pnpm check
 ```
