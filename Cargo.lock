@@ -2242,6 +2242,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "mneme-server"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "mneme-kernel",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.21",
+ "time",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "muda"
 version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
