@@ -47,6 +47,18 @@ pub struct WorkerId(Uuid);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct WorkerJobId(Uuid);
 
+/// 参与同步的设备唯一 ID。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DeviceId(Uuid);
+
+/// 一次同步批次的唯一 ID。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SyncBatchId(Uuid);
+
+/// 一次备份快照的唯一 ID。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct BackupId(Uuid);
+
 impl EventId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
@@ -333,6 +345,84 @@ impl FromStr for WorkerJobId {
     }
 }
 
+impl DeviceId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for DeviceId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for DeviceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl FromStr for DeviceId {
+    type Err = uuid::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self(Uuid::parse_str(value)?))
+    }
+}
+
+impl SyncBatchId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for SyncBatchId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for SyncBatchId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl FromStr for SyncBatchId {
+    type Err = uuid::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self(Uuid::parse_str(value)?))
+    }
+}
+
+impl BackupId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for BackupId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for BackupId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl FromStr for BackupId {
+    type Err = uuid::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self(Uuid::parse_str(value)?))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,6 +497,26 @@ mod tests {
         assert_eq!(
             trace_id.to_string().parse::<RetrievalTraceId>().unwrap(),
             trace_id
+        );
+    }
+
+    #[test]
+    fn generated_sync_ids_are_displayable_and_parseable() {
+        let device_id = DeviceId::new();
+        let sync_batch_id = SyncBatchId::new();
+        let backup_id = BackupId::new();
+
+        assert_eq!(
+            DeviceId::from_str(&device_id.to_string()).unwrap(),
+            device_id
+        );
+        assert_eq!(
+            SyncBatchId::from_str(&sync_batch_id.to_string()).unwrap(),
+            sync_batch_id
+        );
+        assert_eq!(
+            BackupId::from_str(&backup_id.to_string()).unwrap(),
+            backup_id
         );
     }
 }

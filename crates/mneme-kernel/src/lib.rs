@@ -8,6 +8,7 @@ pub mod projections;
 pub mod runs;
 pub mod service;
 pub mod storage;
+pub mod sync;
 pub mod tools;
 pub mod workers;
 
@@ -22,8 +23,8 @@ pub use artifacts::{
 pub use events::{OperationEvent, OperationEventKind};
 pub use health::{kernel_health, KernelHealth};
 pub use ids::{
-    ArtifactId, ContextBundleId, DocumentChunkId, EventId, KnowledgeSourceId, MemoryId,
-    RetrievalTraceId, RunId, ToolCallId, WorkerId, WorkerJobId,
+    ArtifactId, BackupId, ContextBundleId, DeviceId, DocumentChunkId, EventId, KnowledgeSourceId,
+    MemoryId, RetrievalTraceId, RunId, SyncBatchId, ToolCallId, WorkerId, WorkerJobId,
 };
 pub use knowledge::{
     ChunkDraft, ChunkTextSplitter, ComposedChunkService, ComposedKnowledgeService,
@@ -58,6 +59,13 @@ pub use storage::sqlite::{
 pub use storage::{
     SqliteOperationLedger, SqliteRunProjectionStore, SqliteRunService, SqliteStore,
     SqliteStoreError,
+};
+pub use sync::{
+    lww_object_winner, AckEventsRequest, BackupRecord, DeviceRecord, PullEventsRequest,
+    PullEventsResponse, PullObjectsRequest, PullObjectsResponse, PushEventsRequest,
+    PushEventsResponse, PushObjectsRequest, PushObjectsResponse, RegisterDeviceRequest,
+    RegisterDeviceResponse, ServerOverviewResponse, SyncCursorRecord, SyncObjectKind,
+    SyncedEventRecord, SyncedObjectRecord,
 };
 pub use tools::{
     ToolApprovalDecision, ToolApprovalPolicy, ToolCallProjection, ToolCallStatus, ToolEffect,
