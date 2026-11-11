@@ -1,8 +1,8 @@
 use crate::ids::{
     ArtifactId, ContextBundleId, DocumentChunkId, EventId, KnowledgeSourceId, MemoryId,
-    RetrievalTraceId, RunId, ToolCallId,
+    RetrievalTraceId, RunId, ToolCallId, WorkerId, WorkerJobId,
 };
-use crate::{ArtifactKind, KnowledgeSourceKind, MemoryKind, ToolEffect};
+use crate::{ArtifactKind, KnowledgeSourceKind, MemoryKind, ToolEffect, WorkerJobKind};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -94,6 +94,23 @@ pub enum OperationEventKind {
         result_chunk_ids: Vec<DocumentChunkId>,
         result_memory_ids: Vec<MemoryId>,
         explanation: String,
+    },
+    WorkerJobStarted {
+        worker_job_id: WorkerJobId,
+        worker_id: WorkerId,
+        kind: WorkerJobKind,
+        model: Option<String>,
+    },
+    WorkerJobCompleted {
+        worker_job_id: WorkerJobId,
+        worker_id: WorkerId,
+        kind: WorkerJobKind,
+    },
+    WorkerJobFailed {
+        worker_job_id: WorkerJobId,
+        worker_id: WorkerId,
+        kind: WorkerJobKind,
+        reason: String,
     },
 }
 
@@ -386,6 +403,64 @@ impl OperationEvent {
             },
         }
     }
+
+    pub fn new_worker_job_started(
+        run_id: RunId,
+        worker_job_id: WorkerJobId,
+        worker_id: WorkerId,
+        kind: WorkerJobKind,
+        model: Option<String>,
+    ) -> Self {
+        Self {
+            id: EventId::new(),
+            run_id,
+            occurred_at: OffsetDateTime::now_utc(),
+            kind: OperationEventKind::WorkerJobStarted {
+                worker_job_id,
+                worker_id,
+                kind,
+                model,
+            },
+        }
+    }
+
+    pub fn new_worker_job_completed(
+        run_id: RunId,
+        worker_job_id: WorkerJobId,
+        worker_id: WorkerId,
+        kind: WorkerJobKind,
+    ) -> Self {
+        Self {
+            id: EventId::new(),
+            run_id,
+            occurred_at: OffsetDateTime::now_utc(),
+            kind: OperationEventKind::WorkerJobCompleted {
+                worker_job_id,
+                worker_id,
+                kind,
+            },
+        }
+    }
+
+    pub fn new_worker_job_failed(
+        run_id: RunId,
+        worker_job_id: WorkerJobId,
+        worker_id: WorkerId,
+        kind: WorkerJobKind,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: EventId::new(),
+            run_id,
+            occurred_at: OffsetDateTime::now_utc(),
+            kind: OperationEventKind::WorkerJobFailed {
+                worker_job_id,
+                worker_id,
+                kind,
+                reason: reason.into(),
+            },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -393,7 +468,8 @@ mod tests {
     use super::*;
     use crate::{
         ArtifactId, ArtifactKind, ContextBundleId, DocumentChunkId, KnowledgeSourceId,
-        KnowledgeSourceKind, MemoryId, RetrievalTraceId, ToolCallId, ToolEffect,
+        KnowledgeSourceKind, MemoryId, RetrievalTraceId, ToolCallId, ToolEffect, WorkerId,
+        WorkerJobId, WorkerJobKind,
     };
 
     #[test]
@@ -526,6 +602,44 @@ mod tests {
         assert!(
             matches!(event.kind, OperationEventKind::RetrievalTraceRecorded { retrieval_trace_id, result_chunk_ids, result_memory_ids, .. } if retrieval_trace_id == trace_id && result_chunk_ids == vec![chunk_id] && result_memory_ids == vec![memory_id])
         );
+    }
+
+    #[test]
+    fn worker_job_started_event_records_runtime_metadata() {
+        let run_id = RunId::new();
+        let worker_id = WorkerId::new();
+        let worker_job_id = WorkerJobId::new();
+
+        let event = OperationEvent::new_worker_job_started(
+            run_id,
+            worker_job_id,
+            worker_id,
+            WorkerJobKind::ModelCompletion,
+            Some("gpt-4o-mini".to_string()),
+        );
+
+        assert_eq!(event.run_id, run_id);
+        assert!(matches!(
+            event.kind,
+            OperationEventKind::WorkerJobStarted { worker_job_id: actual_job_id, worker_id: actual_worker_id, kind: WorkerJobKind::ModelCompletion, model: Some(ref model) }
+                if actual_job_id == worker_job_id && actual_worker_id == worker_id && model == "gpt-4o-mini"
+        ));
+    }
+
+    #[test]
+    fn worker_job_failed_event_records_reason_without_api_key() {
+        let event = OperationEvent::new_worker_job_failed(
+            RunId::new(),
+            WorkerJobId::new(),
+            WorkerId::new(),
+            WorkerJobKind::ModelCompletion,
+            "provider returned 500",
+        );
+
+        assert!(matches!(
+            event.kind,
+            OperationEventKind::WorkerJobFailed { reason, .. } if reason == "provider returned 500"
+        ));
     }
 
     #[test]

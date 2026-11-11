@@ -79,7 +79,10 @@ impl RunProjectionStore for InMemoryRunProjectionStore {
             | OperationEventKind::KnowledgeSourceCreated { .. }
             | OperationEventKind::DocumentChunkCreated { .. }
             | OperationEventKind::MemoryRecorded { .. }
-            | OperationEventKind::RetrievalTraceRecorded { .. } => {
+            | OperationEventKind::RetrievalTraceRecorded { .. }
+            | OperationEventKind::WorkerJobStarted { .. }
+            | OperationEventKind::WorkerJobCompleted { .. }
+            | OperationEventKind::WorkerJobFailed { .. } => {
                 if let Some(run) = runs
                     .iter_mut()
                     .find(|run| run.run_id == event.run_id && run.status == RunStatus::Running)

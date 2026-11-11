@@ -9,6 +9,7 @@ pub mod runs;
 pub mod service;
 pub mod storage;
 pub mod tools;
+pub mod workers;
 
 pub use artifacts::{
     ArtifactContentStore, ArtifactDetail, ArtifactKind, ArtifactProjectionStore, ArtifactRecord,
@@ -22,7 +23,7 @@ pub use events::{OperationEvent, OperationEventKind};
 pub use health::{kernel_health, KernelHealth};
 pub use ids::{
     ArtifactId, ContextBundleId, DocumentChunkId, EventId, KnowledgeSourceId, MemoryId,
-    RetrievalTraceId, RunId, ToolCallId,
+    RetrievalTraceId, RunId, ToolCallId, WorkerId, WorkerJobId,
 };
 pub use knowledge::{
     ChunkDraft, ChunkTextSplitter, ComposedChunkService, ComposedKnowledgeService,
@@ -61,3 +62,4 @@ pub use tools::{
     ToolApprovalDecision, ToolApprovalPolicy, ToolCallProjection, ToolCallStatus, ToolEffect,
     ToolProjector,
 };
+pub use workers::{WorkerJobKind, WorkerJobRecord, WorkerJobStatus};

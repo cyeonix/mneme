@@ -1973,7 +1973,10 @@ impl SqliteRunService {
             | OperationEventKind::KnowledgeSourceCreated { .. }
             | OperationEventKind::DocumentChunkCreated { .. }
             | OperationEventKind::MemoryRecorded { .. }
-            | OperationEventKind::RetrievalTraceRecorded { .. } => {
+            | OperationEventKind::RetrievalTraceRecorded { .. }
+            | OperationEventKind::WorkerJobStarted { .. }
+            | OperationEventKind::WorkerJobCompleted { .. }
+            | OperationEventKind::WorkerJobFailed { .. } => {
                 sqlx::query(
                     "update runs set updated_at = ?2 where run_id = ?1 and status = 'running'",
                 )
@@ -2286,7 +2289,10 @@ impl RunProjectionStore for SqliteRunProjectionStore {
             | OperationEventKind::KnowledgeSourceCreated { .. }
             | OperationEventKind::DocumentChunkCreated { .. }
             | OperationEventKind::MemoryRecorded { .. }
-            | OperationEventKind::RetrievalTraceRecorded { .. } => {
+            | OperationEventKind::RetrievalTraceRecorded { .. }
+            | OperationEventKind::WorkerJobStarted { .. }
+            | OperationEventKind::WorkerJobCompleted { .. }
+            | OperationEventKind::WorkerJobFailed { .. } => {
                 sqlx::query(
                     "update runs set updated_at = ?2 where run_id = ?1 and status = 'running'",
                 )
@@ -2701,6 +2707,9 @@ fn kind_type_for_event(kind: &OperationEventKind) -> &'static str {
         OperationEventKind::DocumentChunkCreated { .. } => "document_chunk_created",
         OperationEventKind::MemoryRecorded { .. } => "memory_recorded",
         OperationEventKind::RetrievalTraceRecorded { .. } => "retrieval_trace_recorded",
+        OperationEventKind::WorkerJobStarted { .. } => "worker_job_started",
+        OperationEventKind::WorkerJobCompleted { .. } => "worker_job_completed",
+        OperationEventKind::WorkerJobFailed { .. } => "worker_job_failed",
     }
 }
 
@@ -2952,7 +2961,7 @@ mod tests {
         InMemoryArtifactContentStore, KnowledgeSourceId, KnowledgeSourceKind,
         LocalArtifactContentStore, MemoryId, MemoryKind, OperationEvent, OperationLedger,
         RetrievalTraceId, RunId, RunProjectionStore, RunProjector, ToolCallId, ToolCallStatus,
-        ToolEffect, ToolProjector,
+        ToolEffect, ToolProjector, WorkerId, WorkerJobId, WorkerJobKind,
     };
 
     #[tokio::test]
@@ -3144,6 +3153,78 @@ mod tests {
             } if actual_context_bundle_id == &context_bundle_id
                 && artifact_ids == &vec![artifact_id]
                 && event_ids == &vec![event_id]
+        ));
+    }
+
+    #[tokio::test]
+    async fn sqlite_ledger_roundtrips_worker_job_events() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let ledger = SqliteOperationLedger::new(store);
+        let run_id = RunId::new();
+        let worker_id = WorkerId::new();
+        let worker_job_id = WorkerJobId::new();
+
+        ledger
+            .append(OperationEvent::new_worker_job_started(
+                run_id,
+                worker_job_id,
+                worker_id,
+                WorkerJobKind::ModelCompletion,
+                Some("gpt-4o-mini".to_string()),
+            ))
+            .await
+            .unwrap();
+        ledger
+            .append(OperationEvent::new_worker_job_completed(
+                run_id,
+                worker_job_id,
+                worker_id,
+                WorkerJobKind::ModelCompletion,
+            ))
+            .await
+            .unwrap();
+        ledger
+            .append(OperationEvent::new_worker_job_failed(
+                run_id,
+                worker_job_id,
+                worker_id,
+                WorkerJobKind::ModelCompletion,
+                "provider returned 500",
+            ))
+            .await
+            .unwrap();
+
+        let events = ledger.list().await.unwrap();
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            &events[0].kind,
+            OperationEventKind::WorkerJobStarted {
+                worker_job_id: actual_worker_job_id,
+                worker_id: actual_worker_id,
+                kind: WorkerJobKind::ModelCompletion,
+                model: Some(model),
+            } if actual_worker_job_id == &worker_job_id
+                && actual_worker_id == &worker_id
+                && model == "gpt-4o-mini"
+        ));
+        assert!(matches!(
+            &events[1].kind,
+            OperationEventKind::WorkerJobCompleted {
+                worker_job_id: actual_worker_job_id,
+                worker_id: actual_worker_id,
+                kind: WorkerJobKind::ModelCompletion,
+            } if actual_worker_job_id == &worker_job_id && actual_worker_id == &worker_id
+        ));
+        assert!(matches!(
+            &events[2].kind,
+            OperationEventKind::WorkerJobFailed {
+                worker_job_id: actual_worker_job_id,
+                worker_id: actual_worker_id,
+                kind: WorkerJobKind::ModelCompletion,
+                reason,
+            } if actual_worker_job_id == &worker_job_id
+                && actual_worker_id == &worker_id
+                && reason == "provider returned 500"
         ));
     }
 
