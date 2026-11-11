@@ -1239,6 +1239,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_worker_completion_returns_not_found_for_unknown_run() {
+        let app =
+            build_router_with_in_memory_worker_provider(MockProviderWorker::new("reply").shared());
+        let unknown_run_id = RunId::new();
+
+        let response = app
+            .oneshot(json_request(
+                "POST",
+                &format!("/api/v1/runs/{unknown_run_id}/worker-model-completion"),
+                serde_json::json!({ "prompt": "hello" }),
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn api_worker_completion_rejects_terminal_run() {
+        let app =
+            build_router_with_in_memory_worker_provider(MockProviderWorker::new("reply").shared());
+        let run_id = create_run_for_test(&app, "terminal run").await;
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/api/v1/runs/{run_id}/complete"),
+                serde_json::json!({ "text": "done" }),
+            ))
+            .await
+            .expect("complete response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(json_request(
+                "POST",
+                &format!("/api/v1/runs/{run_id}/worker-model-completion"),
+                serde_json::json!({ "prompt": "hello" }),
+            ))
+            .await
+            .expect("worker response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn api_worker_completion_maps_provider_timeout_to_gateway_timeout() {
+        let app = build_router_with_in_memory_worker_provider(
+            MockProviderWorker::failing(ProviderWorkerError::Timeout).shared(),
+        );
+        let run_id = create_run_for_test(&app, "timeout run").await;
+
+        let response = app
+            .oneshot(json_request(
+                "POST",
+                &format!("/api/v1/runs/{run_id}/worker-model-completion"),
+                serde_json::json!({ "prompt": "hello" }),
+            ))
+            .await
+            .expect("worker response");
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn api_worker_completion_maps_provider_bad_gateway() {
+        let app = build_router_with_in_memory_worker_provider(
+            MockProviderWorker::failing(ProviderWorkerError::ProviderStatus {
+                status: 502,
+                body: "upstream failed".to_string(),
+            })
+            .shared(),
+        );
+        let run_id = create_run_for_test(&app, "bad gateway run").await;
+
+        let response = app
+            .oneshot(json_request(
+                "POST",
+                &format!("/api/v1/runs/{run_id}/worker-model-completion"),
+                serde_json::json!({ "prompt": "hello" }),
+            ))
+            .await
+            .expect("worker response");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
     async fn health_endpoint_returns_ready_kernel_status() {
         let app = build_router(InMemoryOperationLedger::new());
 
