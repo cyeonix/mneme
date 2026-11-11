@@ -7,9 +7,12 @@
     "check": "tsc --noEmit",
     "test": "vitest run",
     "dev": "vite",
-    "build": "tsc --noEmit && vite build"
+    "build": "tsc --noEmit && vite build",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build"
   },
   "dependencies": {
+    "@tauri-apps/api": "^2.0.0",
     "@vitejs/plugin-react": "latest",
     "vite": "latest",
     "typescript": "latest",
@@ -17,6 +20,7 @@
     "react-dom": "latest"
   },
   "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0",
     "vitest": "latest",
     "jsdom": "latest",
     "@testing-library/react": "latest",

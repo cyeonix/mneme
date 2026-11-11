@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { getApiBaseUrl, getDesktopRuntimeStatus } from '../tauri/bridge';
 import { createMnemeApiClient } from './client';
 
 function jsonResponse(body: unknown): Response {
@@ -7,6 +8,27 @@ function jsonResponse(body: unknown): Response {
     headers: { 'content-type': 'application/json' },
   });
 }
+
+describe('desktop bridge fallback', () => {
+  it('returns the browser fallback API base URL outside Tauri', async () => {
+    await expect(getApiBaseUrl()).resolves.toBe('http://127.0.0.1:3766');
+  });
+
+  it('returns a dev desktop runtime status outside Tauri', async () => {
+    await expect(getDesktopRuntimeStatus()).resolves.toEqual({
+      daemon: {
+        state: 'ready',
+        api_base_url: 'http://127.0.0.1:3766',
+      },
+      provider: {
+        base_url: 'https://api.openai.com/v1',
+        model: 'gpt-4o-mini',
+        timeout_secs: 30,
+        has_api_key: false,
+      },
+    });
+  });
+});
 
 describe('createMnemeApiClient', () => {
   it('从配置的 base URL 读取 Kernel 健康状态', async () => {
