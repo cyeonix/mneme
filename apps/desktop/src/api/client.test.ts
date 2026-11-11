@@ -363,4 +363,45 @@ describe('createMnemeApiClient', () => {
       headers: { accept: 'application/json' },
     });
   });
+
+  it('runs worker model completion through the API', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ run_id: 'run-1', worker_job_id: 'job-1' }));
+    const client = createMnemeApiClient('http://localhost:3766/', fetchMock);
+
+    await expect(
+      client.runWorkerModelCompletion('run-1', { prompt: 'hello worker' }),
+    ).resolves.toEqual({ run_id: 'run-1', worker_job_id: 'job-1' });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://localhost:3766/api/v1/runs/run-1/worker-model-completion',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ prompt: 'hello worker' }),
+      }),
+    );
+  });
+
+  it('lists worker jobs through the API', async () => {
+    const worker_jobs = [
+      {
+        worker_job_id: 'job-1',
+        worker_id: 'worker-1',
+        run_id: 'run-1',
+        kind: 'model_completion',
+        status: 'completed',
+        model: 'gpt-test',
+        error: null,
+        started_at: '2026-01-01T00:00:00Z',
+        completed_at: '2026-01-01T00:00:01Z',
+      },
+    ];
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ worker_jobs }));
+    const client = createMnemeApiClient('http://localhost:3766', fetchMock);
+
+    await expect(client.listWorkerJobs()).resolves.toEqual({ worker_jobs });
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://localhost:3766/api/v1/worker-jobs',
+      expect.objectContaining({ headers: { accept: 'application/json' } }),
+    );
+  });
 });

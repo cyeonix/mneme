@@ -134,6 +134,8 @@ function createTestClient(state: TestClientState = {}): MnemeApiClient {
     recordMemory: vi.fn(async () => ({ memory_id: 'memory-1' })),
     search: vi.fn(async () => ({ query: 'sqlite', hits: [], retrieval_trace_id: 'trace-1' })),
     listRetrievalTraces: vi.fn(async () => ({ retrieval_traces: state.retrievalTraces ?? [] })),
+    runWorkerModelCompletion: vi.fn(async () => ({ run_id: 'run-123', worker_job_id: 'job-123' })),
+    listWorkerJobs: vi.fn(async () => ({ worker_jobs: [] })),
   };
 }
 

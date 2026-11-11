@@ -242,6 +242,35 @@ export interface RetrievalTracesResponse {
   retrieval_traces: RetrievalTraceRecord[];
 }
 
+export interface RunWorkerModelRequest {
+  prompt: string;
+}
+
+export interface RunWorkerModelResponse {
+  run_id: string;
+  worker_job_id: string;
+}
+
+export type WorkerJobKind = 'model_completion';
+
+export type WorkerJobStatus = 'started' | 'completed' | 'failed';
+
+export interface WorkerJobRecord {
+  worker_job_id: string;
+  worker_id: string;
+  run_id: string;
+  kind: WorkerJobKind;
+  status: WorkerJobStatus;
+  model: string | null;
+  error: string | null;
+  started_at: string;
+  completed_at: string | null;
+}
+
+export interface WorkerJobsResponse {
+  worker_jobs: WorkerJobRecord[];
+}
+
 export interface MnemeApiClient {
   getHealth(): Promise<KernelHealth>;
   listEvents(): Promise<EventsResponse>;
@@ -287,6 +316,11 @@ export interface MnemeApiClient {
   recordMemory(request: RecordMemoryRequest): Promise<RecordMemoryResponse>;
   search(request: SearchRequest): Promise<SearchResponseDto>;
   listRetrievalTraces(): Promise<RetrievalTracesResponse>;
+  runWorkerModelCompletion(
+    runId: string,
+    request: RunWorkerModelRequest,
+  ): Promise<RunWorkerModelResponse>;
+  listWorkerJobs(): Promise<WorkerJobsResponse>;
 }
 
 type FetchLike = typeof fetch;
@@ -559,6 +593,25 @@ export function createMnemeApiClient(baseUrl: string, fetchImpl: FetchLike = fet
         headers: { accept: 'application/json' },
       });
       return parseJsonResponse<RetrievalTracesResponse>(response);
+    },
+
+    async runWorkerModelCompletion(runId: string, request: RunWorkerModelRequest) {
+      const response = await fetchImpl(
+        `${normalizedBaseUrl}/api/v1/runs/${runId}/worker-model-completion`,
+        {
+          method: 'POST',
+          headers: { accept: 'application/json', 'content-type': 'application/json' },
+          body: JSON.stringify(request),
+        },
+      );
+      return parseJsonResponse<RunWorkerModelResponse>(response);
+    },
+
+    async listWorkerJobs() {
+      const response = await fetchImpl(`${normalizedBaseUrl}/api/v1/worker-jobs`, {
+        headers: { accept: 'application/json' },
+      });
+      return parseJsonResponse<WorkerJobsResponse>(response);
     },
   };
 }
