@@ -106,3 +106,18 @@ create table if not exists retrieval_traces (
 
 create index if not exists idx_retrieval_traces_run_id_created_at
   on retrieval_traces(run_id, created_at);
+
+create table if not exists worker_jobs (
+  worker_job_id text primary key,
+  worker_id text not null,
+  run_id text not null,
+  kind text not null,
+  status text not null,
+  model text,
+  error text,
+  started_at text not null,
+  completed_at text
+);
+
+create index if not exists idx_worker_jobs_run_id_started_at
+  on worker_jobs(run_id, started_at);

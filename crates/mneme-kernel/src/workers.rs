@@ -4,8 +4,9 @@ use serde_json::Value;
 use std::sync::Arc;
 use thiserror::Error;
 use time::OffsetDateTime;
+use tokio::sync::RwLock;
 
-use crate::{RunId, WorkerId, WorkerJobId};
+use crate::{OperationEvent, OperationEventKind, RunId, WorkerId, WorkerJobId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -32,6 +33,167 @@ pub struct WorkerJobRecord {
     pub error: Option<String>,
     pub started_at: OffsetDateTime,
     pub completed_at: Option<OffsetDateTime>,
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum WorkerRuntimeError {
+    #[error("worker job projection failed: {0}")]
+    Projection(String),
+    #[error("worker job payload is invalid: {0}")]
+    InvalidPayload(String),
+}
+
+#[async_trait]
+pub trait WorkerJobProjectionStore: Send + Sync {
+    async fn apply(&self, event: &OperationEvent) -> Result<(), WorkerRuntimeError>;
+    async fn list_worker_jobs(&self) -> Result<Vec<WorkerJobRecord>, WorkerRuntimeError>;
+    async fn rebuild(&self, events: &[OperationEvent]) -> Result<(), WorkerRuntimeError>;
+}
+
+pub type SharedWorkerJobProjectionStore = Arc<dyn WorkerJobProjectionStore>;
+
+#[derive(Debug, Clone, Default)]
+pub struct InMemoryWorkerJobProjectionStore {
+    jobs: Arc<RwLock<Vec<WorkerJobRecord>>>,
+}
+
+impl InMemoryWorkerJobProjectionStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn shared(self) -> SharedWorkerJobProjectionStore {
+        Arc::new(self)
+    }
+}
+
+#[async_trait]
+impl WorkerJobProjectionStore for InMemoryWorkerJobProjectionStore {
+    async fn apply(&self, event: &OperationEvent) -> Result<(), WorkerRuntimeError> {
+        let mut jobs = self.jobs.write().await;
+        apply_worker_job_event_to_records(&mut jobs, event);
+        Ok(())
+    }
+
+    async fn list_worker_jobs(&self) -> Result<Vec<WorkerJobRecord>, WorkerRuntimeError> {
+        Ok(self.jobs.read().await.clone())
+    }
+
+    async fn rebuild(&self, events: &[OperationEvent]) -> Result<(), WorkerRuntimeError> {
+        let mut jobs = self.jobs.write().await;
+        jobs.clear();
+        for event in events {
+            apply_worker_job_event_to_records(&mut jobs, event);
+        }
+        Ok(())
+    }
+}
+
+fn apply_worker_job_event_to_records(jobs: &mut Vec<WorkerJobRecord>, event: &OperationEvent) {
+    match &event.kind {
+        OperationEventKind::WorkerJobStarted {
+            worker_job_id,
+            worker_id,
+            kind,
+            model,
+        } => {
+            let record = WorkerJobRecord {
+                worker_job_id: *worker_job_id,
+                worker_id: *worker_id,
+                run_id: event.run_id,
+                kind: *kind,
+                status: WorkerJobStatus::Started,
+                model: model.clone(),
+                error: None,
+                started_at: event.occurred_at,
+                completed_at: None,
+            };
+            upsert_worker_job_record(jobs, record);
+        }
+        OperationEventKind::WorkerJobCompleted {
+            worker_job_id,
+            worker_id,
+            kind,
+        } => {
+            let record = terminal_worker_job_record(
+                jobs,
+                *worker_job_id,
+                *worker_id,
+                event.run_id,
+                *kind,
+                WorkerJobStatus::Completed,
+                None,
+                event.occurred_at,
+            );
+            upsert_worker_job_record(jobs, record);
+        }
+        OperationEventKind::WorkerJobFailed {
+            worker_job_id,
+            worker_id,
+            kind,
+            reason,
+        } => {
+            let record = terminal_worker_job_record(
+                jobs,
+                *worker_job_id,
+                *worker_id,
+                event.run_id,
+                *kind,
+                WorkerJobStatus::Failed,
+                Some(reason.clone()),
+                event.occurred_at,
+            );
+            upsert_worker_job_record(jobs, record);
+        }
+        _ => {}
+    }
+    jobs.sort_by(|left, right| right.started_at.cmp(&left.started_at));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn terminal_worker_job_record(
+    jobs: &[WorkerJobRecord],
+    worker_job_id: WorkerJobId,
+    worker_id: WorkerId,
+    run_id: RunId,
+    kind: WorkerJobKind,
+    status: WorkerJobStatus,
+    error: Option<String>,
+    occurred_at: OffsetDateTime,
+) -> WorkerJobRecord {
+    if let Some(existing) = jobs.iter().find(|job| job.worker_job_id == worker_job_id) {
+        let mut record = existing.clone();
+        record.worker_id = worker_id;
+        record.run_id = run_id;
+        record.kind = kind;
+        record.status = status;
+        record.error = error;
+        record.completed_at = Some(occurred_at);
+        record
+    } else {
+        WorkerJobRecord {
+            worker_job_id,
+            worker_id,
+            run_id,
+            kind,
+            status,
+            model: None,
+            error,
+            started_at: occurred_at,
+            completed_at: Some(occurred_at),
+        }
+    }
+}
+
+fn upsert_worker_job_record(jobs: &mut Vec<WorkerJobRecord>, record: WorkerJobRecord) {
+    if let Some(existing) = jobs
+        .iter_mut()
+        .find(|job| job.worker_job_id == record.worker_job_id)
+    {
+        *existing = record;
+    } else {
+        jobs.push(record);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -302,7 +464,7 @@ fn parse_openai_response(body: &str) -> Result<ModelCompletionResponse, Provider
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{RunId, WorkerId, WorkerJobId};
+    use crate::{OperationEvent, RunId, WorkerId, WorkerJobId};
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -330,6 +492,56 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.content, "assistant reply");
+    }
+
+    #[tokio::test]
+    async fn in_memory_worker_job_projection_tracks_started_completed_failed() {
+        let store = InMemoryWorkerJobProjectionStore::new();
+        let run_id = RunId::new();
+        let worker_id = WorkerId::new();
+        let job_id = WorkerJobId::new();
+
+        let started = OperationEvent::new_worker_job_started(
+            run_id,
+            job_id,
+            worker_id,
+            WorkerJobKind::ModelCompletion,
+            Some("gpt-test".to_string()),
+        );
+        store.apply(&started).await.unwrap();
+        assert_eq!(
+            store.list_worker_jobs().await.unwrap()[0].status,
+            WorkerJobStatus::Started
+        );
+
+        let completed = OperationEvent::new_worker_job_completed(
+            run_id,
+            job_id,
+            worker_id,
+            WorkerJobKind::ModelCompletion,
+        );
+        store.apply(&completed).await.unwrap();
+        let job = &store.list_worker_jobs().await.unwrap()[0];
+        assert_eq!(job.status, WorkerJobStatus::Completed);
+        assert!(job.completed_at.is_some());
+
+        let failed_job_id = WorkerJobId::new();
+        let failed = OperationEvent::new_worker_job_failed(
+            run_id,
+            failed_job_id,
+            worker_id,
+            WorkerJobKind::ModelCompletion,
+            "provider returned 500",
+        );
+        store.apply(&failed).await.unwrap();
+        let jobs = store.list_worker_jobs().await.unwrap();
+        let failed_job = jobs
+            .iter()
+            .find(|job| job.worker_job_id == failed_job_id)
+            .unwrap();
+        assert_eq!(failed_job.status, WorkerJobStatus::Failed);
+        assert_eq!(failed_job.error.as_deref(), Some("provider returned 500"));
+        assert!(failed_job.completed_at.is_some());
     }
 
     #[tokio::test]

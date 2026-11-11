@@ -11,7 +11,8 @@ use crate::{
     RunProjectionStore, RunProjector, RunService, RunServiceError, RunStatus, SearchResponse,
     SearchResult, SharedArtifactContentStore, SharedOperationLedger, SharedRunProjectionStore,
     SharedRunService, ToolApprovalDecision, ToolApprovalPolicy, ToolCallId, ToolCallOutcome,
-    ToolEffect, ToolLifecycleOutcome,
+    ToolEffect, ToolLifecycleOutcome, WorkerJobKind, WorkerJobProjectionStore, WorkerJobRecord,
+    WorkerJobStatus, WorkerRuntimeError,
 };
 use async_trait::async_trait;
 use serde_json::Value;
@@ -671,6 +672,73 @@ impl RetrievalTraceProjectionStore for SqliteRetrievalTraceProjectionStore {
         rows.into_iter()
             .map(RetrievalTraceRecord::try_from)
             .collect()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SqliteWorkerJobProjectionStore {
+    store: SqliteStore,
+}
+
+impl SqliteWorkerJobProjectionStore {
+    pub fn new(store: SqliteStore) -> Self {
+        Self { store }
+    }
+
+    pub async fn rebuild(&self, events: &[OperationEvent]) -> Result<(), WorkerRuntimeError> {
+        let mut tx = self
+            .store
+            .pool()
+            .begin()
+            .await
+            .map_err(|error| WorkerRuntimeError::Projection(error.to_string()))?;
+
+        sqlx::query("delete from worker_jobs")
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| WorkerRuntimeError::Projection(error.to_string()))?;
+
+        for event in events {
+            apply_worker_job_event_to_sqlite_projection(&mut tx, event).await?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|error| WorkerRuntimeError::Projection(error.to_string()))?;
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl WorkerJobProjectionStore for SqliteWorkerJobProjectionStore {
+    async fn apply(&self, event: &OperationEvent) -> Result<(), WorkerRuntimeError> {
+        let mut tx = self
+            .store
+            .pool()
+            .begin()
+            .await
+            .map_err(|error| WorkerRuntimeError::Projection(error.to_string()))?;
+        apply_worker_job_event_to_sqlite_projection(&mut tx, event).await?;
+        tx.commit()
+            .await
+            .map_err(|error| WorkerRuntimeError::Projection(error.to_string()))?;
+        Ok(())
+    }
+
+    async fn list_worker_jobs(&self) -> Result<Vec<WorkerJobRecord>, WorkerRuntimeError> {
+        let rows = sqlx::query_as::<_, StoredWorkerJobRecord>(
+            "select worker_job_id, worker_id, run_id, kind, status, model, error, started_at, completed_at from worker_jobs order by started_at desc",
+        )
+        .fetch_all(self.store.pool())
+        .await
+        .map_err(|error| WorkerRuntimeError::Projection(error.to_string()))?;
+
+        rows.into_iter().map(WorkerJobRecord::try_from).collect()
+    }
+
+    async fn rebuild(&self, events: &[OperationEvent]) -> Result<(), WorkerRuntimeError> {
+        SqliteWorkerJobProjectionStore::rebuild(self, events).await
     }
 }
 
@@ -1726,6 +1794,77 @@ async fn apply_artifact_created_to_sqlite_projection(
     Ok(())
 }
 
+async fn apply_worker_job_event_to_sqlite_projection(
+    tx: &mut Transaction<'_, Sqlite>,
+    event: &OperationEvent,
+) -> Result<(), WorkerRuntimeError> {
+    let occurred_at = event
+        .occurred_at
+        .format(&Rfc3339)
+        .map_err(|error| WorkerRuntimeError::InvalidPayload(error.to_string()))?;
+
+    match &event.kind {
+        OperationEventKind::WorkerJobStarted {
+            worker_job_id,
+            worker_id,
+            kind,
+            model,
+        } => {
+            sqlx::query(
+                "insert into worker_jobs (worker_job_id, worker_id, run_id, kind, status, model, error, started_at, completed_at) values (?1, ?2, ?3, ?4, 'started', ?5, null, ?6, null) on conflict(worker_job_id) do update set worker_id = excluded.worker_id, run_id = excluded.run_id, kind = excluded.kind, status = excluded.status, model = excluded.model, error = excluded.error, started_at = excluded.started_at, completed_at = excluded.completed_at",
+            )
+            .bind(worker_job_id.to_string())
+            .bind(worker_id.to_string())
+            .bind(event.run_id.to_string())
+            .bind(worker_job_kind_to_storage(*kind))
+            .bind(model)
+            .bind(&occurred_at)
+            .execute(&mut **tx)
+            .await
+            .map_err(|error| WorkerRuntimeError::Projection(error.to_string()))?;
+        }
+        OperationEventKind::WorkerJobCompleted {
+            worker_job_id,
+            worker_id,
+            kind,
+        } => {
+            sqlx::query(
+                "insert into worker_jobs (worker_job_id, worker_id, run_id, kind, status, model, error, started_at, completed_at) values (?1, ?2, ?3, ?4, 'completed', null, null, ?5, ?5) on conflict(worker_job_id) do update set worker_id = excluded.worker_id, run_id = excluded.run_id, kind = excluded.kind, status = excluded.status, error = excluded.error, completed_at = excluded.completed_at",
+            )
+            .bind(worker_job_id.to_string())
+            .bind(worker_id.to_string())
+            .bind(event.run_id.to_string())
+            .bind(worker_job_kind_to_storage(*kind))
+            .bind(&occurred_at)
+            .execute(&mut **tx)
+            .await
+            .map_err(|error| WorkerRuntimeError::Projection(error.to_string()))?;
+        }
+        OperationEventKind::WorkerJobFailed {
+            worker_job_id,
+            worker_id,
+            kind,
+            reason,
+        } => {
+            sqlx::query(
+                "insert into worker_jobs (worker_job_id, worker_id, run_id, kind, status, model, error, started_at, completed_at) values (?1, ?2, ?3, ?4, 'failed', null, ?5, ?6, ?6) on conflict(worker_job_id) do update set worker_id = excluded.worker_id, run_id = excluded.run_id, kind = excluded.kind, status = excluded.status, error = excluded.error, completed_at = excluded.completed_at",
+            )
+            .bind(worker_job_id.to_string())
+            .bind(worker_id.to_string())
+            .bind(event.run_id.to_string())
+            .bind(worker_job_kind_to_storage(*kind))
+            .bind(reason)
+            .bind(&occurred_at)
+            .execute(&mut **tx)
+            .await
+            .map_err(|error| WorkerRuntimeError::Projection(error.to_string()))?;
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
 async fn update_running_run_for_artifact_created(
     tx: &mut Transaction<'_, Sqlite>,
     event: &OperationEvent,
@@ -2443,6 +2582,48 @@ impl TryFrom<StoredArtifactRecord> for ArtifactRecord {
 }
 
 #[derive(sqlx::FromRow)]
+struct StoredWorkerJobRecord {
+    worker_job_id: String,
+    worker_id: String,
+    run_id: String,
+    kind: String,
+    status: String,
+    model: Option<String>,
+    error: Option<String>,
+    started_at: String,
+    completed_at: Option<String>,
+}
+
+impl TryFrom<StoredWorkerJobRecord> for WorkerJobRecord {
+    type Error = WorkerRuntimeError;
+
+    fn try_from(row: StoredWorkerJobRecord) -> Result<Self, Self::Error> {
+        Ok(Self {
+            worker_job_id: crate::WorkerJobId::from_str(&row.worker_job_id)
+                .map_err(|error| WorkerRuntimeError::InvalidPayload(error.to_string()))?,
+            worker_id: crate::WorkerId::from_str(&row.worker_id)
+                .map_err(|error| WorkerRuntimeError::InvalidPayload(error.to_string()))?,
+            run_id: RunId::from_str(&row.run_id)
+                .map_err(|error| WorkerRuntimeError::InvalidPayload(error.to_string()))?,
+            kind: worker_job_kind_from_storage(&row.kind)?,
+            status: worker_job_status_from_storage(&row.status)?,
+            model: row.model,
+            error: row.error,
+            started_at: OffsetDateTime::parse(&row.started_at, &Rfc3339)
+                .map_err(|error| WorkerRuntimeError::InvalidPayload(error.to_string()))?,
+            completed_at: row
+                .completed_at
+                .as_deref()
+                .map(|value| {
+                    OffsetDateTime::parse(value, &Rfc3339)
+                        .map_err(|error| WorkerRuntimeError::InvalidPayload(error.to_string()))
+                })
+                .transpose()?,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
 struct StoredContextBundleRecord {
     context_bundle_id: String,
     run_id: String,
@@ -2742,6 +2923,32 @@ fn artifact_kind_from_storage(kind: &str) -> Result<ArtifactKind, ArtifactServic
     }
 }
 
+fn worker_job_kind_to_storage(kind: WorkerJobKind) -> &'static str {
+    match kind {
+        WorkerJobKind::ModelCompletion => "model_completion",
+    }
+}
+
+fn worker_job_kind_from_storage(kind: &str) -> Result<WorkerJobKind, WorkerRuntimeError> {
+    match kind {
+        "model_completion" => Ok(WorkerJobKind::ModelCompletion),
+        other => Err(WorkerRuntimeError::InvalidPayload(format!(
+            "unknown worker job kind: {other}"
+        ))),
+    }
+}
+
+fn worker_job_status_from_storage(status: &str) -> Result<WorkerJobStatus, WorkerRuntimeError> {
+    match status {
+        "started" => Ok(WorkerJobStatus::Started),
+        "completed" => Ok(WorkerJobStatus::Completed),
+        "failed" => Ok(WorkerJobStatus::Failed),
+        other => Err(WorkerRuntimeError::InvalidPayload(format!(
+            "unknown worker job status: {other}"
+        ))),
+    }
+}
+
 fn knowledge_source_kind_to_storage(kind: KnowledgeSourceKind) -> &'static str {
     match kind {
         KnowledgeSourceKind::Artifact => "artifact",
@@ -2961,7 +3168,8 @@ mod tests {
         InMemoryArtifactContentStore, KnowledgeSourceId, KnowledgeSourceKind,
         LocalArtifactContentStore, MemoryId, MemoryKind, OperationEvent, OperationLedger,
         RetrievalTraceId, RunId, RunProjectionStore, RunProjector, ToolCallId, ToolCallStatus,
-        ToolEffect, ToolProjector, WorkerId, WorkerJobId, WorkerJobKind,
+        ToolEffect, ToolProjector, WorkerId, WorkerJobId, WorkerJobKind, WorkerJobProjectionStore,
+        WorkerJobStatus,
     };
 
     #[tokio::test]
@@ -3226,6 +3434,67 @@ mod tests {
                 && actual_worker_id == &worker_id
                 && reason == "provider returned 500"
         ));
+    }
+
+    #[tokio::test]
+    async fn sqlite_ledger_roundtrips_worker_job_events_can_rebuild_projection() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let ledger = SqliteOperationLedger::new(store.clone());
+        let projection = SqliteWorkerJobProjectionStore::new(store);
+        let run_id = RunId::new();
+        let worker_id = WorkerId::new();
+        let completed_job_id = WorkerJobId::new();
+        let failed_job_id = WorkerJobId::new();
+
+        ledger
+            .append(OperationEvent::new_worker_job_started(
+                run_id,
+                completed_job_id,
+                worker_id,
+                WorkerJobKind::ModelCompletion,
+                Some("gpt-4o-mini".to_string()),
+            ))
+            .await
+            .unwrap();
+        ledger
+            .append(OperationEvent::new_worker_job_completed(
+                run_id,
+                completed_job_id,
+                worker_id,
+                WorkerJobKind::ModelCompletion,
+            ))
+            .await
+            .unwrap();
+        ledger
+            .append(OperationEvent::new_worker_job_failed(
+                run_id,
+                failed_job_id,
+                worker_id,
+                WorkerJobKind::ModelCompletion,
+                "provider returned 500",
+            ))
+            .await
+            .unwrap();
+
+        let events = ledger.list().await.unwrap();
+        projection.rebuild(&events).await.unwrap();
+
+        let jobs = projection.list_worker_jobs().await.unwrap();
+        let completed_job = jobs
+            .iter()
+            .find(|job| job.worker_job_id == completed_job_id)
+            .unwrap();
+        assert_eq!(completed_job.status, WorkerJobStatus::Completed);
+        assert_eq!(completed_job.model.as_deref(), Some("gpt-4o-mini"));
+        assert!(completed_job.completed_at.is_some());
+
+        let failed_job = jobs
+            .iter()
+            .find(|job| job.worker_job_id == failed_job_id)
+            .unwrap();
+        assert_eq!(failed_job.status, WorkerJobStatus::Failed);
+        assert_eq!(failed_job.error.as_deref(), Some("provider returned 500"));
+        assert!(failed_job.completed_at.is_some());
     }
 
     #[tokio::test]
