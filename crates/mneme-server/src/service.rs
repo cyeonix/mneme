@@ -1,5 +1,5 @@
 use crate::storage::SqliteSyncServerStore;
-use mneme_kernel::{DeviceId, DeviceRecord, SyncCursorRecord};
+use mneme_kernel::{DeviceId, DeviceRecord, EventId, RunId, SyncCursorRecord, SyncedEventRecord};
 use std::str::FromStr;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
@@ -18,6 +18,19 @@ pub struct DeviceRegistrationOutcome {
     pub device: DeviceRecord,
     pub cursor: SyncCursorRecord,
     pub device_token: String,
+}
+
+#[derive(Debug)]
+pub struct PushEventsOutcome {
+    pub accepted: usize,
+    pub duplicates: usize,
+    pub latest_server_sequence: i64,
+}
+
+#[derive(Debug)]
+pub struct PullEventsOutcome {
+    pub events: Vec<SyncedEventRecord>,
+    pub latest_server_sequence: i64,
 }
 
 #[derive(Clone)]
@@ -108,6 +121,93 @@ impl SyncServerService {
         rows.into_iter().map(SyncCursorRecord::try_from).collect()
     }
 
+    pub async fn push_events(
+        &self,
+        device_id: DeviceId,
+        events: Vec<SyncedEventRecord>,
+    ) -> Result<PushEventsOutcome, SyncServerError> {
+        self.ensure_known_device(device_id).await?;
+
+        let mut accepted = 0;
+        let mut duplicates = 0;
+        let mut latest_server_sequence = self
+            .store
+            .latest_server_sequence()
+            .await
+            .map_err(storage_error)?;
+
+        for event in events {
+            if event.origin_device_id != device_id {
+                return Err(SyncServerError::InvalidInput);
+            }
+
+            let received_at = OffsetDateTime::now_utc();
+            let result = sqlx::query(
+                "insert or ignore into synced_events (event_id, origin_device_id, run_id, occurred_at, kind_type, payload_json, received_at) values (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )
+            .bind(event.event_id.to_string())
+            .bind(event.origin_device_id.to_string())
+            .bind(event.run_id.to_string())
+            .bind(format_datetime(event.occurred_at)?)
+            .bind(event.kind_type)
+            .bind(event.payload_json.to_string())
+            .bind(format_datetime(received_at)?)
+            .execute(self.store.pool())
+            .await
+            .map_err(storage_error)?;
+
+            if result.rows_affected() == 0 {
+                duplicates += 1;
+            } else {
+                accepted += 1;
+                latest_server_sequence = result.last_insert_rowid();
+            }
+        }
+
+        Ok(PushEventsOutcome {
+            accepted,
+            duplicates,
+            latest_server_sequence,
+        })
+    }
+
+    pub async fn pull_events(
+        &self,
+        device_id: DeviceId,
+        after_server_sequence: i64,
+        limit: usize,
+    ) -> Result<PullEventsOutcome, SyncServerError> {
+        if after_server_sequence < 0 {
+            return Err(SyncServerError::InvalidInput);
+        }
+        self.ensure_known_device(device_id).await?;
+
+        let limit = limit.clamp(1, 500) as i64;
+        let rows = sqlx::query_as::<_, StoredSyncedEvent>(
+            "select server_sequence, event_id, origin_device_id, run_id, occurred_at, kind_type, payload_json, received_at from synced_events where server_sequence > ?1 order by server_sequence asc limit ?2",
+        )
+        .bind(after_server_sequence)
+        .bind(limit)
+        .fetch_all(self.store.pool())
+        .await
+        .map_err(storage_error)?;
+
+        let latest_server_sequence = self
+            .store
+            .latest_server_sequence()
+            .await
+            .map_err(storage_error)?;
+        let events = rows
+            .into_iter()
+            .map(SyncedEventRecord::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(PullEventsOutcome {
+            events,
+            latest_server_sequence,
+        })
+    }
+
     pub async fn ack_events(
         &self,
         device_id: DeviceId,
@@ -119,37 +219,56 @@ impl SyncServerService {
 
         let now = OffsetDateTime::now_utc();
         let now_text = format_datetime(now)?;
-        let result = sqlx::query(
+        let mut tx = self.store.pool().begin().await.map_err(storage_error)?;
+
+        let cursor_row = sqlx::query_as::<_, StoredSyncCursor>(
+            "select device_id, last_server_sequence, updated_at from sync_cursors where device_id = ?1",
+        )
+        .bind(device_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(storage_error)?
+        .ok_or(SyncServerError::UnknownDevice)?;
+        let acknowledged_sequence = cursor_row
+            .last_server_sequence
+            .max(last_seen_server_sequence);
+
+        sqlx::query(
             "update sync_cursors set last_server_sequence = ?1, updated_at = ?2 where device_id = ?3",
         )
-        .bind(last_seen_server_sequence)
+        .bind(acknowledged_sequence)
         .bind(&now_text)
         .bind(device_id.to_string())
-        .execute(self.store.pool())
+        .execute(&mut *tx)
         .await
         .map_err(storage_error)?;
 
-        if result.rows_affected() == 0 {
-            return Err(SyncServerError::UnknownDevice);
-        }
+        sqlx::query("update devices set last_seen_at = ?1 where device_id = ?2")
+            .bind(&now_text)
+            .bind(device_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(storage_error)?;
 
-        let device_seen_result =
-            sqlx::query("update devices set last_seen_at = ?1 where device_id = ?2")
-                .bind(&now_text)
-                .bind(device_id.to_string())
-                .execute(self.store.pool())
-                .await
-                .map_err(storage_error)?;
-
-        if device_seen_result.rows_affected() == 0 {
-            return Err(SyncServerError::UnknownDevice);
-        }
+        tx.commit().await.map_err(storage_error)?;
 
         Ok(SyncCursorRecord {
             device_id,
-            last_server_sequence: last_seen_server_sequence,
+            last_server_sequence: acknowledged_sequence,
             updated_at: now,
         })
+    }
+
+    async fn ensure_known_device(&self, device_id: DeviceId) -> Result<(), SyncServerError> {
+        if !self
+            .store
+            .has_device(&device_id.to_string())
+            .await
+            .map_err(storage_error)?
+        {
+            return Err(SyncServerError::UnknownDevice);
+        }
+        Ok(())
     }
 }
 
@@ -193,6 +312,35 @@ impl TryFrom<StoredSyncCursor> for SyncCursorRecord {
     }
 }
 
+#[derive(sqlx::FromRow)]
+struct StoredSyncedEvent {
+    server_sequence: i64,
+    event_id: String,
+    origin_device_id: String,
+    run_id: String,
+    occurred_at: String,
+    kind_type: String,
+    payload_json: String,
+    received_at: String,
+}
+
+impl TryFrom<StoredSyncedEvent> for SyncedEventRecord {
+    type Error = SyncServerError;
+
+    fn try_from(row: StoredSyncedEvent) -> Result<Self, Self::Error> {
+        Ok(Self {
+            server_sequence: row.server_sequence,
+            event_id: EventId::from_str(&row.event_id).map_err(storage_error)?,
+            origin_device_id: DeviceId::from_str(&row.origin_device_id).map_err(storage_error)?,
+            run_id: RunId::from_str(&row.run_id).map_err(storage_error)?,
+            occurred_at: parse_datetime(&row.occurred_at)?,
+            kind_type: row.kind_type,
+            payload_json: serde_json::from_str(&row.payload_json).map_err(storage_error)?,
+            received_at: parse_datetime(&row.received_at)?,
+        })
+    }
+}
+
 fn non_blank(value: String) -> Result<String, SyncServerError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -217,6 +365,151 @@ fn storage_error(error: impl std::fmt::Display) -> SyncServerError {
 mod tests {
     use super::*;
     use crate::storage::SqliteSyncServerStore;
+    use mneme_kernel::{EventId, RunId, SyncedEventRecord};
+
+    fn sample_synced_event(origin_device_id: DeviceId, kind_type: &str) -> SyncedEventRecord {
+        SyncedEventRecord {
+            server_sequence: 0,
+            event_id: EventId::new(),
+            origin_device_id,
+            run_id: RunId::new(),
+            occurred_at: time::OffsetDateTime::now_utc(),
+            kind_type: kind_type.to_string(),
+            payload_json: serde_json::json!({ "sample": true }),
+            received_at: time::OffsetDateTime::now_utc(),
+        }
+    }
+
+    #[tokio::test]
+    async fn event_push_is_idempotent_and_pull_respects_cursor() {
+        let store = SqliteSyncServerStore::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let service = SyncServerService::new(store);
+        let device_a = service
+            .register_device("A".to_string(), None)
+            .await
+            .unwrap()
+            .device
+            .device_id;
+        let device_b = service
+            .register_device("B".to_string(), None)
+            .await
+            .unwrap()
+            .device
+            .device_id;
+        let event = sample_synced_event(device_a, "run_started");
+
+        let first = service
+            .push_events(device_a, vec![event.clone()])
+            .await
+            .unwrap();
+        assert_eq!(first.accepted, 1);
+        assert_eq!(first.duplicates, 0);
+
+        let second = service.push_events(device_a, vec![event]).await.unwrap();
+        assert_eq!(second.accepted, 0);
+        assert_eq!(second.duplicates, 1);
+
+        let pulled = service.pull_events(device_b, 0, 50).await.unwrap();
+        assert_eq!(pulled.events.len(), 1);
+        assert_eq!(pulled.events[0].origin_device_id, device_a);
+
+        service
+            .ack_events(device_b, pulled.events[0].server_sequence)
+            .await
+            .unwrap();
+        let after_ack = service
+            .pull_events(device_b, pulled.events[0].server_sequence, 50)
+            .await
+            .unwrap();
+        assert!(after_ack.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn event_push_rejects_unknown_device_and_origin_mismatch() {
+        let store = SqliteSyncServerStore::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let service = SyncServerService::new(store);
+        let device_a = service
+            .register_device("A".to_string(), None)
+            .await
+            .unwrap()
+            .device
+            .device_id;
+
+        assert!(matches!(
+            service
+                .push_events(
+                    DeviceId::new(),
+                    vec![sample_synced_event(DeviceId::new(), "run_started")]
+                )
+                .await
+                .unwrap_err(),
+            SyncServerError::UnknownDevice
+        ));
+
+        assert!(matches!(
+            service
+                .push_events(
+                    device_a,
+                    vec![sample_synced_event(DeviceId::new(), "run_started")]
+                )
+                .await
+                .unwrap_err(),
+            SyncServerError::InvalidInput
+        ));
+    }
+
+    #[tokio::test]
+    async fn pull_events_rejects_unknown_device_and_negative_cursor() {
+        let store = SqliteSyncServerStore::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let service = SyncServerService::new(store);
+        let device_a = service
+            .register_device("A".to_string(), None)
+            .await
+            .unwrap()
+            .device
+            .device_id;
+
+        assert!(matches!(
+            service
+                .pull_events(DeviceId::new(), 0, 50)
+                .await
+                .unwrap_err(),
+            SyncServerError::UnknownDevice
+        ));
+        assert!(matches!(
+            service.pull_events(device_a, -1, 50).await.unwrap_err(),
+            SyncServerError::InvalidInput
+        ));
+    }
+
+    #[tokio::test]
+    async fn service_ack_events_does_not_move_cursor_backward() {
+        let store = SqliteSyncServerStore::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let service = SyncServerService::new(store);
+        let registered = service
+            .register_device("Phone".to_string(), None)
+            .await
+            .unwrap();
+
+        service
+            .ack_events(registered.device.device_id, 42)
+            .await
+            .unwrap();
+        let cursor = service
+            .ack_events(registered.device.device_id, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(cursor.last_server_sequence, 42);
+    }
 
     #[tokio::test]
     async fn service_register_device_creates_initial_cursor() {
