@@ -1,19 +1,20 @@
 use crate::{
     ArtifactId, ArtifactKind, ArtifactProjectionStore, ArtifactRecord, ArtifactServiceError,
-    ChunkTextSplitter, ComposedWorkerRuntimeService, ContextBundleId, ContextBundleProjectionStore,
-    ContextBundleRecord, ContextServiceError, CreateArtifactOutcome, CreateContextBundleOutcome,
-    CreateKnowledgeSourceOutcome, CreateRunOutcome, DocumentChunkProjectionStore,
-    DocumentChunkRecord, EventId, KnowledgeServiceError, KnowledgeSourceId, KnowledgeSourceKind,
-    KnowledgeSourceProjectionStore, KnowledgeSourceRecord, LedgerError, MemoryId, MemoryKind,
-    MemoryProjectionStore, MemoryRecord, MemoryServiceError, OperationEvent, OperationEventKind,
-    OperationLedger, RecordMemoryOutcome, RetrievalServiceError, RetrievalTraceProjectionStore,
-    RetrievalTraceRecord, RunId, RunLifecycleOutcome, RunModelWithWorkerOutcome, RunProjection,
-    RunProjectionError, RunProjectionStore, RunProjector, RunService, RunServiceError, RunStatus,
-    SearchResponse, SearchResult, SharedArtifactContentStore, SharedOperationLedger,
-    SharedProviderWorker, SharedRunProjectionStore, SharedRunService, SharedWorkerRuntimeService,
-    ToolApprovalDecision, ToolApprovalPolicy, ToolCallId, ToolCallOutcome, ToolEffect,
-    ToolLifecycleOutcome, WorkerJobKind, WorkerJobProjectionStore, WorkerJobRecord,
-    WorkerJobStatus, WorkerRuntimeError, WorkerRuntimeService, WorkerRuntimeServiceError,
+    ArtifactStoreError, ChunkTextSplitter, ComposedWorkerRuntimeService, ContextBundleId,
+    ContextBundleProjectionStore, ContextBundleRecord, ContextServiceError, CreateArtifactOutcome,
+    CreateContextBundleOutcome, CreateKnowledgeSourceOutcome, CreateRunOutcome,
+    DocumentChunkProjectionStore, DocumentChunkRecord, EventId, KnowledgeServiceError,
+    KnowledgeSourceId, KnowledgeSourceKind, KnowledgeSourceProjectionStore, KnowledgeSourceRecord,
+    LedgerError, MemoryId, MemoryKind, MemoryProjectionStore, MemoryRecord, MemoryServiceError,
+    OperationEvent, OperationEventKind, OperationLedger, RecordMemoryOutcome,
+    RetrievalServiceError, RetrievalTraceProjectionStore, RetrievalTraceRecord, RunId,
+    RunLifecycleOutcome, RunModelWithWorkerOutcome, RunProjection, RunProjectionError,
+    RunProjectionStore, RunProjector, RunService, RunServiceError, RunStatus, SearchResponse,
+    SearchResult, SharedArtifactContentStore, SharedOperationLedger, SharedProviderWorker,
+    SharedRunProjectionStore, SharedRunService, SharedWorkerRuntimeService, ToolApprovalDecision,
+    ToolApprovalPolicy, ToolCallId, ToolCallOutcome, ToolEffect, ToolLifecycleOutcome,
+    WorkerJobKind, WorkerJobProjectionStore, WorkerJobRecord, WorkerJobStatus, WorkerRuntimeError,
+    WorkerRuntimeService, WorkerRuntimeServiceError,
 };
 use async_trait::async_trait;
 use serde_json::Value;
@@ -174,12 +175,11 @@ impl SqliteArtifactService {
         .map_err(|error| ArtifactServiceError::Projection(error.to_string()))?
         .ok_or(ArtifactServiceError::UnknownArtifact)?;
         let artifact = ArtifactRecord::try_from(row)?;
-        let bytes = self
-            .content_store
-            .get(&artifact.sha256)
-            .await
-            .map_err(|error| ArtifactServiceError::ContentStore(error.to_string()))?;
-        let content = String::from_utf8(bytes).ok();
+        let content = match self.content_store.get(&artifact.sha256).await {
+            Ok(bytes) => String::from_utf8(bytes).ok(),
+            Err(ArtifactStoreError::NotFound(_)) => None,
+            Err(error) => return Err(ArtifactServiceError::ContentStore(error.to_string())),
+        };
 
         Ok(crate::ArtifactDetail { artifact, content })
     }
@@ -3211,13 +3211,30 @@ pub enum SqliteStoreError {
 mod tests {
     use super::*;
     use crate::{
-        ArtifactId, ArtifactKind, ArtifactProjectionStore, ContextBundleId, DocumentChunkId,
-        InMemoryArtifactContentStore, KnowledgeSourceId, KnowledgeSourceKind,
-        LocalArtifactContentStore, MemoryId, MemoryKind, MockProviderWorker, OperationEvent,
-        OperationLedger, RetrievalTraceId, RunId, RunProjectionStore, RunProjector, RunService,
-        ToolCallId, ToolCallStatus, ToolEffect, ToolProjector, WorkerId, WorkerJobId,
-        WorkerJobKind, WorkerJobProjectionStore, WorkerJobStatus, WorkerRuntimeService,
+        ArtifactContentStore, ArtifactId, ArtifactKind, ArtifactProjectionStore,
+        ArtifactStoreError, ContextBundleId, DocumentChunkId, InMemoryArtifactContentStore,
+        KnowledgeSourceId, KnowledgeSourceKind, LocalArtifactContentStore, MemoryId, MemoryKind,
+        MockProviderWorker, OperationEvent, OperationLedger, RetrievalTraceId, RunId,
+        RunProjectionStore, RunProjector, RunService, StoredArtifactContent, ToolCallId,
+        ToolCallStatus, ToolEffect, ToolProjector, WorkerId, WorkerJobId, WorkerJobKind,
+        WorkerJobProjectionStore, WorkerJobStatus, WorkerRuntimeService,
     };
+
+    struct MissingArtifactContentStore;
+
+    #[async_trait]
+    impl ArtifactContentStore for MissingArtifactContentStore {
+        async fn put(
+            &self,
+            _content: Vec<u8>,
+        ) -> Result<StoredArtifactContent, ArtifactStoreError> {
+            unreachable!("missing store is read-only in tests")
+        }
+
+        async fn get(&self, sha256: &str) -> Result<Vec<u8>, ArtifactStoreError> {
+            Err(ArtifactStoreError::NotFound(sha256.to_string()))
+        }
+    }
 
     #[tokio::test]
     async fn sqlite_store_runs_migrations() {
@@ -4168,6 +4185,36 @@ mod tests {
         let runs = run_service.list_runs().await.unwrap();
         assert_eq!(runs[0].run_id, run.run_id);
         assert_eq!(runs[0].updated_at, artifact_event.occurred_at);
+    }
+
+    #[tokio::test]
+    async fn sqlite_artifact_service_returns_metadata_when_content_file_is_missing() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let run_service = SqliteRunService::new(store.clone());
+        let run = run_service
+            .create_run("collect artifact".to_string())
+            .await
+            .unwrap();
+        let writer =
+            SqliteArtifactService::new(store.clone(), InMemoryArtifactContentStore::new().shared());
+        let created = writer
+            .create_text_artifact(
+                run.run_id,
+                "Restart-safe metadata".to_string(),
+                ArtifactKind::Markdown,
+                "text/markdown".to_string(),
+                "# Persisted metadata".to_string(),
+            )
+            .await
+            .unwrap();
+        let reader =
+            SqliteArtifactService::new(store, std::sync::Arc::new(MissingArtifactContentStore));
+
+        let detail = reader.get_artifact(created.artifact_id).await.unwrap();
+
+        assert_eq!(detail.artifact.artifact_id, created.artifact_id);
+        assert_eq!(detail.artifact.title, "Restart-safe metadata");
+        assert_eq!(detail.content, None);
     }
 
     #[tokio::test]

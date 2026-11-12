@@ -11,7 +11,7 @@ use crate::types::{
 };
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{header, HeaderValue, Method, StatusCode},
     routing::get,
     Json, Router,
 };
@@ -31,6 +31,7 @@ use mneme_kernel::{
     SqliteArtifactService, SqliteChunkService, SqliteContextService, SqliteKnowledgeService,
     SqliteMemoryService, SqliteRetrievalService, ToolCallId, WorkerId, WorkerRuntimeServiceError,
 };
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 #[derive(Clone)]
 pub enum SharedArtifactService {
@@ -78,6 +79,18 @@ pub struct ApiState {
     pub memory_service: SharedMemoryService,
     pub retrieval_service: SharedRetrievalService,
     pub worker_runtime_service: SharedWorkerRuntimeService,
+}
+
+fn local_workbench_cors_layer() -> CorsLayer {
+    let allowed_origins = [
+        HeaderValue::from_static("http://localhost:5173"),
+        HeaderValue::from_static("http://127.0.0.1:5173"),
+    ];
+
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(allowed_origins))
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([header::CONTENT_TYPE])
 }
 
 /// 创建第一版本地 API 路由。
@@ -354,6 +367,7 @@ pub fn build_router_with_all_services(
             retrieval_service,
             worker_runtime_service,
         })
+        .layer(local_workbench_cors_layer())
 }
 
 async fn get_health() -> Json<HealthResponse> {
@@ -1153,6 +1167,55 @@ mod tests {
             .expect("body")
             .to_bytes();
         serde_json::from_slice(&body).expect("json response")
+    }
+
+    #[tokio::test]
+    async fn api_allows_local_workbench_cors_requests() {
+        let app = build_router_with_in_memory_services();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/v1/memories")
+                    .header(header::ORIGIN, "http://localhost:5173")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|value| value.to_str().ok()),
+            Some("http://localhost:5173")
+        );
+
+        let preflight = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/api/v1/memories")
+                    .header(header::ORIGIN, "http://localhost:5173")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(preflight.status(), StatusCode::OK);
+        assert_eq!(
+            preflight
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|value| value.to_str().ok()),
+            Some("http://localhost:5173")
+        );
     }
 
     async fn create_run_for_test(app: &Router, instruction: &str) -> String {

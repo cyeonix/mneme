@@ -3,7 +3,7 @@ use mneme_api::routes::{
     SharedContextService, SharedKnowledgeService, SharedMemoryService, SharedRetrievalService,
 };
 use mneme_kernel::{
-    ChunkTextSplitter, InMemoryArtifactContentStore, OpenAiCompatibleProviderWorker,
+    ChunkTextSplitter, LocalArtifactContentStore, OpenAiCompatibleProviderWorker,
     OpenAiProviderConfig, ReqwestOpenAiHttpClient, RunService, SqliteArtifactService,
     SqliteChunkService, SqliteContextService, SqliteKnowledgeService, SqliteMemoryService,
     SqliteRetrievalService, SqliteRunService, SqliteStore, SqliteWorkerRuntimeService, WorkerId,
@@ -13,6 +13,7 @@ use tokio::net::TcpListener;
 use tracing::info;
 
 const DEFAULT_DATABASE_URL: &str = "sqlite://.mneme/mneme.db?mode=rwc";
+const DEFAULT_ARTIFACT_CONTENT_ROOT: &str = ".mneme/artifacts";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_OPENAI_MODEL: &str = "gpt-4o-mini";
 const DEFAULT_OPENAI_TIMEOUT_SECS: u64 = 30;
@@ -23,6 +24,14 @@ fn database_url_from_env() -> String {
 
 fn database_url_from_env_value(value: Option<String>) -> String {
     value.unwrap_or_else(|| DEFAULT_DATABASE_URL.to_string())
+}
+
+fn artifact_content_root_from_env() -> String {
+    artifact_content_root_from_env_value(std::env::var("MNEME_ARTIFACT_CONTENT_ROOT").ok())
+}
+
+fn artifact_content_root_from_env_value(value: Option<String>) -> String {
+    trimmed_or_default(value, DEFAULT_ARTIFACT_CONTENT_ROOT)
 }
 
 fn rebuild_runs_on_start() -> bool {
@@ -112,10 +121,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let database_url = database_url_from_env();
     ensure_sqlite_parent_directory(&database_url)?;
+    let artifact_content_root = artifact_content_root_from_env();
     let store = SqliteStore::connect(&database_url).await?;
     let service = SqliteRunService::new(store.clone());
-    let artifact_service =
-        SqliteArtifactService::new(store.clone(), InMemoryArtifactContentStore::new().shared());
+    let artifact_service = SqliteArtifactService::new(
+        store.clone(),
+        LocalArtifactContentStore::new(artifact_content_root).shared(),
+    );
     let context_service = SqliteContextService::new(store.clone());
     let knowledge_service = SqliteKnowledgeService::new(store.clone());
     let chunk_service = SqliteChunkService::new(store.clone(), ChunkTextSplitter::new(4096, 256));
@@ -191,6 +203,14 @@ mod tests {
         assert_eq!(
             database_url_from_env_value(None),
             "sqlite://.mneme/mneme.db?mode=rwc"
+        );
+    }
+
+    #[test]
+    fn default_artifact_content_root_uses_local_mneme_directory() {
+        assert_eq!(
+            artifact_content_root_from_env_value(None),
+            ".mneme/artifacts"
         );
     }
 
